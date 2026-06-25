@@ -108,19 +108,25 @@ const DEFAULT_SYSTEM_PROMPTS: Record<AiPromptMode, string> = {
 	explain:
 		`You are a concise reading assistant for "{book}". `
 		+ `Answer the reader's question using your training knowledge only. `
-		+ `Be precise and brief.`,
+		+ `Be precise and brief, and reply in plain conversational prose — `
+		+ `no headings, tables, or diagrams.`,
 	examine:
 		`You are a thorough research assistant for "{book}". `
 		+ `Explore the reader's question in depth. Check the web and Cite sources with numbered `
-		+ `footnotes like [1], [2] and append each as "[^N]: Title — URL".`,
+		+ `footnotes like [1], [2] and append each as "[^N]: Title — URL". `
+		+ `Write your findings as flowing conversational prose; the only structure `
+		+ `should be those footnotes — no headings, tables, or diagrams.`,
 	exclaim:
 		`You are an empathetic reading companion for "{book}". `
 		+ `The reader has had a reaction to the passage. Respond warmly and `
-		+ `connect it to themes, context, or broader ideas.`,
+		+ `connect it to themes, context, or broader ideas. `
+		+ `Talk like a person rather than a document: natural prose, `
+		+ `no headings, tables, or diagrams.`,
 	enquiry:
 		`You are a knowledgeable reading companion for "{book}". `
 		+ `Have a thoughtful, open-ended conversation about the reader's question. `
-		+ `Be substantive but conversational.`,
+		+ `Keep it substantive but conversational — natural prose, `
+		+ `no headings, tables, or diagrams.`,
 };
 
 const DEFAULT_SETTINGS: ThirdMindReaderSettings = {
@@ -4699,6 +4705,11 @@ export default class ThirdMindReader extends Plugin {
 		this.addRibbonIcon("library", "Open Library", () => this.activateLibraryView());
 		this.addReaderCommands();
 
+		// Make sure the Library folder exists so the empty-state prompt ("drop
+		// .epub files into your Library folder") points somewhere real on a fresh
+		// install. Non-blocking — failure just falls back to lazy creation.
+		void this.ensureLibraryFolder();
+
 		// Intercept epub clicks in the file explorer so they always open in a
 		// new tab instead of replacing the active leaf (mirrors Cmd+Click).
 		// Runs in capture phase so it fires before Obsidian's own click handler.
@@ -4716,6 +4727,19 @@ export default class ThirdMindReader extends Plugin {
 		}, { capture: true });
 
 		this.registerVaultEvents();
+	}
+
+	/** Create the `Library/` root on load if it's missing, so a fresh install
+	 *  has the folder the empty-state prompt tells users to drop epubs into.
+	 *  Idempotent and tolerant of a parallel creation race. */
+	private async ensureLibraryFolder(): Promise<void> {
+		const adapter = this.app.vault.adapter;
+		if (await adapter.exists(LIBRARY_ROOT)) return;
+		try {
+			await this.app.vault.createFolder(LIBRARY_ROOT);
+		} catch {
+			// Already created (race or pre-existing) — nothing to do.
+		}
 	}
 
 	/** Live Library upkeep. Keeps reading position (and the display override)
