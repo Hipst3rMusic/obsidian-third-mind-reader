@@ -9,15 +9,15 @@ notes that live in your vault, and an optional inline AI librarian.
 ## Features
 
 - Two-page spread and single-page reading with chapter / table-of-contents navigation.
-- Highlighting with five annotation modes (Exclaim, Explain, Examine, Emphasise, Enquiry).
+- Highlight and Annotate books by selecting text.
 - Per-book **companion notes** written into your vault, linked back to the source.
-- Optional **AI librarian** for Explain / Examine / Enquiry, using a provider you configure.
-- A Library view of all books in your vault with annotation status.
+- Optional **AI librarian** for highlighting with four additional annotation modes (Exclaim, Explain, Examine, Enquiry) using a provider of your choice. Built for local models first.
+- A Library view of all books in your vault with annotation status and progress.
 
 ## Install (beta, via BRAT)
 
 1. Install the **BRAT** community plugin.
-2. In BRAT, run **"Add a beta plugin for testing"** and enter the repository path.
+2. In BRAT, run **"Add a beta plugin for testing"** and enter this repository's path.
 3. Enable **Third Mind Reader** in Community Plugins.
 4. Open any `.epub` file in your vault to start reading.
 
@@ -42,10 +42,9 @@ notes that live in your vault, and an optional inline AI librarian.
   [DOMPurify](https://github.com/cure53/DOMPurify) (MPL-2.0 / Apache-2.0).
 - Bundled fonts: Rosarivo, Labrada, Kode Mono (SIL Open Font License).
 - If you build your own reader on top of this code, a one-line credit to **Third Mind
-  Reader** (in your README or LICENSE) is appreciated. "Third Mind Reader" / "TMR" is
-  a held name — please rename your fork.
+  Reader** (in your README or LICENSE) is appreciated. "Third Mind Reader" / "TMR" is a held name — please rename your fork, thanks.
 
 ## Contributing
 
-Not looking for external contributions at the moment — please **fork and release your own version**.
-Suggestions and bug reports are welcome via issues.
+Not looking for external contributions at the moment, but I encourage you to **fork and release your own version** if you'd like to really make the reader yours.
+Suggestions and bug reports are welcome via issues and the feedback button in the plugin settings.
