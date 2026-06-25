@@ -2662,10 +2662,17 @@ export class ReaderView extends ItemView {
 	}
 
 	private getColumnCountForContent(content: HTMLElement, colWidth: number, gap: number): number {
-		const parent = content.parentElement;
-		if (!parent) return 1;
-		const containerHeight = parent.clientHeight;
-		if (containerHeight <= 0) return 1;
+		// Compare against the height the columns are *actually* constrained to —
+		// the `.tmr-content` box, which is `height:100%` of the spread's content
+		// area. The spread's own clientHeight (the old basis) is taller by its
+		// 1.5rem/1rem vertical padding, so a section whose single-column height
+		// lands in that padding band was mis-counted as one column, then flagged
+		// `singlePage` and overflowed into a clipped, unreachable extra column at
+		// render time. Fall back to the padded parent only before first layout.
+		const columnHeight = content.clientHeight > 0
+			? content.clientHeight
+			: (content.parentElement?.clientHeight ?? 0);
+		if (columnHeight <= 0) return 1;
 
 		// Temporarily remove column layout and constrain to a single column
 		// width so we can measure the content's natural (single-column) height.
@@ -2683,7 +2690,7 @@ export class ReaderView extends ItemView {
 		content.style.columnGap = savedColGap;
 		content.style.width = savedWidth;
 
-		if (naturalHeight <= containerHeight) return 1;
+		if (naturalHeight <= columnHeight) return 1;
 
 		// For multi-column content, count via scrollWidth
 		const stride = colWidth + gap;
@@ -3119,10 +3126,29 @@ export class ReaderView extends ItemView {
 		return Math.max(100, spread.clientWidth - this.getMinSidePaddingPx(spread) * 2);
 	}
 
+	/** Electron UI-zoom factor (Cmd +/-): 1 at the default scale, >1 zoomed in,
+	 *  <1 zoomed out. Falls back to 1 if unavailable. */
+	private getZoomFactor(): number {
+		try {
+			const factor = require("electron").webFrame.getZoomFactor();
+			return Number.isFinite(factor) && factor > 0 ? factor : 1;
+		} catch {
+			return 1;
+		}
+	}
+
 	private resolveLayoutMode(
 		candidateWidth = this.getLayoutCandidateWidth(),
 		previous: LayoutMode = this.layoutMode,
 	): LayoutMode {
+		// Decide on the *physical* pane width. `clientWidth` is reported in CSS
+		// pixels that shrink as UI zoom (Cmd +/-) rises, but the breakpoint is
+		// anchored to the fixed `--tmr-line-width`; comparing the two frames let
+		// a non-default UI scale collapse a comfortably-wide window into
+		// single-page. Multiplying by the zoom factor ties the decision to the
+		// physical window size, so the spread is stable across UI scales (and
+		// identical to the old behaviour at the default scale, where factor = 1).
+		const physicalWidth = candidateWidth * this.getZoomFactor();
 		const readableWidth = this.getReadableLineWidth();
 		const minSpreadCol = Math.max(
 			ReaderView.SINGLE_PAGE_MIN_SPREAD_COL,
@@ -3130,9 +3156,9 @@ export class ReaderView extends ItemView {
 		);
 		const breakpoint = minSpreadCol * 2 + ReaderView.GAP;
 		if (previous === "single") {
-			return candidateWidth > breakpoint + ReaderView.SINGLE_PAGE_HYSTERESIS ? "spread" : "single";
+			return physicalWidth > breakpoint + ReaderView.SINGLE_PAGE_HYSTERESIS ? "spread" : "single";
 		}
-		return candidateWidth < breakpoint - ReaderView.SINGLE_PAGE_HYSTERESIS ? "single" : "spread";
+		return physicalWidth < breakpoint - ReaderView.SINGLE_PAGE_HYSTERESIS ? "single" : "spread";
 	}
 
 	private syncSpreadLayoutMode(spread: HTMLElement | null, mode: LayoutMode = this.layoutMode): void {
