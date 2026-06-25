@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "inlineSourceMap": true,
+    "inlineSources": true,
+    "module": "ESNext",
+    "target": "ES6",
+    "allowSyntheticDefaultImports": true,
+    "moduleResolution": "bundler",
+    "importHelpers": true,
+    "isolatedModules": true,
+    "lib": ["ES6", "DOM"]
+  },
+  "include": ["**/*.ts"]
+}

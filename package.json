@@ -1,0 +1,26 @@
+{
+  "name": "third-mind-reader",
+  "version": "0.5.2-beta",
+  "description": "Third Mind Reader — Obsidian Plugin",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+  },
+  "keywords": [],
+  "author": "Rohan Bell",
+  "license": "AGPL-3.0-or-later",
+  "devDependencies": {
+    "@types/node": "^16.11.6",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "0.17.3",
+    "obsidian": "latest",
+    "tslib": "2.4.0",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@chenglou/pretext": "^0.0.4",
+    "dompurify": "^3.4.11",
+    "jszip": "^3.10.1"
+  }
+}

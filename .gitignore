@@ -1,0 +1,8 @@
+# Dependencies
+node_modules/
+
+# Personal plugin settings (positions, provider config) — never publish
+data.json
+
+# macOS
+.DS_Store

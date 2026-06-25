@@ -1,0 +1,3363 @@
+/* ── Third Mind Reader ──────────────────────────────────────────────────────── */
+
+
+/* ── DLS token layer (Obsidian-mapped default) ────────────────────────────────
+   Stylesheet reads DLS semantic names throughout. In default mode these names
+   point at the user's Obsidian theme vars, so the plugin inherits whatever
+   theme the user has set. The opt-in 3C mode (added in a later step) will
+   override these same names under `.tmr-root.tmr-3c-mode` with DLS primitives,
+   making the swap a single class toggle. */
+.tmr-root {
+	/* surfaces */
+	--background: var(--bg1);
+	--card: var(--bg2, var(--background-primary));
+	--popover: var(--bg2, var(--background-primary));
+	--sidebar: var(--bg2, var(--background-primary));
+
+	/* text */
+	--foreground: var(--tx1, var(--text-normal));
+	--muted-foreground: var(--tx2, var(--text-muted));
+	--subtle-foreground: var(--tx3, var(--text-faint));
+	--sidebar-foreground: var(--tx2, var(--text-normal));
+
+	/* accents & structural */
+	--primary: var(--ax2, var(--interactive-accent, #6EA793));
+	--primary-foreground: var(--bg1, var(--text-on-accent, #ffffff));
+	--hover-border: var(--ax2, var(--interactive-accent, #6EA793));
+	--hover-popover: var(--background-modifier-hover, rgba(0,0,0,0.06));
+	--secondary: var(--ui2, var(--background-primary-alt, var(--background-primary)));
+	--secondary-foreground: var(--tx1, var(--text-normal));
+	--surface-inset: var(--background-primary);
+	--border: var(--ui1, var(--background-modifier-border));
+	--input: var(--ui1, var(--background-modifier-border));
+	--sidebar-accent: var(--ax2, var(--interactive-accent, #6EA793));
+	--sidebar-accent-foreground: var(--tx1, var(--text-normal));
+	--sidebar-border: var(--ui1, var(--background-modifier-border));
+	--hover-sidebar-accent: var(--background-modifier-hover, rgba(0,0,0,0.06));
+
+	/* status */
+	--destructive: var(--color-red, #AF4D4D);
+	--color-success: var(--color-green, #8F996C);
+	--color-error: var(--color-red, #AF4D4D);
+	--color-info: var(--color-cyan, #6EA793);
+	--color-warning: var(--color-yellow, #AC9C5D);
+
+	/* gloss mode accent colours — theme token first, 3C DLS as fallback */
+	--tmr-c-exclaim:      var(--color-red, #7d2e2e);
+	--tmr-c-exclaim-icon: var(--color-red, #af4d4d);
+	--tmr-c-explain:      var(--color-yellow, #ac9c5d);
+	--tmr-c-examine:      var(--color-cyan, #6396a2);
+	--tmr-c-emphasise:    var(--color-green, #50805c);
+	--tmr-c-enquiry:      #8c8787;
+
+	/* shape & type */
+	--radius-min: 9px;
+	--radius-s: 12px;
+	--radius-m: 15px;
+	--radius-L: 18px;
+	--radius-pill: 999px;
+	/* Non-3C mode: inherit whatever fonts the user has set in Obsidian.
+	   3C mode overrides these with the DLS typefaces below. */
+	--font-primary: var(--font-interface, sans-serif);
+	/* Title/display face. In 3C this is Rosarivo; in default mode it inherits
+	   the user's interface font. */
+	--font-primary-alt: var(--font-interface, sans-serif);
+	--font-secondary: var(--font-text, serif);
+	--font-mono: var(--font-monospace, monospace);
+}
+
+/* ── 3C mode overrides (opt-in) ───────────────────────────────────────────────
+   Activated by adding `tmr-3c-mode` class + `data-tmr-theme="light|dark"`
+   attribute to `.tmr-root`. Values are DLS primitives resolved from
+   Hipst3r-DLS/3CLibrary.pen (3C-Semantic theme axis).
+   Dark is the default 3C theme when the class is present without a theme
+   attribute. */
+
+.tmr-root.tmr-3c-mode,
+.tmr-root.tmr-3c-mode[data-tmr-theme="dark"] {
+	/* surfaces */
+	--background: #1f1f1f;           /* Shadow-900 */
+	--card: #222222;                 /* Shadow-800 */
+	--popover: #1f1f1f;              /* Shadow-900 */
+	--sidebar: #222222;              /* Shadow-800 */
+	--surface-inset: #1f1f1f;        /* Shadow-900 — inset elements within the sidebar */
+
+	/* text */
+	--foreground: #c8c5c8;           /* Empire-700 */
+	--muted-foreground: #8c8787;     /* Empire-900W */
+	--subtle-foreground: #87878c;    /* Empire-900C */
+	--sidebar-foreground: #f1eff0;   /* Empire-500 */
+
+	/* accents & structural */
+	--primary: #6ea793;              /* Dawn-500 */
+	--primary-foreground: #262626;   /* Shadow-700 */
+	--hover-border: #6ea793;         /* Dawn-500 */
+	--hover-popover: #262626;        /* Shadow-700 */
+	--secondary: #2e2e2e;            /* Shadow-600 */
+	--secondary-foreground: #979187; /* Prince-500 */
+	--border: #353535;               /* Shadow-500 */
+	--input: #2e2e2e;                /* Shadow-600 */
+	--sidebar-accent: #787268;       /* Prince-700 */
+	--sidebar-accent-foreground: #c8c5c8; /* Empire-700 */
+	--sidebar-border: #97918736;     /* Prince-500 @ 21% */
+	--hover-sidebar-accent: rgba(120, 114, 104, 0.2); /* Prince-700 @ 20% */
+
+	/* status */
+	--destructive: #7d2e2e;          /* Oh Dear */
+	--color-success: #8f996c;        /* Dusk-500 */
+	--color-error: #7d2e2e36;        /* Oh Dear @ 21% */
+	--color-info: #6396a21f;         /* Learn @ 12% */
+	--color-warning: #ac9c5d29;      /* Look @ 16% */
+
+	/* gloss mode accents — locked to DLS primitives in 3C mode */
+	--tmr-c-exclaim:      #7d2e2e;
+	--tmr-c-exclaim-icon: #af4d4d;
+	--tmr-c-explain:      #ac9c5d;
+	--tmr-c-examine:      #6396a2;
+	--tmr-c-emphasise:    #50805c;
+	--tmr-c-enquiry:      #8c8787;
+
+	/* user-tunable vars from Minimal/Style-Settings: force-set in 3C so
+	   headings/emphasis/blockquote flip with the theme rather than leaking
+	   the user's Obsidian palette into an otherwise DLS-controlled pane. */
+	--h2-color: #8f996c;             /* Dusk-500 */
+	--h3-color: #6ea793;             /* Dawn-500 */
+	--blockquote-color: #979187;     /* Prince-500 */
+	--blockquote-border-color: #6a6458; /* Prince-800 */
+	--code-property: #8c8787;        /* Empire-900W */
+	--bold-color: #8c8787;           /* Empire-900W */
+	--italic-color: #979187;         /* Prince-500 */
+
+	/* DLS typefaces — all bundled (OFL/Apache): Rosarivo (display/primary),
+	   Labrada (body), Kode Mono (mono). Advercase/Radwave are unlicensed for
+	   bundling and intentionally not referenced. */
+	--font-primary: "Rosarivo", var(--font-interface, sans-serif);
+	--font-primary-alt: "Rosarivo", var(--font-text, serif);
+	--font-secondary: "Labrada", var(--font-text, serif);
+	--font-mono: "Kode Mono", var(--font-monospace, monospace);
+}
+
+.tmr-root.tmr-3c-mode[data-tmr-theme="light"] {
+	/* surfaces */
+	--background: #f1eff0;           /* Empire-500 */
+	--card: #e1dee0;                 /* Empire-600 */
+	--popover: #f1eff0;              /* Empire-500 */
+	--sidebar: #e1dee0;              /* Empire-600 */
+	--surface-inset: #f1eff0;        /* Empire-500 — inset elements within the sidebar */
+
+	/* text */
+	--foreground: #6a6458;           /* Prince-800 */
+	--muted-foreground: #a4a3a7;     /* Empire-800C */
+	--subtle-foreground: #898379;    /* Prince-600 */
+	--sidebar-foreground: #605a4d;   /* Prince-900 */
+
+	/* accents & structural */
+	--primary: #6ea793;              /* Dawn-500 */
+	--primary-foreground: #353535;   /* Shadow-500 */
+	--hover-border: #6ea793;         /* Dawn-500 */
+	--hover-popover: #e1dee0;        /* Empire-600 */
+	--secondary: #c8c5c8;            /* Empire-700 */
+	--secondary-foreground: #605a4d; /* Prince-900 */
+	--border: #a4a3a7;               /* Empire-800C */
+	--input: #979187;                /* Prince-500 */
+	--sidebar-accent: #979187;       /* Prince-500 */
+	--sidebar-accent-foreground: #979187; /* Prince-500 */
+	--sidebar-border: #c8c5c8;       /* Empire-700 */
+	--hover-sidebar-accent: rgba(151, 145, 135, 0.15); /* Prince-500 @ 15% */
+
+	/* status */
+	--destructive: #af4d4d;          /* HipAgni */
+	--color-success: #8f996c;        /* Dusk-500 */
+	--color-error: #7d2e2e;          /* Oh Dear */
+	--color-info: #6396a2;           /* Learn */
+	--color-warning: #ac9c5d;        /* Look */
+
+	/* gloss mode accents — same DLS primitives in light 3C */
+	--tmr-c-exclaim:      #7d2e2e;
+	--tmr-c-exclaim-icon: #af4d4d;
+	--tmr-c-explain:      #ac9c5d;
+	--tmr-c-examine:      #6396a2;
+	--tmr-c-emphasise:    #50805c;
+	--tmr-c-enquiry:      #8c8787;
+
+	/* user-tunable vars — light-mode DLS picks */
+	--h2-color: #6f7654;             /* Dusk-600 */
+	--h3-color: #3c5953;             /* Dawn-700 */
+	--blockquote-color: #787268;     /* Prince-700 */
+	--blockquote-border-color: #898379; /* Prince-600 */
+	--code-property: #6a6458;        /* Prince-800 */
+	--bold-color: #605a4d;           /* Prince-900 */
+	--italic-color: #7d2e2e;         /* Oh Dear */
+}
+
+/* Translucent window: drop the 3C dark background so macOS vibrancy shows through.
+   `body.is-translucent` is set by Obsidian when "Translucent window" is enabled.
+   Light mode excluded — the light background is needed for contrast. */
+body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
+	--background: transparent;
+}
+
+/* Hide the tab title bar inside the epub reader — it's redundant with the
+   tab label and the ToC pane. Scoped to data-type so all other views are
+   unaffected and no Obsidian setting needs to change. */
+.workspace-leaf-content[data-type="third-mind-reader"] .view-header {
+	display: none;
+}
+
+.tmr-root {
+	/* Mirror Obsidian's Readable Line Length setting; fall back to 680px. */
+	--tmr-line-width: var(--file-line-width, 680px);
+	--tmr-gap: 48px;
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	/* !important needed to win against Obsidian's parent-scoped .view-content
+	   background rule, which has higher specificity than .tmr-root alone. */
+	background-color: var(--background) !important;
+	color: var(--foreground);
+	/* !important: Obsidian's .view-content sets overflow: auto at the same
+	   specificity and wins by load order. Without this, the highlights
+	   panel's translateX(100%) off-screen state extends scrollWidth, and
+	   Obsidian auto-scrolls the container to bring it into view, producing
+	   the "panel gradually slides open during navigation" bug. */
+	overflow: hidden !important;
+	position: relative;
+	contain: layout paint;
+}
+
+/* ── Spread ─────────────────────────────────────────────────────────────────── */
+
+/* Clipping container — overflow hidden at the padding box edge so only one
+   spread is visible at a time.  Padding lives here (not on .tmr-content)
+   so every "page" gets consistent margins after translateX shifts. */
+.tmr-spread {
+	flex: 1;
+	overflow: clip;              /* clip at content box, not padding box */
+	position: relative;
+	min-height: 0;
+	/* Horizontal padding grows on wide displays so neither column exceeds
+	   --tmr-line-width. Extra space becomes outer gutters, not dead zones. */
+	padding: 1.5rem max(3rem, calc((100% - var(--tmr-line-width) * 2 - var(--tmr-gap)) / 2)) 1rem;
+	width: 100%;
+	box-sizing: border-box;
+}
+
+/* True narrow-layout mode: center one readable-width page in the viewport
+   rather than insisting on a two-page spread with implausibly skinny columns. */
+.tmr-spread.tmr-layout-single {
+	padding: 1.5rem max(3rem, calc((100% - var(--tmr-line-width)) / 2)) 1rem;
+}
+
+/* Content fills the spread height exactly, then overflows RIGHT into more columns.
+   column-width and column-gap are set by JS (paginateContent) so they track the
+   actual spread inner width.  transform: translateX() navigates between spreads. */
+.tmr-content {
+	column-fill: auto;
+	column-rule: 1px solid var(--border);
+	height: 100%;
+	box-sizing: border-box;
+	transition: transform 250ms ease;
+	will-change: transform;
+	position: relative;
+	user-select: text;
+	-webkit-user-select: text;
+	cursor: text;
+}
+
+.tmr-spread.tmr-layout-single .tmr-content {
+	column-rule: none;
+}
+
+/* Short sections that couldn't pair with a neighbour (title pages, part headers,
+   etc.) render as a single centered column at reading width rather than sitting
+   in the left column of an otherwise empty two-page spread. */
+.tmr-content.tmr-single-page {
+	column-count: 1;
+	max-width: var(--tmr-line-width);
+	margin: 0 auto;
+}
+
+/* ── Spine items (each epub chapter/section) ───────────────────────────────── */
+
+/* Force each spine item after the first to start on a new column, so short
+   front-matter pages pair up naturally into two-page spreads. */
+.tmr-spine-item + .tmr-spine-item {
+	break-before: column;
+}
+
+/* ── Typography ────────────────────────────────────────────────────────────── */
+
+.tmr-content,
+.tmr-content p {
+	font-family: var(--font-secondary);
+	font-size: 15px;
+	line-height: 1.65;
+	color: var(--foreground);
+}
+
+/* Obsidian's global rule sets margin-block: var(--p-spacing) on all h1-h6.
+   Themes like Minimal set --p-spacing to large values (1.75rem), injecting
+   unwanted space into our reader. Reset to 0 so we own all heading spacing. */
+.tmr-content h1, .tmr-content h2, .tmr-content h3,
+.tmr-content h4, .tmr-content h5, .tmr-content h6 {
+	margin-block: 0;
+}
+
+.tmr-content h1 {
+	font-family: var(--font-primary);
+	font-size: 1.889em;
+	color: var(--foreground);
+	margin-bottom: 2rem;
+}
+
+.tmr-content h2 {
+	font-family: var(--font-primary);
+	font-size: 1.5em;
+	color: var(--h2-color, var(--foreground));
+	break-after: avoid;
+}
+
+.tmr-content h3 {
+	font-family: var(--font-primary);
+	font-size: 1.333em;
+	color: var(--h3-color, var(--foreground));
+	break-after: avoid;
+}
+
+.tmr-content p {
+	margin: 0 0 1.1em;
+	break-inside: avoid-column;
+}
+
+.tmr-content p.tmr-drop-cap::first-letter {
+	initial-letter: 2;
+	margin-right: 4px;
+	font-family: var(--font-primary);
+	color: var(--foreground);
+}
+
+.tmr-content code,
+.tmr-content pre {
+	font-family: var(--font-mono);
+	font-size: 0.875em;
+	background: var(--card);
+	color: var(--code-property, var(--muted-foreground));
+	border-radius: 4px;
+	padding: 0.15em 0.4em;
+}
+
+.tmr-content blockquote {
+	border-left: 3px solid var(--blockquote-border-color, var(--secondary));
+	margin: 1.2em 0;
+	padding: 0.4em 1em;
+	color: var(--blockquote-color, var(--muted-foreground));
+	font-style: italic;
+	background: transparent;
+	break-inside: avoid-column;
+}
+
+/* ── Italic blocks (verse, epigraphs — styled like blockquotes) ────────────── */
+
+.tmr-content .tmr-italic-block {
+	border-left: 3px solid var(--blockquote-border-color, var(--secondary));
+	padding: 0.15em 1em;
+	color: var(--blockquote-color, var(--muted-foreground));
+	background: transparent;
+	break-inside: avoid-column;
+}
+
+.tmr-root.tmr-3c-mode .tmr-content blockquote,
+.tmr-root.tmr-3c-mode .tmr-content .tmr-italic-block {
+	background: var(--card);
+}
+
+/* ── Epub callout groups ─────────────────────────────────────────────────────── */
+/* wrapCalloutGroups() in epub.ts wraps consecutive [data-epub-callout] siblings
+   into a single .tmr-callout-group container, giving us one DOM node to style
+   as a unified card rather than stacking individual blockquote-alike elements. */
+
+.tmr-content .tmr-callout-group {
+	border: 1px solid var(--border);
+	border-radius: var(--radius-s, 12px);
+	background: var(--card, var(--background-primary-alt));
+	margin: 1.5em 0;
+	/* No overflow:hidden — it creates a block formatting context that blocks
+	   column fragmentation, making long groups spill past the page edge. */
+}
+
+.tmr-content .tmr-callout-group [data-epub-callout] {
+	background: transparent;
+	border: none;
+	margin: 0;
+	padding: 0.85em 2.5em;
+	text-align: center;
+	color: var(--foreground);
+	break-inside: avoid-column;
+}
+
+/* Continuation: two adjacent non-separator items (e.g. quote + —Archimedes)
+   are one logical entry — tighten the spacing and skip the divider. */
+.tmr-content .tmr-callout-group [data-epub-callout].tmr-callout-continuation {
+	padding-top: 0;
+	margin-top: -0.25em;
+	color: var(--muted-foreground);
+}
+
+/* Separators: keep the ↓ visible as a small muted progression cue, sitting on
+   a hairline that doubles as the divider between items. */
+.tmr-content .tmr-callout-group .tmr-callout-sep {
+	border-top: 1px solid var(--border);
+	padding: 0.45em 0;
+	text-align: center;
+	font-size: 0.85em;
+	color: var(--muted-foreground);
+	opacity: 0.8;
+	line-height: 1;
+}
+
+/* ── Epub bibliography citations ─────────────────────────────────────────────── */
+/* wrapCitations() in epub.ts wraps body-text "[N]" markers in these spans;
+   data-cite-text carries the full bibliography line and the reader's hover
+   handler routes it through the existing tooltip pipeline. */
+
+.tmr-content a.tmr-citation {
+	display: inline-block;
+	font-size: 0.7em;
+	font-family: var(--font-mono, monospace);
+	color: var(--primary);
+	vertical-align: 0.3em;
+	padding: 0 0.15em;
+	margin: 0 0.05em;
+	cursor: pointer;
+	border-radius: 3px;
+	text-decoration: none;
+	transition: background 0.12s ease, color 0.12s ease;
+}
+
+.tmr-content a.tmr-citation:hover {
+	background: var(--hover-popover, var(--background-modifier-hover));
+	text-decoration: none;
+}
+
+/* ── 3C-mode typography — DLS weights, colour scale, emphasis tints ──────────
+   All purely aesthetic choices that should yield to the user's active
+   Obsidian theme when 3C mode is off. */
+.tmr-root.tmr-3c-mode .tmr-content h1 { font-weight: 900; }
+.tmr-root.tmr-3c-mode .tmr-content h2 { font-weight: 600; color: var(--h2-color); }
+.tmr-root.tmr-3c-mode .tmr-content h3 { font-weight: 300; color: var(--h3-color); }
+.tmr-root.tmr-3c-mode .tmr-content em,
+.tmr-root.tmr-3c-mode .tmr-content i  { color: var(--italic-color); }
+.tmr-root.tmr-3c-mode .tmr-content strong,
+.tmr-root.tmr-3c-mode .tmr-content b  { color: var(--bold-color); }
+.tmr-root.tmr-3c-mode .tmr-content p.tmr-drop-cap::first-letter { font-weight: 900; }
+
+/* ── Images ─────────────────────────────────────────────────────────────────── */
+
+.tmr-content img {
+	max-width: 100%;
+	height: auto;
+	border-radius: 4px;
+	display: block;
+	margin: 1em auto;
+}
+
+/* Wide figures span both columns */
+.tmr-content figure {
+	break-inside: avoid-column;
+	margin: 1.5em 0;
+}
+
+/* ── Links ───────────────────────────────────────────────────────────────────── */
+
+/* Anchors without href (named anchors / epub artifacts) inherit body text */
+.tmr-content a {
+	color: inherit;
+	text-decoration: none;
+}
+
+/* Any anchor with an href is a real link (block-wrapping hrefs are stripped
+   in the renderer, so only inline links remain here) */
+.tmr-content a[href] {
+	color: var(--primary);
+}
+
+.tmr-content a[href]:hover {
+	text-decoration: underline;
+	text-underline-offset: 2px;
+}
+
+/* Footnote ref superscripts */
+.tmr-content a sup,
+.tmr-content sup a {
+	color: var(--primary);
+	font-size: 0.75em;
+	cursor: pointer;
+}
+
+/* ── Footnotes (aside / section at bottom) ───────────────────────────────────── */
+
+.tmr-content aside,
+.tmr-content .footnotes,
+.tmr-content section[epub\:type="footnotes"] {
+	margin-top: 2em;
+	padding-top: 1em;
+	border-top: 1px solid var(--border);
+	font-size: 0.85em;
+	color: var(--muted-foreground);
+	break-before: column;
+}
+
+/* ── Footnote tooltip ────────────────────────────────────────────────────────── */
+
+/* Tooltip lives on document.body (outside .tmr-root) so it needs its own
+   opaque token defaults. Obsidian vars (--bg2 etc.) may contain alpha or
+   be undefined at body scope — hardcode fallbacks for both native + 3C. */
+.tmr-tooltip {
+	position: fixed;
+	z-index: 9999;
+	max-width: 320px;
+	max-height: min(50vh, calc(100vh - 2rem));
+	padding: 0.65em 0.9em;
+	background: var(--bg2, var(--background-primary));
+	color: var(--tx1, #c8c5c8);
+	font-family: var(--font-secondary);
+	font-size: 13px;
+	line-height: 1.5;
+	border: 1px solid var(--ui1, var(--background-modifier-border));
+	border-radius: 6px;
+	box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+	pointer-events: none;
+	overflow: auto;
+	overflow-wrap: break-word;
+}
+
+.tmr-tooltip.tmr-3c-mode:not([data-tmr-theme="light"]) {
+	background: #262626;
+	color: #c8c5c8;
+	border-color: #353535;
+}
+
+.tmr-tooltip.tmr-3c-mode[data-tmr-theme="light"] {
+	background: #e1dee0;
+	color: #6a6458;
+	border-color: #a4a3a7;
+	box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+}
+
+.tmr-tooltip-caption {
+	margin: 0.5em 0 0;
+	font-size: 12px;
+	color: var(--subtle-foreground);
+}
+
+.tmr-tooltip-text {
+	margin: 0;
+}
+
+/* Visual cue on wired reference spans */
+.tmr-content [data-rid] {
+	cursor: pointer;
+	border-bottom: 1px dotted var(--primary);
+}
+
+/* ── Highlight overlay (active selection) ──────────────────────────────────── */
+
+/* Rect divs are positioned relative to .tmr-content so they ride along with
+   the translateX transform. Pointer-events off so the underlying text stays
+   selectable / clickable. */
+/* Persisted-annotation overlay — painted on every mount for any saved
+   highlight whose paragraph lives in the current unit. Sits below the active
+   selection overlay so a fresh selection still reads as warmer. */
+.tmr-saved-highlight-overlay {
+	position: absolute;
+	inset: 0;
+	pointer-events: none;
+	z-index: 0;
+}
+
+.tmr-saved-highlight-rect {
+	position: absolute;
+	pointer-events: none;
+	border-radius: 2px;
+	background: color-mix(in srgb, var(--tmr-c-enquiry) 16%, transparent);
+}
+
+.tmr-saved-highlight-rect[data-mode="exclaim"]   { background: color-mix(in srgb, var(--tmr-c-exclaim) 20%, transparent); }
+.tmr-saved-highlight-rect[data-mode="explain"]   { background: color-mix(in srgb, var(--tmr-c-explain) 20%, transparent); }
+.tmr-saved-highlight-rect[data-mode="examine"]   { background: color-mix(in srgb, var(--tmr-c-examine) 20%, transparent); }
+.tmr-saved-highlight-rect[data-mode="emphasise"] { background: color-mix(in srgb, var(--tmr-c-emphasise) 20%, transparent); }
+.tmr-saved-highlight-rect[data-mode="enquiry"]   { background: color-mix(in srgb, var(--tmr-c-enquiry) 20%, transparent); }
+
+/* Active-conversation variant — pinned highlight while a conversation card is
+   expanded in the Highlights pane. ~35% fill alpha (vs 20% standard) plus a
+   1px outline at full opacity in the mode colour. */
+.tmr-saved-highlight-rect-active[data-mode="exclaim"]   { background: color-mix(in srgb, var(--tmr-c-exclaim) 35%, transparent); box-shadow: 0 0 0 1px var(--tmr-c-exclaim); }
+.tmr-saved-highlight-rect-active[data-mode="explain"]   { background: color-mix(in srgb, var(--tmr-c-explain) 35%, transparent); box-shadow: 0 0 0 1px var(--tmr-c-explain); }
+.tmr-saved-highlight-rect-active[data-mode="examine"]   { background: color-mix(in srgb, var(--tmr-c-examine) 35%, transparent); box-shadow: 0 0 0 1px var(--tmr-c-examine); }
+.tmr-saved-highlight-rect-active[data-mode="emphasise"] { background: color-mix(in srgb, var(--tmr-c-emphasise) 35%, transparent); box-shadow: 0 0 0 1px var(--tmr-c-emphasise); }
+.tmr-saved-highlight-rect-active[data-mode="enquiry"]   { background: color-mix(in srgb, var(--tmr-c-enquiry) 35%, transparent); box-shadow: 0 0 0 1px var(--tmr-c-enquiry); }
+
+.tmr-highlight-overlay {
+	position: absolute;
+	inset: 0;
+	pointer-events: none;
+	z-index: 1;
+}
+
+.tmr-highlight-rect {
+	position: absolute;
+	background: color-mix(in srgb, var(--tmr-c-explain) 16%, transparent);
+	border-radius: 2px;
+	pointer-events: none;
+}
+
+/* 3C dark mode: warning token is already alpha'd (#ac9c5d29) — use as-is. */
+
+/* ── Gloss bar (annotation toolbar) ────────────────────────────────────────── */
+
+/* Lives on document.body (outside .tmr-root's `contain`) — needs opaque
+   token defaults like the tooltip. */
+.tmr-gloss-bar {
+	position: fixed;
+	z-index: 9998;
+	display: flex;
+	gap: 6px;
+	padding: 6px;
+	background: var(--bg2, var(--background-primary));
+	border: 1px solid var(--ui1, var(--background-modifier-border));
+	border-radius: 15px;
+	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+	user-select: none;
+}
+
+.tmr-gloss-bar.tmr-3c-mode:not([data-tmr-theme="light"]) {
+	background: #1f1f1f;
+	border-color: #353535;
+}
+
+.tmr-gloss-bar.tmr-3c-mode[data-tmr-theme="light"] {
+	background: #e1dee0;
+	border-color: #a4a3a7;
+	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+	--muted-foreground: #a4a3a7;
+}
+
+/* Body-scoped elements are direct children of <body>, which inherits --color-*
+   from Obsidian. Define base tokens here so theme colours are picked up.
+   (:root cannot see body-level custom properties — inheritance is downward only.) */
+.tmr-gloss-bar,
+.tmr-gloss-input,
+.tmr-annotation-preview,
+.tmr-gloss-tooltip {
+	--tmr-c-exclaim:      var(--color-red, #7d2e2e);
+	--tmr-c-exclaim-icon: var(--color-red, #af4d4d);
+	--tmr-c-explain:      var(--color-yellow, #ac9c5d);
+	--tmr-c-examine:      var(--color-cyan, #6396a2);
+	--tmr-c-emphasise:    var(--color-green, #50805c);
+	--tmr-c-enquiry:      #8c8787;
+	/* Font tokens default to Obsidian's active fonts in non-3C mode. */
+	--font-primary:  var(--font-interface, sans-serif);
+	--font-secondary: var(--font-text, serif);
+}
+
+/* Lock to DLS primitives in 3C mode — same values for light and dark. */
+.tmr-gloss-bar.tmr-3c-mode,
+.tmr-gloss-input.tmr-3c-mode,
+.tmr-annotation-preview.tmr-3c-mode,
+.tmr-gloss-tooltip.tmr-3c-mode {
+	--tmr-c-exclaim:      #7d2e2e;
+	--tmr-c-exclaim-icon: #af4d4d;
+	--tmr-c-explain:      #ac9c5d;
+	--tmr-c-examine:      #6396a2;
+	--tmr-c-emphasise:    #50805c;
+	--tmr-c-enquiry:      #8c8787;
+	--font-primary:  "Rosarivo", var(--font-interface, sans-serif);
+	--font-secondary: "Labrada", var(--font-text, serif);
+}
+
+.tmr-gloss-tile {
+	width: 32px;
+	height: 32px;
+	padding: 0;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	background: transparent !important;
+	border: none;
+	border-radius: 12px;
+	color: var(--muted-foreground, #8c8787);
+	cursor: pointer;
+	transition: filter 150ms ease, transform 150ms ease, background 150ms ease, color 150ms ease;
+}
+
+.tmr-gloss-tile .svg-icon {
+	width: 20px;
+	height: 20px;
+}
+
+/* ── 3C mode: filled tiles with contrasting DLS icons (GlossBar/Master/Updated).
+   Fills use the theme-aware --tmr-c-* tokens (3C primitives); icon colours are
+   the DLS contrast picks. `!important` beats Obsidian's default <button> bg. ── */
+.tmr-gloss-bar.tmr-3c-mode .tmr-gloss-tile[data-gloss-mode="emphasise"] { background: var(--tmr-c-emphasise) !important; color: #e1dee0; }
+.tmr-gloss-bar.tmr-3c-mode .tmr-gloss-tile[data-gloss-mode="exclaim"]   { background: var(--tmr-c-exclaim) !important;   color: #ac9c5d; }
+.tmr-gloss-bar.tmr-3c-mode .tmr-gloss-tile[data-gloss-mode="explain"]   { background: var(--tmr-c-explain) !important;   color: #605a4d; }
+.tmr-gloss-bar.tmr-3c-mode .tmr-gloss-tile[data-gloss-mode="examine"]   { background: var(--tmr-c-examine) !important;   color: #2e443d; }
+.tmr-gloss-bar.tmr-3c-mode .tmr-gloss-tile[data-gloss-mode="enquiry"]   { background: #353535 !important;                color: #a7a3a5; }
+.tmr-gloss-bar.tmr-3c-mode .tmr-gloss-tile:hover  { filter: brightness(1.12); transform: translateY(-1px); }
+.tmr-gloss-bar.tmr-3c-mode .tmr-gloss-tile:active { filter: brightness(0.95); transform: translateY(0); }
+
+/* ── Non-3C (user's own theme): simpler coloured-icon-on-transparent treatment,
+   so the bar inherits the active theme's accent palette instead of forcing DLS
+   fills onto an arbitrary theme (avoids contrast clashes). Exclaim uses its
+   brighter `-icon` token so the dark Oh-Dear red still reads on any bar; hover
+   is a neutral theme tint. ── */
+.tmr-gloss-bar:not(.tmr-3c-mode) .tmr-gloss-tile[data-gloss-mode="emphasise"] { color: var(--tmr-c-emphasise); }
+.tmr-gloss-bar:not(.tmr-3c-mode) .tmr-gloss-tile[data-gloss-mode="exclaim"]   { color: var(--tmr-c-exclaim-icon); }
+.tmr-gloss-bar:not(.tmr-3c-mode) .tmr-gloss-tile[data-gloss-mode="explain"]   { color: var(--tmr-c-explain); }
+.tmr-gloss-bar:not(.tmr-3c-mode) .tmr-gloss-tile[data-gloss-mode="examine"]   { color: var(--tmr-c-examine); }
+.tmr-gloss-bar:not(.tmr-3c-mode) .tmr-gloss-tile[data-gloss-mode="enquiry"]   { color: var(--tmr-c-enquiry); }
+.tmr-gloss-bar:not(.tmr-3c-mode) .tmr-gloss-tile:hover { background: var(--background-modifier-hover, rgba(127, 127, 127, 0.15)) !important; }
+
+.tmr-gloss-tile-disabled,
+.tmr-gloss-tile-disabled:hover {
+	opacity: 0.45;
+	cursor: not-allowed;
+	background: transparent;
+}
+
+/* Separator stroke between the Emphasise tile and the AI tiles. */
+.tmr-gloss-sep {
+	flex-shrink: 0;
+	align-self: center;
+	width: 1.5px;
+	height: 22px;
+	border-radius: 3px;
+	background: var(--background-modifier-border, #97918736);
+}
+.tmr-gloss-bar.tmr-3c-mode .tmr-gloss-sep { background: #97918736; } /* Prince-500 @ 21% */
+
+/* Lite mode (AI features off): only the Emphasise tile, no separator — but the
+   Extend control stays, since cross-page highlighting applies to Emphasise too. */
+.tmr-gloss-bar.tmr-gloss-lite .tmr-gloss-sep:not(.tmr-gloss-sep-extend),
+.tmr-gloss-bar.tmr-gloss-lite .tmr-gloss-tile:not([data-gloss-mode="emphasise"]):not(.tmr-gloss-tile-extend) {
+	display: none;
+}
+
+/* Extend control is hidden by default and only surfaces when the selection
+   reaches the end of the page (bar gains .tmr-gloss-can-extend), so it never
+   clutters the bar during ordinary selection. */
+.tmr-gloss-sep-extend { display: none; }
+.tmr-gloss-tile-extend { display: none; }
+.tmr-gloss-bar.tmr-gloss-can-extend .tmr-gloss-sep-extend { display: block; }
+.tmr-gloss-bar.tmr-gloss-can-extend .tmr-gloss-tile-extend { display: flex; }
+
+/* Anchored cross-page selection: the hint shown while waiting for the far
+   endpoint. Non-interactive so it never intercepts the end-click. */
+.tmr-extend-hint {
+	position: fixed;
+	bottom: 80px;
+	left: 50%;
+	transform: translateX(-50%);
+	z-index: 30;
+	max-width: min(90vw, 460px);
+	padding: 8px 14px;
+	border-radius: 8px;
+	background: var(--popover, var(--background-secondary));
+	border: 1px solid var(--border, var(--background-modifier-border));
+	color: var(--foreground, var(--text-normal));
+	font-family: var(--font-secondary);
+	font-size: 12px;
+	line-height: 1.4;
+	text-align: center;
+	box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+	pointer-events: none;
+}
+
+.tmr-extend-hint.tmr-3c-mode:not([data-tmr-theme="light"]) {
+	background: #1d1b1c;
+	border-color: #ffffff14;
+	color: #d8d4d6;
+}
+
+.tmr-extend-hint.tmr-3c-mode[data-tmr-theme="light"] {
+	background: #f3f0ee;
+	border-color: #00000014;
+	color: #2a2729;
+}
+
+/* Lite mode: hide the Annotations/Conversations tab bar — nothing to choose,
+   so only the Annotations list shows when the Highlights pane is open. */
+.tmr-pane-lite .tmr-pane-tabs-wrap { display: none; }
+
+/* Inline input panel shown after a tile is clicked. Body-scoped like the bar,
+   so it needs its own opaque fallbacks and 3C-theme overrides. */
+.tmr-gloss-input {
+	position: fixed;
+	z-index: 9998;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 6px 8px;
+	min-width: 320px;
+	max-width: min(520px, calc(100vw - 16px));
+	background: var(--bg2, var(--background-primary));
+	border: 1px solid var(--ui1, var(--background-modifier-border));
+	border-radius: 15px;
+	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+	font-family: var(--font-secondary);
+	--background-modifier-form-field: transparent;
+	--background-modifier-form-field-hover: transparent;
+	--background-modifier-border-hover: transparent;
+	--background-modifier-border-focus: transparent;
+	--input-border-width: 0px;
+	--input-border-width-focus: 0px;
+	--input-radius: 0;
+	--input-padding: 4px 2px;
+}
+
+.tmr-gloss-input.tmr-3c-mode:not([data-tmr-theme="light"]) {
+	background: #1f1f1f;
+	border-color: #353535;
+}
+
+.tmr-gloss-input.tmr-3c-mode[data-tmr-theme="light"] {
+	background: #e1dee0;
+	border-color: #a4a3a7;
+	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+	color: #6a6458;
+	--muted-foreground: #a4a3a7;
+}
+
+/* Mode accent stripe on the left edge (mirrors the tile colour). */
+.tmr-gloss-input::before {
+	content: "";
+	width: 3px;
+	align-self: stretch;
+	border-radius: 2px;
+	background: var(--muted-foreground, #8c8787);
+	margin-right: 4px;
+}
+.tmr-gloss-input[data-gloss-mode="exclaim"]::before   { background: var(--tmr-c-exclaim); }
+.tmr-gloss-input[data-gloss-mode="explain"]::before   { background: var(--tmr-c-explain); }
+.tmr-gloss-input[data-gloss-mode="examine"]::before   { background: var(--tmr-c-examine); }
+.tmr-gloss-input[data-gloss-mode="emphasise"]::before { background: var(--tmr-c-emphasise); }
+
+.tmr-gloss-input .tmr-gloss-input-field {
+	flex: 1;
+	min-width: 0;
+	height: auto;
+	-webkit-appearance: none;
+	appearance: none;
+	background: transparent;
+	border: 0;
+	border-radius: 0;
+	box-shadow: none;
+	outline: none;
+	color: inherit;
+	font: inherit;
+	font-size: 14px;
+	line-height: 1.4;
+	padding: 4px 2px;
+}
+
+.tmr-gloss-input .tmr-gloss-input-field:hover,
+.tmr-gloss-input .tmr-gloss-input-field:focus,
+.tmr-gloss-input .tmr-gloss-input-field:active,
+.tmr-gloss-input .tmr-gloss-input-field:focus-visible {
+	background: transparent;
+	border-color: transparent;
+	box-shadow: none;
+}
+
+.tmr-gloss-input .tmr-gloss-input-field::placeholder {
+	color: var(--muted-foreground, #8c8787);
+	font-style: italic;
+	opacity: 0.9;
+}
+
+.tmr-gloss-input-submit {
+	width: 28px;
+	height: 28px;
+	padding: 0;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	background: transparent !important;
+	border: none;
+	border-radius: 999px;
+	color: var(--muted-foreground, #8c8787);
+	cursor: pointer;
+	transition: background 150ms ease, color 150ms ease;
+}
+
+.tmr-gloss-input-submit:hover {
+	color: var(--tx1, inherit);
+	background: rgba(127, 127, 127, 0.12);
+}
+
+.tmr-gloss-input.tmr-3c-mode[data-tmr-theme="light"] .tmr-gloss-input-submit {
+	color: #6a6458;
+}
+
+.tmr-gloss-input.tmr-3c-mode[data-tmr-theme="light"] .tmr-gloss-input-submit:hover {
+	color: #3c2e2e;
+	background: rgba(106, 100, 88, 0.10);
+}
+
+.tmr-gloss-input-submit .svg-icon {
+	width: 16px;
+	height: 16px;
+}
+
+/* ── Footer / Progress bar ─────────────────────────────────────────────────── */
+
+.tmr-footer {
+	flex-shrink: 0;
+	display: flex;
+	align-items: center;
+}
+
+.tmr-progress-bar {
+	flex: 1;
+	display: flex;
+	position: relative;
+	z-index: 10;
+	cursor: pointer;
+	padding: 6px 0;
+	user-select: none;
+}
+
+.tmr-global-page,
+.tmr-page-info {
+	font-family: var(--font-mono);
+	font-size: 10px;
+	color: var(--subtle-foreground);
+	padding: 0 0.75rem;
+	white-space: nowrap;
+	opacity: 0;
+	transition: opacity 200ms ease, color 150ms ease;
+}
+
+.tmr-root:hover .tmr-global-page,
+.tmr-root:hover .tmr-page-info {
+	opacity: 1;
+}
+
+/* Hover directly on a counter reveals its progress-bar connection via colour. */
+.tmr-root:hover .tmr-page-info:hover {
+	color: var(--primary);
+}
+
+.tmr-root:hover .tmr-global-page:hover {
+	color: var(--color-success);
+}
+
+/* Chapter counter at max (e.g. 10/10) — Examine teal micro-celebration. */
+.tmr-root:hover .tmr-page-info.tmr-page-info-max {
+	color: var(--tmr-c-examine);
+}
+
+.tmr-progress-segment {
+	flex: 1;
+	min-width: 12px;
+	height: 4px;
+	background: var(--border);
+	position: relative;
+	overflow: hidden;
+	border-radius: 2px;
+	transition: background 150ms ease;
+}
+
+.tmr-progress-segment + .tmr-progress-segment {
+	margin-left: 4px;
+}
+
+.tmr-progress-segment:hover {
+	background: var(--primary);
+}
+
+.tmr-progress-segment-fill {
+	height: 100%;
+	width: 0%;
+	transition: width 0.3s ease;
+	background: var(--secondary);
+	border-radius: 2px;
+}
+
+.tmr-progress-current .tmr-progress-segment-fill {
+	background: var(--primary);
+}
+
+.tmr-progress-complete .tmr-progress-segment-fill {
+	background: var(--color-success);
+}
+
+.tmr-progress-complete:hover .tmr-progress-segment-fill {
+	background: var(--primary);
+}
+
+/* In light 3C mode the track (--border = Empire-800C #a4a3a7) and the
+   completed fill (--color-success = Dusk-500 #8f996c) are too similar in
+   lightness — both look like "grey-brown" against the light background.
+   Dropping the track to --secondary (Empire-600 #e1dee0) makes unread
+   segments recede and lets the olive/dawn fills read as clearly distinct. */
+.tmr-root.tmr-3c-mode[data-tmr-theme="light"] .tmr-progress-segment {
+	background: var(--secondary);
+}
+
+/* ── Progress back button ──────────────────────────────────────────────────── */
+
+.tmr-progress-back {
+	position: absolute;
+	top: -28px;
+	transform: translateX(-50%);
+	display: inline-flex;
+	align-items: center;
+	gap: 3px;
+	height: auto;
+	min-height: 0;
+	appearance: none !important;
+	background: var(--popover) !important;
+	border: 1px solid var(--border) !important;
+	border-radius: 6px;
+	color: var(--foreground) !important;
+	font-family: var(--font-secondary);
+	font-size: 12px;
+	padding: 3px 8px;
+	cursor: pointer;
+	z-index: 5;
+	line-height: 1.3;
+	white-space: nowrap;
+	box-shadow: none !important;
+	transition: border-color 150ms ease, opacity 260ms ease, transform 260ms ease;
+}
+
+.tmr-progress-back:hover {
+	border-color: var(--hover-border) !important;
+}
+
+/* Committed-to-destination: the pill recedes (fades + drops toward the bar)
+   but stays in the layout so it can fade back in on dot-hover. */
+.tmr-progress-back-dismissed {
+	opacity: 0;
+	transform: translateX(-50%) translateY(6px);
+	pointer-events: none;
+}
+
+.tmr-progress-back-icon {
+	display: inline-flex;
+	width: 11px;
+	height: 11px;
+	color: var(--primary);
+	transform: rotate(180deg);
+	pointer-events: none;
+}
+
+.tmr-progress-back-icon .svg-icon {
+	width: 11px;
+	height: 11px;
+}
+
+.tmr-progress-back-label {
+	pointer-events: none;
+	color: inherit !important;
+}
+
+/* One-time first-run hint above the Library settings gear. Shape mirrors the
+   reader's progress "Back" pill (.tmr-progress-back), but uses Obsidian's global
+   theme vars (it's body-scoped, outside .tmr-root) and fixed positioning (so the
+   strip's overflow can't clip it). */
+.tmr-lib-feedback-hint {
+	position: fixed;
+	z-index: 60;
+	display: inline-flex;
+	align-items: center;
+	max-width: 300px;
+	background: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s, 6px);
+	color: var(--text-normal);
+	font-size: 12px;
+	line-height: 1.35;
+	padding: 6px 10px;
+	box-shadow: var(--shadow-s);
+	cursor: pointer;
+	opacity: 0;
+	transform: translateY(4px);
+	transition: opacity 200ms ease, transform 200ms ease;
+}
+
+.tmr-lib-feedback-hint-visible {
+	opacity: 1;
+	transform: translateY(0);
+}
+
+.tmr-lib-feedback-hint-caret {
+	position: absolute;
+	top: 100%;
+	width: 8px;
+	height: 8px;
+	background: var(--background-secondary);
+	border-right: 1px solid var(--background-modifier-border);
+	border-bottom: 1px solid var(--background-modifier-border);
+	transform: translate(-50%, -50%) rotate(45deg);
+}
+
+/* Return-point marker dot sitting on the progress bar itself. */
+.tmr-progress-back-marker {
+	position: absolute;
+	top: 50%;
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	background: var(--primary);
+	box-shadow: 0 0 0 2px var(--background);
+	transform: translate(-50%, -50%);
+	pointer-events: auto;
+	cursor: pointer;
+	z-index: 4;
+	transition: left 200ms ease, box-shadow 150ms ease;
+}
+
+/* Enlarge the hit target well beyond the 8px dot so hover/click is forgiving
+   without bloating the visual. */
+.tmr-progress-back-marker::after {
+	content: "";
+	position: absolute;
+	inset: -8px;
+	border-radius: 50%;
+}
+
+.tmr-progress-back-marker:hover {
+	box-shadow: 0 0 0 2px var(--background), 0 0 0 3px var(--hover-border);
+}
+
+/* ── Progress tooltip ──────────────────────────────────────────────────────── */
+
+.tmr-progress-tooltip {
+	position: absolute;
+	bottom: 100%;
+	margin-bottom: 4px;
+	background: var(--popover);
+	border: 1px solid var(--border);
+	border-radius: 4px;
+	color: var(--foreground);
+	font-family: var(--font-secondary);
+	font-size: 11px;
+	padding: 3px 8px;
+	white-space: nowrap;
+	pointer-events: none;
+	z-index: 5;
+	max-width: 250px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+/* ── Table of Contents ──────────────────────────────────────────────────────── */
+
+.tmr-toc-toggle {
+	position: absolute;
+	top: 0.5rem;
+	left: 0.5rem;
+	z-index: 25;
+	width: 2.0625rem;
+	height: 2.0625rem;
+	border-radius: 0.5625rem !important;
+	background: transparent !important;
+	border: 1px solid transparent !important;
+	box-shadow: none !important;
+	color: var(--foreground);
+	padding: 0 !important;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	cursor: pointer;
+	opacity: 0;
+	transition: opacity 200ms ease, background 150ms ease, color 150ms ease;
+	--icon-size: 1rem;
+}
+
+.tmr-root:hover .tmr-toc-toggle,
+.tmr-toc-toggle:focus-visible {
+	opacity: 1;
+}
+
+.tmr-toc-toggle.tmr-toc-toggle-hidden {
+	opacity: 0 !important;
+	pointer-events: none;
+}
+
+.tmr-toc-toggle:hover {
+	background: var(--hover-popover) !important;
+	color: var(--muted-foreground);
+}
+
+.tmr-toc-toggle .svg-icon {
+	color: inherit !important;
+}
+
+.tmr-toc {
+	position: absolute;
+	top: 0;
+	left: 0;
+	bottom: 0;
+	width: 340px;
+	max-width: calc(100% - 60px);
+	z-index: 20;
+	background: var(--sidebar);
+	border-right: 1px solid var(--sidebar-border);
+	transform: translateX(-100%);
+	transition: transform 300ms ease;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+	border-radius: 0 var(--radius-L) var(--radius-L) 0;
+}
+
+.tmr-toc.tmr-toc-open {
+	transform: translateX(0);
+}
+
+.tmr-toc-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 1rem 1rem 0.75rem;
+	border-bottom: 1px solid var(--sidebar-border);
+	flex-shrink: 0;
+}
+
+.tmr-toc-title {
+	font-family: var(--font-primary-alt);
+	font-weight: 700;
+	font-size: 1.2em;
+	color: var(--foreground);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	flex: 1;
+	min-width: 0;
+}
+
+/* Shared pane-header icon buttons — ToC close, Highlights close + note.
+   Ghost tertiary (DLS): transparent, muted icon, lights up on hover.
+   33×33 @ 9px radius (--radius-minima). */
+.tmr-pane-hdr-btn {
+	width: 2.0625rem;
+	height: 2.0625rem;
+	border-radius: 0.5625rem !important;
+	background: transparent !important;
+	border: 1px solid transparent !important;
+	box-shadow: none !important;
+	color: var(--muted-foreground) !important;
+	cursor: pointer;
+	padding: 0 !important;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+	margin-left: 0.25rem;
+	transition: background 150ms ease, color 150ms ease;
+	--icon-size: 1rem;
+}
+
+.tmr-pane-hdr-btn .svg-icon {
+	color: inherit !important;
+	opacity: 1 !important;
+}
+
+.tmr-pane-hdr-btn:hover {
+	background: var(--hover-popover) !important;
+	color: var(--foreground) !important;
+}
+
+/* In light contexts the muted resting colour washes out against the pane
+   header; use the full foreground so the X / note icons stay legible. Covers
+   both 3C light and the user's own light theme (3C off → no data-tmr-theme). */
+.tmr-root[data-tmr-theme="light"] .tmr-pane-hdr-btn,
+body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
+	color: var(--foreground) !important;
+}
+
+.tmr-toc-list {
+	flex: 1;
+	overflow-y: auto;
+	padding: 0.5rem 0;
+}
+
+.tmr-toc-item {
+	font-family: var(--font-secondary);
+	font-size: 13px;
+	line-height: 1.5;
+	color: var(--sidebar-foreground);
+	padding: 0.5rem 1rem;
+	display: flex;
+	align-items: center;
+	cursor: pointer;
+	transition: color 150ms ease, background 150ms ease;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	border-left: 2px solid transparent;
+}
+
+.tmr-toc-item:hover {
+	color: var(--foreground);
+	background: var(--border);
+}
+
+.tmr-toc-item.tmr-toc-active {
+	color: var(--primary);
+	border-left-color: var(--primary);
+}
+
+/* 3C mode: chapters (level-0) get filled card; sub-levels get left-accent only. */
+.tmr-3c-mode .tmr-toc-list {
+	display: flex;
+	flex-direction: column;
+	gap: 0.375rem;
+}
+
+.tmr-3c-mode .tmr-toc-item {
+	margin: 0 0.75rem;
+	padding: 0.5rem 0.75rem;
+	flex-shrink: 0;
+	border-left: none;
+	border-radius: var(--radius-s);
+}
+
+/* Level-0 (chapters): full card treatment */
+.tmr-3c-mode .tmr-toc-item[data-level="0"]:hover {
+	background: var(--hover-sidebar-accent);
+	color: var(--sidebar-accent-foreground);
+}
+
+.tmr-3c-mode .tmr-toc-item[data-level="0"].tmr-toc-active {
+	background: var(--hover-sidebar-accent);
+	color: var(--sidebar-accent-foreground);
+	font-weight: 600;
+	box-shadow: inset 0 0 0 2px var(--sidebar-accent);
+}
+
+/* Sub-levels (headings within chapters): left-accent only, no card fill */
+.tmr-3c-mode .tmr-toc-item:not([data-level="0"]) {
+	border-left: 2px solid transparent;
+	background: none;
+}
+
+.tmr-3c-mode .tmr-toc-item:not([data-level="0"]):hover {
+	background: none;
+	color: var(--sidebar-accent-foreground);
+	border-left-color: var(--sidebar-border);
+}
+
+.tmr-3c-mode .tmr-toc-item:not([data-level="0"]).tmr-toc-active {
+	color: var(--sidebar-accent-foreground);
+	border-left-color: var(--sidebar-accent);
+	background: none;
+	font-weight: normal;
+}
+
+/* ── ToC footer (mode / theme toggles) ─────────────────────────────────────── */
+
+.tmr-toc-footer {
+	flex-shrink: 0;
+	display: flex;
+	gap: 8px;
+	padding: 0.75rem 1rem;
+	border-top: 1px solid var(--sidebar-border);
+}
+
+.tmr-toc-mode-btn,
+.tmr-toc-theme-btn {
+	appearance: none !important;
+	background: transparent !important;
+	border: 1px solid transparent !important;
+	border-radius: var(--radius-s);
+	box-shadow: none !important;
+	color: var(--foreground) !important;
+	width: 2.625rem;
+	height: 2.625rem;
+	padding: 0;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	cursor: pointer;
+	transition: color 150ms ease, border-color 150ms ease, background 150ms ease;
+	flex-shrink: 0;
+}
+
+.tmr-toc-mode-btn:hover,
+.tmr-toc-theme-btn:hover {
+	color: var(--muted-foreground) !important;
+	background: var(--hover-popover) !important;
+}
+
+/* In 3C light mode the "switch to dark" button uses a Prince-500 background on
+   hover so it previews the dark theme rather than using the dark hover-popover. */
+.tmr-root.tmr-3c-mode[data-tmr-theme="light"] .tmr-toc-theme-btn:hover {
+	background: var(--sidebar-accent) !important;  /* Prince-500 #979187 */
+	color: var(--background) !important;            /* Empire-500 #f1eff0 */
+}
+
+.tmr-toc-mode-btn.tmr-toc-footer-btn-active {
+	color: var(--primary) !important;
+	border-color: var(--primary) !important;
+	background: var(--hover-popover) !important;
+}
+
+.tmr-toc-mode-btn svg {
+	width: 22px;
+	height: 22px;
+	fill: currentColor;
+	color: inherit !important;
+}
+
+.tmr-toc-theme-btn .svg-icon {
+	width: 22px;
+	height: 22px;
+	color: inherit !important;
+}
+
+.tmr-toc-backdrop {
+	position: absolute;
+	inset: 0;
+	z-index: 15;
+	display: none;
+}
+
+.tmr-toc-backdrop.tmr-toc-backdrop-visible {
+	display: block;
+}
+
+/* ── State helpers ─────────────────────────────────────────────────────────── */
+
+.tmr-hidden { display: none !important; }
+
+.tmr-loading {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	flex: 1;
+	color: var(--subtle-foreground);
+	font-family: var(--font-secondary);
+	font-size: 0.9em;
+}
+
+.tmr-error { color: var(--destructive); }
+
+/* ── Annotation preview (hover over saved highlights) ────────────────────────
+   Body-scoped floater (escapes .tmr-root's `contain`) that surfaces the
+   annotation's user text when the pointer hovers a saved highlight. Mirrors
+   the GlossBar/gloss-input theming pattern so it flips with the plugin theme.
+   Pointer-events off — the pointer should still hit the underlying rect for
+   hit-testing, and we never want to block text selection. */
+
+.tmr-annotation-preview {
+	position: fixed;
+	z-index: 9999;
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	padding: 8px 12px;
+	max-width: 320px;
+	background: var(--bg2, var(--background-primary));
+	color: var(--tx1, inherit);
+	border: 1px solid var(--ui1, var(--background-modifier-border));
+	border-radius: 9px;
+	box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+	font-family: var(--font-secondary);
+	font-size: 13px;
+	line-height: 1.45;
+	pointer-events: none;
+	border-left-width: 3px;
+	border-left-style: solid;
+	border-left-color: var(--muted-foreground, #8c8787);
+}
+
+.tmr-annotation-preview.tmr-3c-mode:not([data-tmr-theme="light"]) {
+	background: #1f1f1f;
+	border-top-color: #353535;
+	border-right-color: #353535;
+	border-bottom-color: #353535;
+	--bold-color: #8c8787;   /* Empire-900W */
+	--italic-color: #979187; /* Prince-500 */
+}
+.tmr-annotation-preview.tmr-3c-mode[data-tmr-theme="light"] {
+	background: #e1dee0;
+	color: #6a6458;
+	border-top-color: #a4a3a7;
+	border-right-color: #a4a3a7;
+	border-bottom-color: #a4a3a7;
+	box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
+	--muted-foreground: #a4a3a7;
+	--bold-color: #605a4d;   /* Prince-900 */
+	--italic-color: #7d2e2e; /* Oh Dear */
+}
+
+.tmr-annotation-preview.tmr-3c-mode[data-tmr-theme="light"] .tmr-annotation-preview-empty {
+	color: #a4a3a7;
+}
+
+/* Emphasis lock — setInlineMarkdown writes <strong>/<em> straight into this
+   body-scoped floater (outside .tmr-root), so the active theme's strong/em
+   colour rules leak in and override the DLS palette, same as the chat bubble.
+   Re-assert the DLS tokens (set per light/dark above) in 3C mode at specificity
+   (0,2,1), beating the theme's (0,1,2); when 3C is off these drop out and the
+   theme styles the markup normally. */
+.tmr-annotation-preview.tmr-3c-mode strong,
+.tmr-annotation-preview.tmr-3c-mode b { color: var(--bold-color); }
+.tmr-annotation-preview.tmr-3c-mode em,
+.tmr-annotation-preview.tmr-3c-mode i { color: var(--italic-color); }
+
+/* Mode accent on the left edge — mirrors the rect tint + tile colour. */
+.tmr-annotation-preview[data-gloss-mode="exclaim"]   { border-left-color: var(--tmr-c-exclaim); }
+.tmr-annotation-preview[data-gloss-mode="explain"]   { border-left-color: var(--tmr-c-explain); }
+.tmr-annotation-preview[data-gloss-mode="examine"]   { border-left-color: var(--tmr-c-examine); }
+.tmr-annotation-preview[data-gloss-mode="emphasise"] { border-left-color: var(--tmr-c-emphasise); }
+.tmr-annotation-preview[data-gloss-mode="enquiry"]   { border-left-color: var(--tmr-c-enquiry); }
+
+.tmr-annotation-preview-mode {
+	font-family: var(--font-primary);
+	font-size: 10px;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	color: var(--muted-foreground, #8c8787);
+}
+
+.tmr-annotation-preview[data-gloss-mode="exclaim"]   .tmr-annotation-preview-mode { color: var(--tmr-c-exclaim-icon); }
+.tmr-annotation-preview[data-gloss-mode="explain"]   .tmr-annotation-preview-mode { color: var(--tmr-c-explain); }
+.tmr-annotation-preview[data-gloss-mode="examine"]   .tmr-annotation-preview-mode { color: var(--tmr-c-examine); }
+.tmr-annotation-preview[data-gloss-mode="emphasise"] .tmr-annotation-preview-mode { color: var(--tmr-c-emphasise); }
+
+.tmr-annotation-preview-body {
+	white-space: pre-wrap;
+	word-wrap: break-word;
+}
+
+.tmr-annotation-preview-empty {
+	color: var(--muted-foreground, #8c8787);
+	font-style: italic;
+	opacity: 0.8;
+}
+
+/* ── Gloss callouts (companion doc) ──────────────────────────────────────────
+   Global selectors — companion doc renders in Obsidian's stock markdown view,
+   not inside .tmr-root, so these rules target the native `.callout[data-callout]`
+   structure wherever it appears. The five gloss types are unique enough that
+   we're not worried about collisions with other callout types in the vault.
+
+   `--callout-color` takes an `R, G, B` triplet; `--callout-icon` takes any
+   lucide icon name. Both are standard Obsidian callout hooks. Colour triplets
+   mirror the DLS primitives used by the GlossBar and the persistent-highlight
+   overlay so reader ↔ companion doc stays chromatically linked. */
+
+.callout[data-callout="exclaim"] {
+	--callout-color: 175, 77, 77;               /* HipAgni */
+	--callout-icon: lucide-circle-alert;
+}
+.callout[data-callout="explain"] {
+	--callout-color: 172, 156, 93;              /* Look */
+	--callout-icon: lucide-help-circle;
+}
+.callout[data-callout="examine"] {
+	--callout-color: 99, 150, 162;              /* Learn */
+	--callout-icon: lucide-search;
+}
+.callout[data-callout="emphasise"] {
+	--callout-color: 80, 128, 92;               /* All Good */
+	--callout-icon: lucide-highlighter;
+}
+.callout[data-callout="enquiry"] {
+	--callout-color: 140, 135, 135;             /* Shadow / Empire-900W */
+	--callout-icon: lucide-message-circle-more;
+}
+
+/* AI exchange text — styled muted italic at reduced size. Activated by the
+   Phase 4 write path, which will wrap AI responses in
+   `<span class="tmr-ai-line">…</span>` so the two-turn inline exchange is
+   visually distinguishable from the user's own annotation. Placeholder rule
+   sits here now so Phase 4 is pure wiring. */
+.callout[data-callout="exclaim"]   .tmr-ai-line,
+.callout[data-callout="explain"]   .tmr-ai-line,
+.callout[data-callout="examine"]   .tmr-ai-line,
+.callout[data-callout="emphasise"] .tmr-ai-line,
+.callout[data-callout="enquiry"]   .tmr-ai-line {
+	font-style: italic;
+	font-size: 0.88em;
+	color: var(--text-muted);
+}
+
+/* ── GlossBar tile tooltip (body-scoped, tinted per mode) ──────────────────── */
+
+.tmr-gloss-tooltip {
+	position: fixed;
+	z-index: 9999;
+	padding: 4px 10px;
+	border-radius: 8px;
+	font-family: var(--font-mono, "Kode Mono", monospace);
+	font-size: 11px;
+	letter-spacing: 0.04em;
+	line-height: 1.3;
+	background: var(--bg2, var(--background-primary));
+	border: 1px solid currentColor;
+	box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+	pointer-events: none;
+	white-space: nowrap;
+	user-select: none;
+}
+
+.tmr-gloss-tooltip.tmr-3c-mode[data-tmr-theme="light"] {
+	background: #e1dee0;
+	box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+.tmr-gloss-tooltip[data-gloss-mode="exclaim"]   { color: var(--tmr-c-exclaim-icon); }
+.tmr-gloss-tooltip[data-gloss-mode="explain"]   { color: var(--tmr-c-explain); }
+.tmr-gloss-tooltip[data-gloss-mode="examine"]   { color: var(--tmr-c-examine); }
+.tmr-gloss-tooltip[data-gloss-mode="emphasise"] { color: var(--tmr-c-emphasise); }
+.tmr-gloss-tooltip[data-gloss-mode="enquiry"]   { color: var(--tmr-c-enquiry); }
+
+/* ── Highlights navigation panel (right-side slide-in) ─────────────────────── */
+
+.tmr-highlights-toggle {
+	position: absolute;
+	top: 0.5rem;
+	right: 0.5rem;
+	z-index: 25;
+	width: 2.0625rem;
+	height: 2.0625rem;
+	border-radius: 0.5625rem !important;
+	background: transparent !important;
+	border: 1px solid transparent !important;
+	box-shadow: none !important;
+	color: var(--foreground);
+	padding: 0 !important;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	cursor: pointer;
+	opacity: 0;
+	transition: opacity 200ms ease, background 150ms ease, color 150ms ease;
+	--icon-size: 1rem;
+}
+
+.tmr-root:hover .tmr-highlights-toggle,
+.tmr-highlights-toggle:focus-visible {
+	opacity: 1;
+}
+
+.tmr-highlights-toggle.tmr-highlights-toggle-hidden {
+	opacity: 0 !important;
+	pointer-events: none;
+}
+
+.tmr-highlights-toggle:hover {
+	background: var(--hover-popover) !important;
+	color: var(--muted-foreground);
+}
+
+.tmr-highlights-toggle .svg-icon {
+	color: inherit !important;
+}
+
+.tmr-highlights-panel {
+	position: absolute;
+	top: 0;
+	right: 0;
+	bottom: 0;
+	width: 340px;
+	max-width: calc(100% - 60px);
+	z-index: 20;
+	background: var(--sidebar);
+	border-left: 1px solid var(--sidebar-border);
+	transform: translateX(100%);
+	transition: transform 300ms ease;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+	padding-bottom: var(--status-bar-height, 1.5rem);
+	border-radius: var(--radius-L) 0 0 var(--radius-L);
+}
+
+.tmr-highlights-panel.tmr-highlights-open {
+	transform: translateX(0);
+}
+
+.tmr-highlights-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 1rem 1rem 0.75rem;
+	border-bottom: 1px solid var(--sidebar-border);
+	flex-shrink: 0;
+}
+
+.tmr-highlights-title {
+	font-family: var(--font-primary-alt);
+	font-weight: 700;
+	font-size: 1.2em;
+	color: var(--foreground);
+	flex: 1;
+	min-width: 0;
+}
+
+.tmr-highlights-list {
+	flex: 1;
+	overflow-y: auto;
+	padding: 0.5rem 0 1rem;
+}
+
+.tmr-highlights-empty {
+	padding: 1.25rem 1rem;
+	color: var(--muted-foreground);
+	font-family: var(--font-secondary);
+	font-size: 12px;
+	line-height: 1.5;
+	font-style: italic;
+}
+
+.tmr-highlights-section-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 0.5rem;
+	font-family: var(--font-primary);
+	font-size: 11px;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+	color: var(--muted-foreground);
+	padding: 0.9rem 1rem 0.35rem;
+	transition: color 150ms ease;
+}
+
+.tmr-section-header-collapsible { cursor: pointer; }
+.tmr-section-header-collapsible:hover { color: var(--foreground); }
+
+.tmr-section-header-left {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	min-width: 0;
+	flex: 0 1 auto;
+}
+
+.tmr-section-header-label {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+/* Chevron points down when open; rotates to point right when collapsed. */
+.tmr-section-chevron {
+	display: inline-flex;
+	flex-shrink: 0;
+	transition: transform 200ms ease;
+}
+
+.tmr-section-chevron .svg-icon { width: 11px; height: 11px; }
+
+.tmr-section-collapsed .tmr-section-chevron { transform: rotate(-90deg); }
+
+/* Count badge: bookmark + annotation count, faded in only while collapsed. */
+.tmr-section-count {
+	display: inline-flex;
+	align-items: center;
+	gap: 3px;
+	flex-shrink: 0;
+	text-transform: none;
+	letter-spacing: 0;
+	opacity: 0;
+	transition: opacity 200ms ease;
+}
+
+.tmr-section-collapsed .tmr-section-count { opacity: 1; }
+
+.tmr-section-count-icon { display: inline-flex; }
+.tmr-section-count-icon .svg-icon { width: 12px; height: 12px; }
+
+.tmr-section-count-num {
+	font-family: var(--font-mono, "Kode Mono", monospace);
+	font-size: 10px;
+	font-weight: normal;
+	letter-spacing: 0.06em;
+}
+
+/* Rows "fall out" on collapse: the grid row animates 1fr → 0fr while the inner
+   wrapper clips the overflow and fades — pure CSS, no height measurement. */
+.tmr-section-items {
+	display: grid;
+	grid-template-rows: 1fr;
+	transition: grid-template-rows 250ms ease;
+}
+
+.tmr-section-collapsed .tmr-section-items {
+	grid-template-rows: 0fr;
+}
+
+.tmr-section-items-inner {
+	min-height: 0;
+	overflow: hidden;
+	transition: opacity 200ms ease;
+}
+
+.tmr-section-collapsed .tmr-section-items-inner {
+	opacity: 0;
+}
+
+.tmr-highlights-item {
+	position: relative;
+	display: flex;
+	gap: 0.6rem;
+	align-items: flex-start;
+	padding: 0.55rem 1rem;
+	cursor: pointer;
+	border-left: 2px solid transparent;
+	transition: background 150ms ease, border-color 150ms ease;
+}
+
+.tmr-highlights-item:hover {
+	background: var(--hover-popover);
+}
+
+.tmr-highlights-item-icon {
+	flex-shrink: 0;
+	width: 16px;
+	height: 16px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	margin-top: 2px;
+}
+
+.tmr-highlights-item-icon .svg-icon {
+	width: 14px;
+	height: 14px;
+}
+
+.tmr-highlights-item[data-gloss-mode="exclaim"]   { border-left-color: var(--tmr-c-exclaim); }
+.tmr-highlights-item[data-gloss-mode="explain"]   { border-left-color: var(--tmr-c-explain); }
+.tmr-highlights-item[data-gloss-mode="examine"]   { border-left-color: var(--tmr-c-examine); }
+.tmr-highlights-item[data-gloss-mode="emphasise"] { border-left-color: var(--tmr-c-emphasise); }
+.tmr-highlights-item[data-gloss-mode="enquiry"]   { border-left-color: var(--tmr-c-enquiry); }
+
+.tmr-highlights-item[data-gloss-mode="exclaim"]   .tmr-highlights-item-icon { color: var(--tmr-c-exclaim-icon); }
+.tmr-highlights-item[data-gloss-mode="explain"]   .tmr-highlights-item-icon { color: var(--tmr-c-explain); }
+.tmr-highlights-item[data-gloss-mode="examine"]   .tmr-highlights-item-icon { color: var(--tmr-c-examine); }
+.tmr-highlights-item[data-gloss-mode="emphasise"] .tmr-highlights-item-icon { color: var(--tmr-c-emphasise); }
+.tmr-highlights-item[data-gloss-mode="enquiry"]   .tmr-highlights-item-icon { color: var(--tmr-c-enquiry); }
+
+.tmr-highlights-item-body {
+	flex: 1;
+	min-width: 0;
+	font-family: var(--font-secondary);
+	font-size: 12px;
+	line-height: 1.45;
+	color: var(--sidebar-foreground);
+}
+
+.tmr-highlights-item-quote {
+	display: -webkit-box;
+	-webkit-line-clamp: 2;
+	line-clamp: 2;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
+	color: var(--foreground);
+}
+
+.tmr-highlights-item-note {
+	margin-top: 0.25rem;
+	color: var(--muted-foreground);
+	font-style: italic;
+	display: -webkit-box;
+	-webkit-line-clamp: 2;
+	line-clamp: 2;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
+}
+
+.tmr-highlights-item-note-editable {
+	cursor: pointer;
+	transition: color 150ms ease;
+}
+
+.tmr-highlights-item-note-editable:hover {
+	color: var(--foreground);
+}
+
+/* Muted, input-level prompt standing in for an absent note. */
+.tmr-highlights-item-add-note {
+	margin-top: 0.25rem;
+	color: var(--muted-foreground);
+	font-style: italic;
+	opacity: 0.75;
+	cursor: pointer;
+	transition: color 150ms ease, opacity 150ms ease;
+}
+
+.tmr-highlights-item-add-note:hover {
+	color: var(--foreground);
+	opacity: 1;
+}
+
+.tmr-highlights-note-input {
+	margin-top: 0.25rem;
+	width: 100%;
+	box-sizing: border-box;
+	background: var(--background);
+	border: 1px solid var(--border);
+	border-radius: 5px;
+	color: var(--foreground);
+	font-family: var(--font-secondary);
+	font-size: 12px;
+	line-height: 1.45;
+	padding: 4px 7px;
+	outline: none;
+	transition: border-color 150ms ease;
+}
+
+.tmr-highlights-note-input:focus {
+	border-color: var(--tmr-c-emphasise);
+}
+
+/* Per-row delete affordance; fades in on row hover. */
+.tmr-highlights-item-delete {
+	position: absolute;
+	top: 0.4rem;
+	right: 0.5rem;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 22px;
+	height: 22px;
+	padding: 0;
+	border: none;
+	border-radius: 5px;
+	background: transparent;
+	color: var(--muted-foreground);
+	cursor: pointer;
+	opacity: 0;
+	box-shadow: none !important;
+	transition: opacity 150ms ease, color 150ms ease, background 150ms ease;
+}
+
+.tmr-highlights-item:hover .tmr-highlights-item-delete {
+	opacity: 0.65;
+}
+
+.tmr-highlights-item-delete:hover {
+	opacity: 1 !important;
+	color: var(--destructive);
+	background: var(--hover-popover);
+}
+
+.tmr-highlights-item-delete .svg-icon {
+	width: 13px;
+	height: 13px;
+}
+
+.tmr-highlights-backdrop {
+	position: absolute;
+	inset: 0;
+	z-index: 15;
+	display: none;
+}
+
+.tmr-highlights-backdrop.tmr-highlights-backdrop-visible {
+	display: block;
+}
+
+/* ── Highlights Pane: tab bar + Conversations list ─────────────────────────── */
+/* Pencil sources: azAp2 (Sidebar/Annotations), oGl2e (Sidebar/Conversations),
+   xqC3E (Sidebar/Conversations/Empty), Wff3G (Annotation card primitive). */
+
+/* ── Tab bar ─────────────────────────────────────────────────────────────── */
+/* DLS: Tabs container #2e2e2e / pill #1f1f1f / hover hint #262626          */
+/* All sizes rem so CMD+/- scales the whole pane uniformly.                 */
+
+.tmr-pane-tabs-wrap {
+	padding: 0.5rem 0.625rem 0.625rem;
+	flex-shrink: 0;
+}
+
+.tmr-pane-tabs {
+	position: relative;
+	display: flex;
+	align-items: stretch;
+	gap: 0.25rem;
+	padding: 0.25rem;
+	height: 2.25rem;
+	background: var(--secondary);
+	border-radius: 0.5625rem;
+}
+
+/* Sliding active indicator pill — moves left/right via data-active attr */
+.tmr-pane-tabs::before {
+	content: '';
+	position: absolute;
+	top: 0.25rem;
+	bottom: 0.25rem;
+	left: 0.25rem;
+	width: calc(50% - 0.375rem);
+	background: var(--surface-inset);
+	border-radius: var(--radius-min);
+	transition: left 220ms cubic-bezier(0.4, 0, 0.2, 1);
+	pointer-events: none;
+	z-index: 0;
+}
+
+.tmr-pane-tabs[data-active="conversations"]::before {
+	left: calc(50% + 0.125rem);
+}
+
+.tmr-pane-tab {
+	flex: 1 1 0;
+	position: relative;
+	z-index: 1;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	font-family: var(--font-secondary);
+	font-size: 0.75rem;
+	font-weight: 500;
+	color: var(--sidebar-accent-foreground) !important;
+	background: transparent !important;
+	border: 1px solid transparent !important;
+	box-shadow: none !important;
+	border-radius: 0.5625rem;
+	padding: 0 0.75rem;
+	cursor: pointer;
+	transition: background 150ms ease, color 150ms ease;
+}
+
+.tmr-pane-tab.tmr-pane-tab-active {
+	font-weight: 600;
+	color: var(--foreground) !important;
+}
+
+.tmr-pane-tab:hover:not(.tmr-pane-tab-active) {
+	background: var(--hover-popover) !important;
+}
+
+/* ── Conversations list container (#1f1f1f rounded frame) ─────────────────── */
+
+.tmr-conversations-list {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow: hidden;
+	margin: 0 0.5625rem 0.5625rem;
+	background: var(--surface-inset);
+	border-radius: 0.9375rem;
+	padding: 0.375rem;
+	display: flex;
+	flex-direction: column;
+	gap: 0.75rem;
+}
+
+/* Scrollable cards area — fills all available height above the filter row */
+.tmr-conv-cards {
+	flex: 1 1 0;
+	min-height: 0;
+	overflow-y: auto;
+	display: flex;
+	flex-direction: column;
+	gap: 0.75rem;
+}
+
+/* Focused: one conversation open — cards area locks scroll */
+.tmr-conv-cards.tmr-conv-list-focused {
+	overflow-y: hidden;
+	gap: 0;
+}
+
+/* Hide all other cards while one is expanded */
+.tmr-conv-cards.tmr-conv-list-focused .tmr-conv-card:not(.tmr-conv-card-expanded) {
+	display: none;
+}
+
+/* Hide filter row while a conversation is open */
+.tmr-conv-cards.tmr-conv-list-focused ~ .tmr-conv-filter-row {
+	display: none;
+}
+
+/* ── Conversations filter row ────────────────────────────────────────────── */
+
+.tmr-conv-filter-row {
+	display: flex;
+	align-items: center;
+	gap: 0.625rem;
+	flex-shrink: 0;
+	padding: 0.125rem 0 0.125rem;
+}
+
+/* Sort pills — hidden until filter is open; slide in from the right */
+.tmr-conv-filter-options {
+	display: flex;
+	gap: 0.375rem;
+	flex: 1 1 0;
+	overflow: hidden;
+	opacity: 0;
+	pointer-events: none;
+	transform: translateX(0.75rem);
+	transition: opacity 180ms ease, transform 180ms ease;
+}
+
+.tmr-conv-filter-options.tmr-conv-filter-options-open {
+	opacity: 1;
+	pointer-events: auto;
+	transform: translateX(0);
+}
+
+.tmr-conv-sort-btn {
+	flex: 1 1 0;
+	height: 2.0625rem;
+	font-family: var(--font-secondary);
+	font-size: 0.6875rem;
+	font-weight: 400;
+	color: var(--muted-foreground) !important;
+	background: var(--surface-inset) !important;
+	border: 1px solid var(--border) !important;
+	border-radius: 0.5625rem;
+	padding: 0.4375rem 0.6875rem;
+	cursor: pointer;
+	transition: color 120ms ease, border-color 120ms ease;
+	box-shadow: none !important;
+}
+
+.tmr-conv-sort-btn:hover:not(.tmr-conv-sort-btn-active) {
+	color: var(--foreground) !important;
+}
+
+.tmr-conv-sort-btn.tmr-conv-sort-btn-active {
+	color: var(--foreground) !important;
+	font-weight: 600;
+}
+
+/* Filter icon button — always visible at bottom-right */
+.tmr-conv-filter-btn {
+	flex-shrink: 0;
+	margin-left: auto;
+	width: 2.0625rem;
+	height: 2.0625rem;
+	padding: 0 !important;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	background: var(--surface-inset) !important;
+	border: 1px solid var(--border) !important;
+	border-radius: 0.5625rem;
+	color: var(--muted-foreground) !important;
+	cursor: pointer;
+	transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+	box-shadow: none !important;
+}
+
+.tmr-conv-filter-btn .svg-icon {
+	width: 1rem;
+	height: 1rem;
+}
+
+.tmr-conv-filter-btn.tmr-conv-filter-btn-active {
+	background: #262626 !important;
+	border-color: #6ea793 !important;
+	color: #6ea793 !important;
+}
+
+.tmr-conv-filter-btn:hover:not(.tmr-conv-filter-btn-active) {
+	color: var(--foreground) !important;
+}
+
+/* ── Conversation card ───────────────────────────────────────────────────── */
+
+/* Transparent wrapper — all visual styling lives on .tmr-conv-card-row */
+.tmr-conv-card {
+	display: flex;
+	flex-direction: column;
+	cursor: pointer;
+}
+
+/* The visible box (Annotation component from DLS) */
+.tmr-conv-card-row {
+	display: flex;
+	align-items: flex-start;
+	background: var(--card);
+	border-radius: 0.5625rem;
+	border: 0 solid transparent;
+	border-left-width: 3px;
+	padding: 0.5rem 0.5rem 0.625rem 0.875rem;
+	cursor: pointer;
+	transition: border-width 180ms ease, border-radius 180ms ease;
+}
+
+.tmr-conv-card:hover .tmr-conv-card-row {
+	background: var(--hover-popover);
+}
+
+/* Per-mode border colors */
+.tmr-conv-card[data-gloss-mode="exclaim"] .tmr-conv-card-row { border-color: var(--tmr-c-exclaim); }
+.tmr-conv-card[data-gloss-mode="explain"] .tmr-conv-card-row { border-color: var(--tmr-c-explain); }
+.tmr-conv-card[data-gloss-mode="examine"] .tmr-conv-card-row { border-color: var(--tmr-c-examine); }
+.tmr-conv-card[data-gloss-mode="enquiry"] .tmr-conv-card-row { border-color: #a7a3a5; }
+
+/* Open: 3px left → 1px top+left+right, bottom stroke dropped, corners kept */
+.tmr-conv-card-expanded .tmr-conv-card-row {
+	border-width: 1px;
+	border-bottom-width: 0;
+}
+
+.tmr-conv-card-body {
+	flex: 1 1 auto;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 0.125rem;
+}
+
+.tmr-conv-card-title {
+	font-family: var(--font-secondary);
+	font-size: 0.875rem;
+	font-weight: 500;
+	color: var(--foreground);
+	line-height: 1.35;
+	overflow: hidden;
+	display: -webkit-box;
+	-webkit-line-clamp: 2;
+	line-clamp: 2;
+	-webkit-box-orient: vertical;
+	word-break: break-word;
+}
+
+.tmr-conv-card-preview {
+	font-family: var(--font-secondary);
+	font-size: 0.8125rem;
+	font-style: italic;
+	font-weight: 400;
+	color: var(--muted-foreground);
+	line-height: 1.4;
+	overflow: hidden;
+	display: -webkit-box;
+	-webkit-line-clamp: 2;
+	line-clamp: 2;
+	-webkit-box-orient: vertical;
+	word-break: break-word;
+}
+
+.tmr-conv-card-preview-pending { opacity: 0.7; }
+.tmr-conv-card-preview-error   { color: var(--destructive); font-style: normal; }
+
+/* Chevron: per-mode color, rotates 90° on expand */
+.tmr-conv-card-chevron {
+	flex-shrink: 0;
+	align-self: flex-start;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	margin-left: 0.375rem;
+	padding-top: 0.1875rem;
+	transform-origin: center center;
+	transition: transform 220ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.tmr-conv-card[data-gloss-mode="exclaim"] .tmr-conv-card-chevron { color: var(--tmr-c-exclaim-icon); }
+.tmr-conv-card[data-gloss-mode="explain"] .tmr-conv-card-chevron { color: var(--tmr-c-explain); }
+.tmr-conv-card[data-gloss-mode="examine"] .tmr-conv-card-chevron { color: var(--tmr-c-examine); }
+.tmr-conv-card[data-gloss-mode="enquiry"] .tmr-conv-card-chevron { color: #a7a3a5; }
+
+.tmr-conv-card-chevron .svg-icon {
+	width: 0.8125rem;
+	height: 0.8125rem;
+}
+
+.tmr-conv-card-expanded .tmr-conv-card-chevron {
+	transform: rotate(90deg);
+}
+
+/* Expanded card fills the full list height */
+.tmr-conv-list-focused .tmr-conv-card-expanded {
+	flex: 1;
+	min-height: 0;
+}
+
+/* ── Open conversation surface ───────────────────────────────────────────── */
+
+.tmr-conv-surface {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 0.75rem;
+	padding: 0.625rem 0.375rem 0.375rem;
+}
+
+/* Source quote — centred italic Labrada */
+.tmr-conv-quote {
+	font-family: var(--font-secondary);
+	font-size: 0.8125rem;
+	font-style: italic;
+	font-weight: 300;
+	color: var(--muted-foreground);
+	line-height: 1.55;
+	text-align: center;
+	padding: 0 0.5rem;
+}
+
+/* Chat log — grows to fill space, scrolls internally */
+.tmr-conv-log {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
+	display: flex;
+	flex-direction: column;
+	gap: 0.75rem;
+	padding-bottom: 0.25rem;
+}
+
+/* AI bubble: full-width, left accent stripe */
+.tmr-conv-turn-ai-wrap {
+	display: flex;
+}
+
+.tmr-conv-turn-ai-bubble {
+	flex: 1;
+	min-width: 0;
+	background: var(--secondary);
+	border-radius: 0.5625rem 0.5625rem 0.5625rem 0.1875rem;
+	border-left: 3px solid var(--sidebar-border);
+	padding: 0.5rem 0.625rem;
+	font-family: var(--font-secondary);
+	font-size: 0.8125rem;
+	line-height: 1.5;
+	color: var(--foreground);
+	word-break: break-word;
+	/* Bridge Obsidian markdown renderer vars to the active DLS tokens so
+	   rendered markdown respects 3C light/dark instead of leaking the
+	   surrounding Obsidian theme. */
+	--text-normal: var(--foreground);
+	--text-muted: var(--muted-foreground);
+	--text-faint: var(--subtle-foreground);
+	--code-background: var(--surface-inset);
+	--link-color: var(--primary);
+	--link-color-hover: var(--hover-border);
+	--bold-weight: 600;
+}
+
+/* Strip default spacing Obsidian's renderer adds to the first/last block */
+.tmr-conv-turn-ai-bubble > :first-child { margin-top: 0; }
+.tmr-conv-turn-ai-bubble > :last-child  { margin-bottom: 0; }
+
+/* 3C-mode emphasis lock. The AI bubble is the only surface we render through
+   Obsidian's MarkdownRenderer, so the active theme's strong/em/heading colour
+   rules (e.g. `body:not(.default-font-color) strong`, specificity 0,1,2) leak
+   in and override the DLS palette — bold/italic show up in the theme accent
+   instead of the Empire/Prince tokens. Re-assert the DLS tokens here, scoped
+   to 3C mode at specificity (0,3,1) so it wins; when 3C mode is off these
+   drop out and the active theme styles the markdown as normal. Mirrors the
+   reader-content rules under `.tmr-content`. */
+.tmr-root.tmr-3c-mode .tmr-conv-turn-ai-bubble strong,
+.tmr-root.tmr-3c-mode .tmr-conv-turn-ai-bubble b { color: var(--bold-color); }
+.tmr-root.tmr-3c-mode .tmr-conv-turn-ai-bubble em,
+.tmr-root.tmr-3c-mode .tmr-conv-turn-ai-bubble i { color: var(--italic-color); }
+.tmr-root.tmr-3c-mode .tmr-conv-turn-ai-bubble h1,
+.tmr-root.tmr-3c-mode .tmr-conv-turn-ai-bubble h2,
+.tmr-root.tmr-3c-mode .tmr-conv-turn-ai-bubble h3,
+.tmr-root.tmr-3c-mode .tmr-conv-turn-ai-bubble h4,
+.tmr-root.tmr-3c-mode .tmr-conv-turn-ai-bubble h5,
+.tmr-root.tmr-3c-mode .tmr-conv-turn-ai-bubble h6 { color: var(--foreground); }
+
+/* User bubble: full-width, right-anchored shape */
+.tmr-conv-turn-user-wrap {
+	display: flex;
+}
+
+.tmr-conv-turn-user-bubble {
+	flex: 1;
+	min-width: 0;
+	background: var(--sidebar-accent);
+	border-radius: 0.5625rem 0.5625rem 0.1875rem 0.5625rem;
+	padding: 0.5rem 0.625rem;
+	font-family: var(--font-secondary);
+	font-size: 0.8125rem;
+	line-height: 1.5;
+	color: #f1eff0;
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+/* Pending indicator — animated "Connecting…" / "Loading model…" / "Thinking…"
+   with blinking dots. The tmr-turn-connecting / -loading / -thinking phase
+   classes only swap the label text (set in main.ts); the visual is shared. */
+.tmr-conv-turn-ai-bubble.tmr-turn-pending {
+	color: var(--muted-foreground);
+	font-style: italic;
+	display: inline-flex;
+	align-items: center;
+	gap: 0.125rem;
+}
+
+.tmr-thinking-dots {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.1875rem;
+	margin-left: 0.25rem;
+}
+.tmr-thinking-dots .tmr-dot {
+	width: 0.25rem;
+	height: 0.25rem;
+	border-radius: 50%;
+	background: currentColor;
+	opacity: 0.3;
+	animation: tmr-dot-blink 1.4s ease-in-out infinite both;
+}
+.tmr-thinking-dots .tmr-dot:nth-child(2) { animation-delay: 0.2s; }
+.tmr-thinking-dots .tmr-dot:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes tmr-dot-blink {
+	0%, 80%, 100% { opacity: 0.3; transform: translateY(0); }
+	40%           { opacity: 1;   transform: translateY(-1px); }
+}
+
+/* Live streamed text: rendered as-typed (plain, pre-wrap) with a blinking
+   caret, until the formatted markdown bubble replaces it on completion. */
+.tmr-conv-turn-ai-bubble.tmr-turn-streaming {
+	white-space: pre-wrap;
+}
+.tmr-conv-turn-ai-bubble.tmr-turn-streaming::after {
+	content: "";
+	display: inline-block;
+	width: 0.45em;
+	height: 0.95em;
+	margin-left: 2px;
+	transform: translateY(0.15em);
+	background: var(--primary);
+	opacity: 0.7;
+	animation: tmr-caret-blink 1s steps(2, start) infinite;
+}
+@keyframes tmr-caret-blink { 0%, 100% { opacity: 0.7; } 50% { opacity: 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+	.tmr-thinking-dots .tmr-dot { animation: none; opacity: 0.7; }
+	.tmr-conv-turn-ai-bubble.tmr-turn-streaming::after { animation: none; opacity: 0.5; }
+}
+
+.tmr-conv-turn-ai-bubble.tmr-turn-error {
+	color: var(--destructive, #cc4444);
+	font-size: 0.8125rem;
+}
+
+/* ── Chat box (DLS "Chat box" component) ─────────────────────────────────── */
+
+.tmr-conv-chatbox {
+	flex-shrink: 0;
+	background: var(--card);
+	border-radius: 0.5625rem;
+	border: 1px solid var(--sidebar-border);
+	padding: 0.5625rem 0.75rem;
+	display: flex;
+	flex-direction: column;
+	justify-content: space-between;
+	gap: 0.375rem;
+	min-height: 4.5rem;
+}
+
+.tmr-conv-chatbox-top {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+}
+
+.tmr-conv-textarea {
+	flex: 1 1 auto;
+	resize: none;
+	background: transparent !important;
+	border: none !important;
+	box-shadow: none !important;
+	outline: none;
+	font-family: var(--font-secondary);
+	font-size: 0.8rem;
+	font-style: italic;
+	font-weight: 400;
+	color: var(--foreground);
+	line-height: 1.4;
+	padding: 0;
+	min-height: 1.25rem;
+	max-height: 5rem;
+	overflow-y: auto;
+	caret-color: var(--foreground);
+}
+
+.tmr-conv-textarea::placeholder {
+	color: var(--muted-foreground);
+	font-style: italic;
+}
+
+/* Send button — Ghost small */
+.tmr-conv-send {
+	flex-shrink: 0;
+	width: 2.0625rem;
+	height: 2.0625rem;
+	border-radius: 0.5625rem !important;
+	background: transparent !important;
+	border: 1px solid transparent !important;
+	box-shadow: none !important;
+	cursor: pointer;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 0 !important;
+	color: var(--muted-foreground);
+	transition: background 150ms ease, color 150ms ease;
+	--icon-size: 0.9375rem;
+}
+
+.tmr-conv-send:disabled {
+	opacity: 0.3;
+	cursor: default;
+}
+
+.tmr-conv-send:not(:disabled):hover {
+	background: var(--hover-popover) !important;
+	color: var(--foreground);
+}
+
+.tmr-conv-chatbox-bottom {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+}
+
+/* Model picker: chevron-down + model name */
+.tmr-conv-model-picker {
+	display: flex;
+	align-items: center;
+	gap: 0.1875rem;
+	font-family: var(--font-secondary);
+	font-size: 0.6875rem;
+	font-weight: 300;
+	color: var(--muted-foreground);
+	cursor: pointer;
+	max-width: 75%;
+	overflow: hidden;
+}
+
+/* Clickable when a provider is resolved — brighten on hover to signal it. */
+.tmr-conv-model-picker-clickable:hover {
+	color: var(--foreground);
+}
+
+.tmr-conv-model-picker .svg-icon {
+	flex-shrink: 0;
+	width: 0.5625rem;
+	height: 0.5625rem;
+}
+
+.tmr-conv-model-picker span {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+/* Settings button — Ghost small */
+.tmr-conv-settings-btn {
+	width: 2.0625rem;
+	height: 2.0625rem;
+	border-radius: 0.5625rem !important;
+	background: transparent !important;
+	border: 1px solid transparent !important;
+	box-shadow: none !important;
+	color: var(--muted-foreground);
+	cursor: pointer;
+	padding: 0 !important;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	transition: background 150ms ease, color 150ms ease;
+	--icon-size: 0.875rem;
+}
+
+.tmr-conv-settings-btn:hover {
+	background: var(--hover-popover) !important;
+	color: var(--foreground);
+}
+
+.tmr-conv-settings-btn .svg-icon {
+	width: 0.875rem;
+	height: 0.875rem;
+}
+
+/* Examine inline citation pills inside assistant bubbles. Tinted the same
+   warm hue as Look ($Look) at a low alpha so they read as a soft inline
+   marker rather than a button. Click opens the URL; hover shows the source
+   via the existing tmr-tooltip. */
+.tmr-citation {
+	display: inline;
+	cursor: pointer;
+	font-size: 0.75em;
+	font-weight: 600;
+	color: var(--text-accent, var(--tmr-c-examine));
+	background: color-mix(in srgb, var(--tmr-c-examine) 12%, transparent);
+	border-radius: 3px;
+	padding: 0 3px;
+	margin: 0 1px;
+	vertical-align: baseline;
+	transition: background 120ms ease, color 120ms ease;
+}
+
+.tmr-citation:hover {
+	background: color-mix(in srgb, var(--tmr-c-examine) 25%, transparent);
+	color: var(--text-accent-hover, var(--tmr-c-examine));
+}
+
+/* ── Settings: provider accordion ──────────────────────────────────────── */
+.tmr-settings-provider {
+	border-radius: var(--radius-s, 12px);
+	margin-bottom: 0.5rem;
+	overflow: hidden;
+}
+
+.tmr-settings-provider-summary {
+	display: flex;
+	align-items: center;
+	gap: 0.25rem;
+	padding: 0.625rem 0.875rem;
+	cursor: pointer;
+	font-weight: 600;
+	font-size: 0.9375rem;
+	list-style: none;
+	user-select: none;
+}
+
+.tmr-settings-provider-summary::-webkit-details-marker { display: none; }
+
+.tmr-settings-provider-summary::before {
+	content: "▶";
+	font-size: 0.6em;
+	opacity: 0.5;
+	transition: transform 150ms ease;
+	flex-shrink: 0;
+}
+
+.tmr-settings-provider[open] > .tmr-settings-provider-summary::before {
+	transform: rotate(90deg);
+}
+
+.tmr-settings-provider-kind {
+	font-weight: 400;
+	opacity: 0.6;
+	font-size: 0.85em;
+}
+
+.tmr-settings-provider > .setting-item {
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+.tmr-settings-provider-actions {
+	width: fit-content;
+	margin-left: auto;
+	border-top: none !important;
+	padding-top: 0.5rem;
+	padding-bottom: 0.5rem;
+}
+
+/* ── Settings: collapsible accordion (AI system prompts) ───────────────── */
+.tmr-settings-accordion {
+	border-radius: var(--radius-s, 12px);
+	margin-top: 1rem;
+	overflow: hidden;
+}
+
+.tmr-settings-accordion-summary {
+	display: flex;
+	align-items: center;
+	gap: 0.25rem;
+	padding: 0.625rem 0.875rem;
+	cursor: pointer;
+	font-weight: 600;
+	font-size: 0.9375rem;
+	list-style: none;
+	user-select: none;
+}
+
+.tmr-settings-accordion-summary::-webkit-details-marker { display: none; }
+
+.tmr-settings-accordion-summary::before {
+	content: "▶";
+	font-size: 0.6em;
+	opacity: 0.5;
+	transition: transform 150ms ease;
+	flex-shrink: 0;
+}
+
+.tmr-settings-accordion[open] > .tmr-settings-accordion-summary::before {
+	transform: rotate(90deg);
+}
+
+.tmr-settings-accordion-intro {
+	padding: 0 0.875rem;
+	margin: 0.25rem 0 0.5rem;
+}
+
+.tmr-settings-accordion > .setting-item {
+	border-top: 1px solid var(--background-modifier-border);
+	padding: 0.75rem 0.875rem;
+}
+
+.tmr-settings-prompt-row {
+	flex-direction: column;
+	align-items: stretch;
+	gap: 0.4rem;
+}
+
+.tmr-settings-prompt-row .setting-item-control {
+	width: 100%;
+	justify-content: flex-start;
+}
+
+.tmr-settings-prompt-input {
+	flex: 1;
+	min-height: 5.5rem;
+	resize: vertical;
+	font-family: var(--font-monospace);
+	font-size: 0.8125rem;
+	line-height: 1.5;
+}
+
+/* ── Settings: Apple Books import ──────────────────────────────────────── */
+.tmr-settings-import-section {
+	margin-top: 1rem;
+}
+
+/* The header is a single card: title + description on the left, folder
+   picker button on the right. The book list grows below it, uncontained. */
+.tmr-settings-import-head .setting-item-name {
+	font-size: 1.05rem;
+	font-weight: 700;
+}
+
+.tmr-settings-import-head .setting-item-info {
+	text-align: left;
+}
+
+.tmr-settings-import-results {
+	margin-top: 0.75rem;
+}
+
+.tmr-settings-import-results:empty {
+	display: none;
+}
+
+.tmr-settings-import-footer {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 0.75rem;
+	margin-top: 0.75rem;
+}
+
+.tmr-settings-import-entry {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+	padding: 0.3125rem 0;
+}
+
+.tmr-settings-import-entry input[type="checkbox"] {
+	flex-shrink: 0;
+	cursor: pointer;
+}
+
+.tmr-settings-import-entry-name {
+	flex-shrink: 0;
+	max-width: 220px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 0.85em;
+	color: var(--text-muted);
+}
+
+.tmr-settings-import-entry-arrow {
+	flex-shrink: 0;
+	opacity: 0.4;
+	font-size: 0.85em;
+}
+
+.tmr-settings-import-entry-rename {
+	flex: 1;
+	min-width: 0;
+	background: var(--background-modifier-form-field);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 4px;
+	padding: 2px 6px;
+	font-size: 0.85em;
+	color: var(--text-normal);
+}
+
+.tmr-settings-import-status {
+	flex: 1;
+	min-width: 0;
+}
+
+.tmr-settings-import-status-line {
+	display: flex;
+	align-items: center;
+	gap: 0.375rem;
+	font-size: 0.85em;
+	padding: 0.125rem 0;
+	color: var(--text-muted);
+}
+
+.tmr-settings-import-status-icon {
+	display: inline-flex;
+}
+
+.tmr-settings-import-status-icon svg {
+	width: 1.1em;
+	height: 1.1em;
+}
+
+.tmr-settings-import-ok { color: var(--color-green); }
+.tmr-settings-import-err { color: var(--color-red); }
+
+
+/* ── Library View ─────────────────────────────────────────────────────────────
+   The plugin's home surface (LibraryView, VIEW_TYPE "tmr-library"). Inherits the
+   .tmr-root token layer + 3C mode plumbing, so it tracks the reader's theme.
+   Layout is a fixed header above a scrolling body — the root is overflow:hidden,
+   so the body owns the scroll and the header stays put ("sticky" via flex). */
+
+/* Hide Obsidian's redundant tab title bar inside the Library; the sticky header
+   carries the title. Mirrors the reader's view-header rule. */
+.workspace-leaf-content[data-type="tmr-library"] .view-header {
+	display: none;
+}
+
+/* .tmr-root already supplies display:flex; flex-direction:column; height:100%;
+   background; color; overflow:hidden — the Library only adds its own children. */
+
+/* Header (fixed; the grid scrolls beneath it) */
+.tmr-lib-header {
+	flex: 0 0 auto;
+	padding: 48px 64px 24px;
+}
+
+.tmr-lib-eyebrow {
+	font-family: var(--font-mono);
+	font-size: 11px;
+	letter-spacing: 0.18em;
+	color: var(--muted-foreground);
+	text-transform: uppercase;
+}
+
+.tmr-lib-title {
+	font-family: var(--font-primary-alt);
+	font-size: 34px;
+	font-weight: 700;
+	line-height: 1.1;
+	color: var(--foreground);
+	margin: 6px 0 0;
+}
+
+.tmr-lib-subtitle {
+	font-family: var(--font-secondary);
+	font-style: italic;
+	font-size: 15px;
+	color: var(--secondary-foreground);
+	margin: 6px 0 0;
+}
+
+/* Body (scroll container) */
+.tmr-lib-body {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow-y: auto;
+	padding: 32px 64px 48px;
+}
+
+/* Empty state */
+.tmr-lib-empty {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 10px;
+	height: 100%;
+	min-height: 320px;
+	text-align: center;
+}
+
+.tmr-lib-empty-title {
+	font-family: var(--font-primary-alt);
+	font-size: 20px;
+	font-weight: 700;
+	color: var(--foreground);
+}
+
+.tmr-lib-empty-hint {
+	font-family: var(--font-secondary);
+	font-size: 14px;
+	color: var(--muted-foreground);
+	max-width: 36ch;
+}
+
+.tmr-lib-empty-import {
+	margin-top: 8px;
+	padding: 8px 18px !important;
+	border: 1px solid var(--border) !important;
+	border-radius: var(--radius-pill) !important;
+	background: var(--card) !important;
+	box-shadow: none !important;
+	color: var(--foreground);
+	font-family: var(--font-mono);
+	font-size: 12px;
+	cursor: pointer;
+	transition: border-color 150ms ease, color 150ms ease;
+}
+
+.tmr-lib-empty-import:hover {
+	border-color: var(--hover-border) !important;
+	color: var(--primary);
+}
+
+/* Book grid — reflows to as many columns as the pane width allows. */
+.tmr-lib-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+	gap: 18px;
+}
+
+/* BookCard (3CLibrary.pen `kxepB`) */
+.tmr-lib-card {
+	display: flex;
+	flex-direction: column;
+	justify-content: space-between;
+	gap: 14px;
+	min-height: 168px;
+	padding: 24px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-min);
+	background: var(--card);
+	cursor: pointer;
+	transition: border-color 150ms ease;
+}
+
+.tmr-lib-card:hover,
+.tmr-lib-card:focus-visible {
+	border-color: var(--hover-border);
+	outline: none;
+}
+
+.tmr-lib-card-head {
+	display: flex;
+	flex-direction: column;
+	gap: 5px;
+}
+
+.tmr-lib-card-title {
+	font-family: var(--font-primary-alt);
+	font-size: 20px;
+	font-weight: 700;
+	line-height: 1.15;
+	color: var(--foreground);
+	transition: color 150ms ease;
+}
+
+.tmr-lib-card:hover .tmr-lib-card-title,
+.tmr-lib-card:focus-visible .tmr-lib-card-title {
+	color: var(--primary);
+}
+
+.tmr-lib-card-author {
+	font-family: var(--font-secondary);
+	font-style: italic;
+	font-size: 13px;
+	color: var(--muted-foreground);
+}
+
+.tmr-lib-card-foot {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.tmr-lib-card-track {
+	width: 100%;
+	height: 4px;
+	border-radius: var(--radius-pill);
+	background: var(--border);
+	overflow: hidden;
+}
+
+.tmr-lib-card-track-fill {
+	height: 100%;
+	border-radius: inherit;
+	background: var(--primary);
+}
+
+.tmr-lib-card-stats {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+}
+
+.tmr-lib-card-pct,
+.tmr-lib-card-marks {
+	font-family: var(--font-mono);
+	font-size: 10px;
+	color: var(--muted-foreground);
+}
+
+.tmr-lib-card-marks {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+
+.tmr-lib-card-marks-icon {
+	display: inline-flex;
+}
+
+.tmr-lib-card-marks-icon svg {
+	width: 12px;
+	height: 12px;
+}
+
+/* Edit-details modal note (native Obsidian modal — uses theme vars). */
+.tmr-lib-edit-note {
+	margin: 0 0 12px;
+	color: var(--text-muted);
+	font-size: 0.85em;
+}
+
+/* ── Collection strip (fixed, below the header) ───────────────────────────── */
+/* Strip = inset content row with a bottom divider (iM80o `Eq5b0`). margin (not
+   padding) insets the divider to the content width like the design. */
+.tmr-lib-strip {
+	flex: 0 0 auto;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin: 0 64px;
+	padding-bottom: 12px;
+	border-bottom: 1px solid var(--border);
+}
+
+/* Tabs Group — segmented control container (iM80o `famf8`). */
+.tmr-lib-tabs {
+	position: relative;
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	padding: 4px;
+	border-radius: var(--radius-min);
+	background: var(--secondary);
+}
+
+/* Sliding active-indicator pill — JS positions left/width to the active tab;
+   reuses the Conversations-pane easing (`.tmr-pane-tabs::before`). */
+.tmr-lib-tab-indicator {
+	position: absolute;
+	top: 4px;
+	bottom: 4px;
+	left: 4px;
+	width: 0;
+	border-radius: 6px;
+	background: var(--surface-inset);
+	transition: left 220ms cubic-bezier(0.4, 0, 0.2, 1),
+		width 220ms cubic-bezier(0.4, 0, 0.2, 1);
+	pointer-events: none;
+	z-index: 0;
+}
+
+.tmr-lib-strip-spacer {
+	flex: 1 1 auto;
+}
+
+/* Tab items (active = RY34R, inactive = SMRbV): Labrada 14/500. The active pill
+   is the sliding indicator behind it, so tabs stay transparent. */
+.tmr-lib-tab {
+	position: relative;
+	z-index: 1;
+	padding: 6px 12px !important;
+	border: none !important;
+	border-radius: 6px !important;
+	background: transparent !important;
+	box-shadow: none !important;
+	color: var(--sidebar-accent-foreground) !important;
+	font-family: var(--font-secondary);
+	font-size: 14px;
+	font-weight: 500;
+	line-height: 1.43;
+	cursor: pointer;
+	transition: color 150ms ease, background 150ms ease;
+}
+
+.tmr-lib-tab:hover:not(.tmr-lib-tab-active) {
+	background: var(--hover-popover) !important;
+}
+
+.tmr-lib-tab.tmr-lib-tab-active {
+	color: var(--foreground) !important;
+	font-weight: 600;
+}
+
+/* Tertiary icon buttons (Add-Folder / Search / Import — 26XXR). 33×33, filled
+   to the page surface with a 1px border and an 18px muted icon. */
+.tmr-lib-icon-btn {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 33px;
+	height: 33px;
+	padding: 0 !important;
+	border: 1px solid var(--border) !important;
+	border-radius: var(--radius-min) !important;
+	background: var(--popover) !important;
+	box-shadow: none !important;
+	color: var(--muted-foreground) !important;
+	cursor: pointer;
+	transition: border-color 150ms ease, color 150ms ease;
+}
+
+.tmr-lib-icon-btn:hover {
+	border-color: var(--tmr-c-examine) !important;
+	color: var(--tmr-c-examine) !important;
+}
+
+.tmr-lib-icon-btn svg {
+	width: 18px;
+	height: 18px;
+	color: inherit !important;
+}
+
+/* 3C-mode toggle: the icon-button shell, but the 3C logo path inherits the
+   button colour (it has no fill of its own). Active = 3C on → Dawn/--primary. */
+.tmr-lib-3c-btn svg {
+	fill: currentColor;
+}
+
+.tmr-lib-3c-btn.tmr-lib-3c-btn-active,
+.tmr-lib-3c-btn.tmr-lib-3c-btn-active:hover {
+	border-color: var(--primary) !important;
+	color: var(--primary) !important;
+}
+
+/* ── Exploded-epub import nudge ───────────────────────────────────────────── */
+.tmr-lib-nudge-slot {
+	flex: 0 0 auto;
+}
+
+.tmr-lib-nudge {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	margin: 12px 64px 0;
+	padding: 10px 14px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-s);
+	background: var(--card);
+}
+
+.tmr-lib-nudge-text {
+	flex: 1 1 auto;
+	font-family: var(--font-secondary);
+	font-size: 13px;
+	color: var(--foreground);
+}
+
+.tmr-lib-nudge-cta {
+	padding: 5px 14px !important;
+	border: 1px solid var(--hover-border) !important;
+	border-radius: var(--radius-pill) !important;
+	background: transparent !important;
+	box-shadow: none !important;
+	color: var(--primary);
+	font-family: var(--font-mono);
+	font-size: 12px;
+	cursor: pointer;
+	transition: background 150ms ease, color 150ms ease;
+}
+
+.tmr-lib-nudge-cta:hover {
+	background: var(--primary) !important;
+	color: var(--primary-foreground);
+}
+
+.tmr-lib-nudge-dismiss {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 24px;
+	height: 24px;
+	padding: 0 !important;
+	border: none !important;
+	background: transparent !important;
+	box-shadow: none !important;
+	color: var(--muted-foreground);
+	cursor: pointer;
+}
+
+.tmr-lib-nudge-dismiss:hover {
+	color: var(--foreground);
+}
+
+.tmr-lib-nudge-dismiss svg {
+	width: 14px;
+	height: 14px;
+}
+
+/* Selected-but-empty collection (e.g. a freshly added folder). */
+.tmr-lib-collection-empty {
+	padding: 48px 0;
+	text-align: center;
+	color: var(--muted-foreground);
+	font-family: var(--font-secondary);
+	font-style: italic;
+	font-size: 14px;
+}
+
+/* ── Search — one element: collapsed icon button (26XXR) ⇆ expanded field
+   (LwJaU). Open/close animates the width at a constant 33px height, so the
+   strip never changes height and the view doesn't jump. ───────────────────── */
+.tmr-lib-search {
+	display: flex;
+	align-items: center;
+	justify-content: flex-start;
+	width: 33px;
+	height: 33px;
+	box-sizing: border-box;
+	padding: 0 7px;
+	border: 1px solid var(--border) !important;
+	border-radius: var(--radius-min) !important;
+	background: var(--popover) !important;
+	box-shadow: none !important;
+	color: var(--muted-foreground);
+	cursor: pointer;
+	overflow: hidden;
+	transition: width 240ms cubic-bezier(0.4, 0, 0.2, 1),
+		border-color 150ms ease, border-radius 150ms ease, background 150ms ease;
+}
+
+.tmr-lib-search:hover:not(.tmr-lib-search-open),
+.tmr-lib-search:hover:not(.tmr-lib-search-open) .tmr-lib-search-icon {
+	color: var(--tmr-c-examine);
+	border-color: var(--tmr-c-examine) !important;
+}
+
+.tmr-lib-search.tmr-lib-search-open {
+	width: 240px;
+	gap: 6px;
+	/* same left padding as collapsed so the icon never shifts as it animates;
+	   only the right padding widens for the clear button. */
+	padding: 0 8px 0 7px;
+	cursor: text;
+	border-color: var(--sidebar-border) !important;
+	border-radius: var(--radius-s) !important;
+	background: transparent !important;
+}
+
+.tmr-lib-search-icon {
+	display: inline-flex;
+	flex-shrink: 0;
+	color: var(--muted-foreground);
+	transition: color 150ms ease;
+}
+
+.tmr-lib-search-icon svg {
+	width: 18px !important;
+	height: 18px !important;
+	color: inherit !important;
+}
+
+.tmr-lib-search-input,
+.tmr-lib-search-input:focus {
+	flex: 0 1 0;
+	width: 0;
+	min-width: 0;
+	height: auto;
+	padding: 0 !important;
+	border: none !important;
+	background: transparent !important;
+	box-shadow: none !important;
+	color: var(--foreground);
+	font-family: var(--font-secondary) !important;
+	font-size: 14px !important;
+	opacity: 0;
+	transition: opacity 160ms ease;
+}
+
+.tmr-lib-search-open .tmr-lib-search-input {
+	flex: 1 1 auto;
+	opacity: 1;
+}
+
+.tmr-lib-search-input::placeholder {
+	color: var(--muted-foreground);
+}
+
+.tmr-lib-search-clear {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+	width: 0;
+	height: 20px;
+	padding: 0 !important;
+	border: none !important;
+	background: transparent !important;
+	box-shadow: none !important;
+	color: var(--muted-foreground);
+	cursor: pointer;
+	opacity: 0;
+	overflow: hidden;
+	transition: opacity 160ms ease;
+}
+
+.tmr-lib-search-open .tmr-lib-search-clear {
+	width: 18px;
+	opacity: 1;
+}
+
+.tmr-lib-search-clear:hover {
+	color: var(--foreground) !important;
+}
+
+.tmr-lib-search-clear svg {
+	width: 12px;
+	height: 12px;
+}
+
+/* Grouped search results (separator + collection label per group). */
+.tmr-lib-search-group {
+	margin-bottom: 28px;
+}
+
+.tmr-lib-search-group-label {
+	margin-bottom: 14px;
+	padding-top: 14px;
+	border-top: 1px solid var(--border);
+	font-family: var(--font-mono);
+	font-size: 11px;
+	letter-spacing: 0.12em;
+	text-transform: uppercase;
+	color: var(--muted-foreground);
+}
+
+.tmr-lib-search-group:first-child .tmr-lib-search-group-label {
+	padding-top: 0;
+	border-top: none;
+}
+
+/* Drag-reorder affordance (R9 refines). */
+.tmr-lib-tab[draggable="true"] {
+	cursor: grab;
+}
+
+.tmr-lib-tab-dragging {
+	opacity: 0.4;
+}
+
+.tmr-lib-tab-dragover {
+	box-shadow: inset 2px 0 0 0 var(--primary);
+}
