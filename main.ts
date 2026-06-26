@@ -2801,8 +2801,20 @@ export class ReaderView extends ItemView {
 		const spreadWidth = spread.clientWidth > 0 ? spread.clientWidth : fallbackWidth;
 		const innerWidth = Math.max(100, spreadWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight));
 		const gap = this.getColumnGap(mode, spread);
-		const colWidth = Math.max(100, mode === "single" ? innerWidth : (innerWidth - gap) / 2);
-		content.style.columnWidth = `${colWidth}px`;
+		// `innerWidth` comes from float padding math and can run a sub-pixel wider
+		// than the pixel-snapped `.tmr-content` box the columns actually live in
+		// (this divergence only shows up at fractional UI zoom). Compute the column
+		// width against the real box so two columns are guaranteed to fit.
+		const usableInner = content.clientWidth > 0 ? Math.min(innerWidth, content.clientWidth) : innerWidth;
+		const colWidth = Math.max(100, mode === "single" ? usableInner : (usableInner - gap) / 2);
+		// CSS `column-width` is a *minimum*: if the applied value rounds up even a
+		// hair past what fits, multicol drops from two columns to one full-width
+		// column and the right page is clipped by `overflow: clip`. Apply a value
+		// just under the true column width as the minimum so two columns always
+		// fit; the returned `colWidth` stays the true rendered width so stride and
+		// column-count measurement remain exact.
+		const cssColWidth = mode === "single" ? colWidth : Math.max(100, Math.floor(colWidth) - 1);
+		content.style.columnWidth = `${cssColWidth}px`;
 		content.style.columnGap = `${gap}px`;
 		return { innerWidth, colWidth, gap };
 	}
