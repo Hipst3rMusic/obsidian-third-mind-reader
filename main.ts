@@ -1203,7 +1203,6 @@ export class ReaderView extends ItemView {
 		// the next swipe become possible. To page repeatedly, swipe in succession.
 		// Vertical-dominant scroll (plain mouse wheel) stays inert.
 		const SWIPE_THRESHOLD = 45;
-		const SWIPE_REARM_FLOOR = 4;
 		const SWIPE_IDLE_RESET_MS = 150;
 		let swipeAccum = 0;
 		let swipeArmed = true;
@@ -1219,15 +1218,12 @@ export class ReaderView extends ItemView {
 				swipeArmed = true;
 				swipeIdleTimer = null;
 			}, SWIPE_IDLE_RESET_MS);
-			// While disarmed, wait for the swipe (incl. its momentum tail) to settle
-			// to a near-stop before allowing the next page turn.
-			if (!swipeArmed) {
-				if (Math.abs(e.deltaX) < SWIPE_REARM_FLOOR) {
-					swipeArmed = true;
-					swipeAccum = 0;
-				}
-				return;
-			}
+			// While disarmed, swallow every event (the momentum tail keeps resetting
+			// the idle timer above) and only re-arm once the wheel stream has fully
+			// stopped for SWIPE_IDLE_RESET_MS. Re-arming on a momentary low-delta dip
+			// instead would catch the lull at the gesture→momentum handoff and let the
+			// inertial tail fire a second page turn — one physical flick, two pages.
+			if (!swipeArmed) return;
 			// Reversed direction: start counting the new direction fresh.
 			if (swipeAccum !== 0 && Math.sign(e.deltaX) !== Math.sign(swipeAccum)) swipeAccum = 0;
 			swipeAccum += e.deltaX;
