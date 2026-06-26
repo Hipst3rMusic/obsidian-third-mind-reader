@@ -225,8 +225,8 @@ export class LibraryView extends ItemView {
 
 		// Import lives in settings, so this opens the settings tab — hence the gear
 		// icon (per the updated DLS); the action is still "import a book".
-		const addBook = this.iconButton(strip, "settings", "Import a book");
-		this.registerDomEvent(addBook, "click", () => this.openImporter());
+		const addBook = this.iconButton(strip, "settings", "Settings");
+		this.registerDomEvent(addBook, "click", () => this.openSettings());
 
 		if (!this.plugin.settings.feedbackHintShown) this.showFeedbackHint(addBook);
 
@@ -450,7 +450,9 @@ export class LibraryView extends ItemView {
 
 	/** Open (or reveal) the importer. Interim: surfaces the importer in the
 	 *  settings tab; a dedicated in-Library import modal is deferred. */
-	private openImporter(): void {
+	/** Opens the plugin's settings tab (where the book importer lives), not a
+	 *  standalone importer — every "import" entry point routes here. */
+	private openSettings(): void {
 		const setting = (this.app as any).setting;
 		setting?.open?.();
 		setting?.openTabById?.(this.plugin.manifest.id);
@@ -507,7 +509,7 @@ export class LibraryView extends ItemView {
 			hint.remove();
 			if (this.feedbackHintEl === hint) this.feedbackHintEl = null;
 		};
-		this.registerDomEvent(hint, "click", () => { dismiss(); this.openImporter(); });
+		this.registerDomEvent(hint, "click", () => { dismiss(); this.openSettings(); });
 		this.registerDomEvent(anchor, "click", dismiss);
 		window.setTimeout(dismiss, 9000);
 	}
@@ -549,7 +551,7 @@ export class LibraryView extends ItemView {
 			text: `Found ${n} book${n === 1 ? "" : "s"} that ${n === 1 ? "needs" : "need"} to be imported.`,
 		});
 		const cta = banner.createEl("button", { cls: "tmr-lib-nudge-cta", text: "Import" });
-		this.registerDomEvent(cta, "click", () => this.openImporter());
+		this.registerDomEvent(cta, "click", () => this.openSettings());
 		const dismiss = banner.createEl("button", { cls: "tmr-lib-nudge-dismiss" });
 		setIcon(dismiss, "x");
 		setTooltip(dismiss, "Dismiss");
@@ -644,6 +646,23 @@ export class LibraryView extends ItemView {
 			head.createEl("div", { cls: "tmr-lib-card-author", text: `— ${book.author}` });
 		}
 
+		// Hover-revealed ellipsis: a visible handle for the same menu that
+		// right-clicking anywhere on the card already opens. Click must not
+		// bubble to the card's open-on-click / Enter handlers.
+		const menuBtn = card.createEl("button", { cls: "tmr-lib-card-menu" });
+		setIcon(menuBtn, "ellipsis");
+		menuBtn.setAttribute("aria-label", "More options");
+		this.registerDomEvent(menuBtn, "click", (e: MouseEvent) => {
+			e.stopPropagation();
+			this.showCardMenu(e, book);
+			// Drop focus after a mouse click so the button doesn't stay revealed
+			// once the menu is dismissed (keyboard activation, detail 0, keeps it).
+			if (e.detail > 0) menuBtn.blur();
+		});
+		this.registerDomEvent(menuBtn, "keydown", (e: KeyboardEvent) => {
+			if (e.key === "Enter" || e.key === " ") e.stopPropagation();
+		});
+
 		const foot = card.createEl("div", { cls: "tmr-lib-card-foot" });
 		const track = foot.createEl("div", { cls: "tmr-lib-card-track" });
 		const fill = track.createEl("div", { cls: "tmr-lib-card-track-fill" });
@@ -734,7 +753,7 @@ export class LibraryView extends ItemView {
 			cls: "tmr-lib-empty-import",
 			text: "Import a book",
 		});
-		this.registerDomEvent(importBtn, "click", () => this.openImporter());
+		this.registerDomEvent(importBtn, "click", () => this.openSettings());
 	}
 }
 

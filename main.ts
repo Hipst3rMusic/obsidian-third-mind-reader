@@ -15,6 +15,7 @@ import {
 	SecretComponent,
 	TextAreaComponent,
 	TextComponent,
+	Modal,
 	SuggestModal,
 	Platform,
 	apiVersion,
@@ -37,6 +38,14 @@ import { OffsetMap, type CursorRange } from "./pretext-layer";
 import { chat, probeProvider, probeModelLoaded, type AiProvider, type ChatMessage, type ProviderKind, type LocalRuntime } from "./ai-client";
 import { LibraryView, LIBRARY_VIEW_TYPE } from "./library-view";
 import { type LibraryOverride, invalidateMetaCache, LIBRARY_ROOT } from "./library-scan";
+// Bundled 3C typefaces (OFL/Apache). Imported as base64 data URLs (see
+// esbuild.config.mjs `dataurl` loader) so they ship inside main.js and render
+// for BRAT testers, whose vaults never receive the loose fonts/ folder.
+import RosarivoRegular from "./fonts/Rosarivo-Regular.ttf";
+import RosarivoItalic from "./fonts/Rosarivo-Italic.ttf";
+import LabradaRegular from "./fonts/Labrada-VariableFont_wght.ttf";
+import LabradaItalic from "./fonts/Labrada-Italic-VariableFont_wght.ttf";
+import KodeMono from "./fonts/KodeMono-VariableFont_wght.ttf";
 
 export const READER_VIEW_TYPE = "third-mind-reader";
 
@@ -98,6 +107,10 @@ interface ThirdMindReaderSettings {
 	/** One-time flag: the Library shows a feedback hint above the settings gear on
 	 *  first load, then sets this so it never reappears. */
 	feedbackHintShown: boolean;
+	/** One-time flag: the "How to use the reader" help modal auto-opens the first
+	 *  time a book is opened, then sets this so it never auto-opens again. The
+	 *  help button (next to the ToC toggle) re-opens it on demand. */
+	helpShown: boolean;
 }
 
 /** Gloss modes that issue an AI request. Emphasise is excluded — it never
@@ -142,6 +155,7 @@ const DEFAULT_SETTINGS: ThirdMindReaderSettings = {
 	libraryOverrides: {},
 	libraryCollectionOrder: [],
 	feedbackHintShown: false,
+	helpShown: false,
 };
 
 /** Gloss annotation modes. Per-mode button fill + icon fill colours are
@@ -503,6 +517,81 @@ class ModelPickerModal extends SuggestModal<string> {
 	}
 	onChooseSuggestion(model: string): void {
 		this.onPick(model);
+	}
+}
+
+/** A cheat-sheet row: a keycap, an optional colour-flagged mode label, and a
+ *  description. Recreated from the `HelpPopoup` component in the 3C Pencil DLS. */
+interface HelpRow {
+	key: string;
+	label?: { text: string; color: string };
+	desc: string;
+}
+
+const HELP_GROUPS: { heading: string; rows: HelpRow[] }[] = [
+	{
+		heading: "Reading",
+		rows: [
+			{ key: "← / →", desc: "Previous / Next Page" },
+			{ key: "t", desc: "Table Of Contents" },
+			{ key: "h", desc: "Highlights & Annotations" },
+			{ key: "Esc", desc: "Close a panel or dismiss the Gloss toolbar" },
+		],
+	},
+	{
+		heading: "Annotating – Select Text, Then Press",
+		rows: [
+			{ key: "Select Text", desc: "Surfaces the Gloss toolbar over your selection" },
+			{ key: "1", label: { text: "Emphasise", color: "#50805c" }, desc: "Plain highlight with annotation" },
+			{ key: "2", label: { text: "Exclaim", color: "#af4d4d" }, desc: "Capture a reaction as first AI turn" },
+			{ key: "3", label: { text: "Explain", color: "#ac9c5d" }, desc: "Ask AI to clarify" },
+			{ key: "4", label: { text: "Examine", color: "#6396a2" }, desc: "Ask the AI to explore, with citations" },
+			{ key: "5", label: { text: "Enquiry", color: "#a7a3a5" }, desc: "Open back-and-forth conversation with AI" },
+		],
+	},
+];
+
+/** "How to use the Reader" — a keyboard/action cheat sheet recreated from the
+ *  3C DLS `HelpPopoup` component. Auto-opens once on first book open (gated by
+ *  `settings.helpShown`); re-openable any time from the help button beside the
+ *  ToC toggle. Pure presentation — reads no plugin state. */
+class HelpModal extends Modal {
+	onOpen(): void {
+		const { modalEl, contentEl } = this;
+		modalEl.addClass("tmr-help-modal");
+		contentEl.empty();
+
+		const header = contentEl.createDiv({ cls: "tmr-help-header" });
+		header.createEl("h2", { cls: "tmr-help-title", text: "How to use the Reader" });
+		header.createEl("p", {
+			cls: "tmr-help-intro",
+			text: "Third Mind Reader is keyboard-first. Hover over the page to reveal the panel buttons, everything else is a keystroke away.",
+		});
+
+		for (const group of HELP_GROUPS) {
+			const section = contentEl.createDiv({ cls: "tmr-help-section" });
+			section.createDiv({ cls: "tmr-help-group", text: group.heading });
+			for (const row of group.rows) {
+				const rowEl = section.createDiv({ cls: "tmr-help-row" });
+				rowEl.createDiv({ cls: "tmr-help-keycol" })
+					.createSpan({ cls: "tmr-help-keycap", text: row.key });
+				const desc = rowEl.createDiv({ cls: "tmr-help-desc" });
+				if (row.label) {
+					const lbl = desc.createSpan({ cls: "tmr-help-mode", text: row.label.text });
+					lbl.style.color = row.label.color;
+				}
+				desc.createSpan({ cls: "tmr-help-action", text: row.desc });
+			}
+		}
+
+		contentEl.createEl("p", {
+			cls: "tmr-help-foot",
+			text: "Gloss shortcuts (1-5) only trigger while text is selected and toolbar is showing. AI modes need a provider configured in settings.",
+		});
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
 	}
 }
 
@@ -934,6 +1023,24 @@ export class ReaderView extends ItemView {
 		tocToggle.ariaLabel = "Table of Contents";
 		this.registerDomEvent(tocToggle, "click", () => this.toggleToc());
 
+		const helpToggle = root.createEl("button", { cls: "tmr-help-toggle" });
+		setIcon(helpToggle, "circle-help");
+		helpToggle.ariaLabel = "How to use the reader";
+		this.registerDomEvent(helpToggle, "click", () => new HelpModal(this.app).open());
+
+		// Page-turn affordances: floating chevrons at the far edges, revealed on
+		// reader hover (same idiom as the panel toggles). advance()/retreat()
+		// no-op at the boundaries, so no disabled state is needed.
+		const prevPage = root.createEl("button", { cls: "tmr-page-nav tmr-page-nav-prev" });
+		setIcon(prevPage, "chevron-left");
+		prevPage.ariaLabel = "Previous page";
+		this.registerDomEvent(prevPage, "click", () => void this.retreat());
+
+		const nextPage = root.createEl("button", { cls: "tmr-page-nav tmr-page-nav-next" });
+		setIcon(nextPage, "chevron-right");
+		nextPage.ariaLabel = "Next page";
+		this.registerDomEvent(nextPage, "click", () => void this.advance());
+
 		const tocPanel = root.createEl("div", { cls: "tmr-toc" });
 		const tocHeader = tocPanel.createEl("div", { cls: "tmr-toc-header" });
 		this.tocTitleEl = tocHeader.createEl("span", { cls: "tmr-toc-title", text: "Contents" });
@@ -1088,9 +1195,48 @@ export class ReaderView extends ItemView {
 				void this.navigateToHref(href);
 			}
 		});
+		// Trackpad two-finger horizontal swipe → page turn, exactly one page per
+		// physical swipe. Accumulate horizontal delta and fire once past a
+		// threshold, then DISARM. Re-arming is magnitude-based: the momentum tail
+		// decays but stays above SWIPE_REARM_FLOOR for its whole duration, so it's
+		// ignored; only once the gesture physically settles (near-zero delta) does
+		// the next swipe become possible. To page repeatedly, swipe in succession.
+		// Vertical-dominant scroll (plain mouse wheel) stays inert.
+		const SWIPE_THRESHOLD = 45;
+		const SWIPE_REARM_FLOOR = 4;
+		const SWIPE_IDLE_RESET_MS = 150;
+		let swipeAccum = 0;
+		let swipeArmed = true;
+		let swipeIdleTimer: number | null = null;
 		this.registerDomEvent(this.spreadEl, "wheel", (e: WheelEvent) => {
 			// Keep navigation transform-driven; native wheel scrolling causes horizontal drift.
 			e.preventDefault();
+			if (Math.abs(e.deltaX) <= Math.abs(e.deltaY)) return;
+			// Full stop resets everything (belt-and-braces with the floor re-arm).
+			if (swipeIdleTimer !== null) window.clearTimeout(swipeIdleTimer);
+			swipeIdleTimer = window.setTimeout(() => {
+				swipeAccum = 0;
+				swipeArmed = true;
+				swipeIdleTimer = null;
+			}, SWIPE_IDLE_RESET_MS);
+			// While disarmed, wait for the swipe (incl. its momentum tail) to settle
+			// to a near-stop before allowing the next page turn.
+			if (!swipeArmed) {
+				if (Math.abs(e.deltaX) < SWIPE_REARM_FLOOR) {
+					swipeArmed = true;
+					swipeAccum = 0;
+				}
+				return;
+			}
+			// Reversed direction: start counting the new direction fresh.
+			if (swipeAccum !== 0 && Math.sign(e.deltaX) !== Math.sign(swipeAccum)) swipeAccum = 0;
+			swipeAccum += e.deltaX;
+			if (Math.abs(swipeAccum) < SWIPE_THRESHOLD) return;
+			swipeArmed = false;
+			const dir = swipeAccum;
+			swipeAccum = 0;
+			if (dir > 0) void this.advance();
+			else void this.retreat();
 		});
 		this.registerDomEvent(this.spreadEl, "mouseup", () => this.onSelectionMouseUp());
 
@@ -2515,6 +2661,12 @@ export class ReaderView extends ItemView {
 			this.buildProgressSegments();
 			this.updateProgress();
 			this.showSpread();
+			// First book open ever: surface the cheat sheet once, then remember.
+			if (!this.plugin.settings.helpShown) {
+				this.plugin.settings.helpShown = true;
+				void this.plugin.saveSettings();
+				new HelpModal(this.app).open();
+			}
 		} catch (err) {
 			console.error("[ThirdMindReader] epub parse error", err);
 			this.showError(`Failed to open epub: ${(err as Error).message}`);
@@ -4901,19 +5053,20 @@ export default class ThirdMindReader extends Plugin {
 
 	private injectFonts(): void {
 		document.getElementById("tmr-bundled-fonts")?.remove();
-		const dir = this.manifest.dir!;
-		const adapter = this.app.vault.adapter as any;
-		const faces: { family: string; weight: string; style: string; file: string }[] = [
-			{ family: "Rosarivo", weight: "400", style: "normal", file: "Rosarivo-Regular.ttf" },
-			{ family: "Rosarivo", weight: "400", style: "italic", file: "Rosarivo-Italic.ttf" },
-			{ family: "Labrada", weight: "100 900", style: "normal", file: "Labrada-VariableFont_wght.ttf" },
-			{ family: "Labrada", weight: "100 900", style: "italic", file: "Labrada-Italic-VariableFont_wght.ttf" },
-			{ family: "Kode Mono", weight: "400 700", style: "normal", file: "KodeMono-VariableFont_wght.ttf" },
+		// `url` is a base64 data URL baked into main.js at build time (see the
+		// font imports at the top of this file), so the @font-face sources are
+		// self-contained and render wherever the plugin runs — no reliance on a
+		// fonts/ folder on disk, which BRAT never delivers to testers.
+		const faces: { family: string; weight: string; style: string; url: string }[] = [
+			{ family: "Rosarivo", weight: "400", style: "normal", url: RosarivoRegular },
+			{ family: "Rosarivo", weight: "400", style: "italic", url: RosarivoItalic },
+			{ family: "Labrada", weight: "100 900", style: "normal", url: LabradaRegular },
+			{ family: "Labrada", weight: "100 900", style: "italic", url: LabradaItalic },
+			{ family: "Kode Mono", weight: "400 700", style: "normal", url: KodeMono },
 		];
-		const css = faces.map(({ family, weight, style, file }) => {
-			const url = adapter.getResourcePath(`${dir}/fonts/${file}`);
-			return `@font-face { font-family: "${family}"; font-weight: ${weight}; font-style: ${style}; src: url("${url}") format("truetype"); }`;
-		}).join("\n");
+		const css = faces.map(({ family, weight, style, url }) =>
+			`@font-face { font-family: "${family}"; font-weight: ${weight}; font-style: ${style}; src: url("${url}") format("truetype"); }`
+		).join("\n");
 
 		const el = document.createElement("style");
 		el.id = "tmr-bundled-fonts";
@@ -5106,7 +5259,47 @@ class TmrSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}));
 
+		// ── Providers list ───────────────────────────────────────────────
+		new Setting(containerEl).setName("AI providers").setHeading();
+
+		// ── Add provider (cloud + local, one dropdown) ───────────────────
+		// Local-first: TMR prioritises on-device inference, so LM Studio /
+		// Ollama lead the list and LM Studio is the default selection.
+		let pendingProvider = "lm-studio";
+		new Setting(containerEl)
+			.setName("Add provider")
+			.setDesc("Local options use an OpenAI-compatible endpoint with the default port prefilled (LM Studio :1234, Ollama :11434). Anthropic and OpenAI need an API key.")
+			.addDropdown(d => d
+				.addOption("lm-studio", "LM Studio (local)")
+				.addOption("ollama", "Ollama (local)")
+				.addOption("generic", "OpenAI-compatible (local)")
+				.addOption("anthropic", "Anthropic")
+				.addOption("openai", "OpenAI")
+				.setValue(pendingProvider)
+				.onChange(v => { pendingProvider = v; }))
+			.addButton(b => b.setButtonText("Add").setCta().onClick(() => {
+				switch (pendingProvider) {
+					case "ollama": return this.addProvider("openai-compatible", "ollama");
+					case "generic": return this.addProvider("openai-compatible", "generic");
+					case "anthropic": return this.addProvider("anthropic");
+					case "openai": return this.addProvider("openai");
+					default: return this.addProvider("openai-compatible", "lm-studio");
+				}
+			}));
+
+		if (this.plugin.settings.aiProviders.length === 0) {
+			containerEl.createEl("div", {
+				cls: "setting-item-description",
+				text: "No providers configured. Add one above — local providers (LM Studio, Ollama) need only an endpoint URL; Anthropic and OpenAI need an API key.",
+			});
+		}
+		for (let i = 0; i < this.plugin.settings.aiProviders.length; i++) {
+			this.renderProviderEditor(containerEl, i);
+		}
+
 		// ── Default model ────────────────────────────────────────────────
+		// Sits below the providers list: the natural flow is add a provider
+		// first, then pick which one is the default.
 		new Setting(containerEl).setName("Default model").setHeading();
 		new Setting(containerEl)
 			.setName("Primary provider")
@@ -5135,31 +5328,6 @@ class TmrSettingTab extends PluginSettingTab {
 					this.plugin.settings.streaming = v;
 					await this.plugin.saveSettings();
 				}));
-
-		// ── Providers list ───────────────────────────────────────────────
-		new Setting(containerEl).setName("AI providers").setHeading();
-		if (this.plugin.settings.aiProviders.length === 0) {
-			containerEl.createEl("div", {
-				cls: "setting-item-description",
-				text: "No providers configured. Add one below — local providers (LM Studio, Ollama) need only an endpoint URL; Anthropic and OpenAI need an API key.",
-			});
-		}
-		for (let i = 0; i < this.plugin.settings.aiProviders.length; i++) {
-			this.renderProviderEditor(containerEl, i);
-		}
-
-		// ── Add provider ────────────────────────────────────────────────
-		new Setting(containerEl)
-			.setName("Add provider")
-			.setDesc("Cloud providers need an API key.")
-			.addButton(b => b.setButtonText("+ Anthropic").onClick(() => this.addProvider("anthropic")))
-			.addButton(b => b.setButtonText("+ OpenAI").onClick(() => this.addProvider("openai")));
-		new Setting(containerEl)
-			.setName("Add local provider")
-			.setDesc("All use an OpenAI-compatible endpoint; the preset prefills the default port (LM Studio :1234, Ollama :11434).")
-			.addButton(b => b.setButtonText("+ LM Studio").onClick(() => this.addProvider("openai-compatible", "lm-studio")))
-			.addButton(b => b.setButtonText("+ Ollama").onClick(() => this.addProvider("openai-compatible", "ollama")))
-			.addButton(b => b.setButtonText("+ OpenAI-compatible").onClick(() => this.addProvider("openai-compatible", "generic")));
 
 		// ── AI system prompts ────────────────────────────────────────────
 		this.renderSystemPromptsSection(containerEl);

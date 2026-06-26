@@ -30,6 +30,11 @@ const context = await esbuild.context({
   treeShaking: true,
   outfile: "main.js",
   minify: prod,
+  // Inline bundled fonts as base64 data URLs so they travel inside main.js.
+  // BRAT only delivers main.js + manifest.json + styles.css, so a loose
+  // fonts/ folder never reaches testers — 3C mode would fall back to default
+  // fonts. Embedding makes the @font-face sources self-contained.
+  loader: { ".ttf": "dataurl" },
 });
 
 if (prod) {
