@@ -1,15 +1,12 @@
 import {
 	prepareWithSegments,
-	layoutWithLines,
 	type PreparedTextWithSegments,
 	type LayoutCursor,
-	type LayoutLinesResult,
 } from "@chenglou/pretext";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-export const BODY_FONT = "15px Labrada, serif";
-const BODY_LINE_HEIGHT = 15 * 1.65; // matches styles.css: font-size 15px, line-height 1.65
+const BODY_FONT = "15px Labrada, serif";
 const MIN_OPENER_CHARS = 200;
 const LEADING_WRAPPER_SELECTOR =
 	'[class*="dropcap" i], [class*="drop-cap" i], [class*="initial" i], [class*="versal" i]';
@@ -21,8 +18,6 @@ export interface ParagraphEntry {
 	element: HTMLElement;                  // live DOM <p> reference
 	text: string;                          // textContent at preparation time
 	prepared: PreparedTextWithSegments;
-	layout: LayoutLinesResult | null;      // populated on relayout
-	isChapterOpener: boolean;
 }
 
 /** A highlight range stored as pretext cursors — stable across re-renders.
@@ -47,13 +42,13 @@ export class OffsetMap {
 	 *  multiple units (current + prev + next) accumulates cleanly. Full reset
 	 *  happens on book load via `clear()`. */
 	prepareUnit(unitEl: HTMLElement, font: string = BODY_FONT): void {
-		const spineItems = Array.from(unitEl.querySelectorAll(".tmr-spine-item")) as HTMLElement[];
+		const spineItems = Array.from(unitEl.querySelectorAll<HTMLElement>(".tmr-spine-item"));
 		for (const spineItem of spineItems) {
 			const spineIndex = parseInt(spineItem.dataset.spineIndex ?? "0", 10);
 			// Body prose + list items are both annotatable. Lists stay DOM-rendered
 			// (no pretext display layout), but registering them lets a selection
 			// inside an <li> resolve to a CursorRange, so the GlossBar fires there.
-			const blocks = Array.from(spineItem.querySelectorAll("p, li")) as HTMLElement[];
+			const blocks = Array.from(spineItem.querySelectorAll<HTMLElement>("p, li"));
 			const chapterOpenerIdx = findChapterOpenerIndex(spineItem);
 
 			let paraCount = 0;
@@ -88,22 +83,15 @@ export class OffsetMap {
 					element: el,
 					text,
 					prepared,
-					layout: null,
-					isChapterOpener,
 				};
 
+				// Re-preparing a unit (after cache eviction + re-render) overwrites
+				// the entry — that refreshes the live element reference — but must
+				// not append the paraId again or orderedIds grows every re-mount.
+				if (!this.entries.has(paraId)) this.orderedIds.push(paraId);
 				this.entries.set(paraId, entry);
-				this.orderedIds.push(paraId);
 				paraCount++;
 			}
-		}
-	}
-
-	/** Relayout all prepared paragraphs at the given column width.
-	 *  Pure arithmetic — fast enough to call on every resize. */
-	relayout(columnWidth: number, lineHeight: number = BODY_LINE_HEIGHT): void {
-		for (const entry of this.entries.values()) {
-			entry.layout = layoutWithLines(entry.prepared, columnWidth, lineHeight);
 		}
 	}
 
@@ -297,10 +285,6 @@ export class OffsetMap {
 		return this.entries.get(paraId) ?? null;
 	}
 
-	get size(): number {
-		return this.entries.size;
-	}
-
 	clear(): void {
 		this.entries.clear();
 		this.orderedIds = [];
@@ -365,7 +349,7 @@ function findChapterOpenerIndex(spineItem: HTMLElement): number {
 		if (nextP) {
 			// Count the opener's index among the same blocks prepareUnit registers,
 			// so it matches paraCount even when a list precedes it.
-			const blocks = Array.from(spineItem.querySelectorAll("p, li")) as HTMLElement[];
+			const blocks = Array.from(spineItem.querySelectorAll<HTMLElement>("p, li"));
 			let nonEmptyIdx = 0;
 			for (const el of blocks) {
 				if (!isRegisterableBlock(el)) continue;
@@ -391,7 +375,7 @@ function walkToNextParagraph(start: Element, boundary: HTMLElement): HTMLElement
 				const el = current as HTMLElement;
 				if (el.tagName === "P" && (el.textContent ?? "").trim()) return el;
 				const inner = el.querySelector("p");
-				if (inner && (inner.textContent ?? "").trim()) return inner as HTMLElement;
+				if (inner && (inner.textContent ?? "").trim()) return inner;
 			}
 		} else {
 			// Move up to parent's next sibling

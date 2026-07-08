@@ -23,7 +23,6 @@ export interface EpubLinkPreview {
 	text?: string;
 	imageSrc?: string;
 	caption?: string;
-	truncated?: boolean;
 }
 
 export interface EpubCitation {
@@ -309,8 +308,7 @@ export async function extractLinkPreview(
 		const directText = normalizePreviewText(target.textContent ?? "");
 		if (directText.length >= 12 && directText.length <= 2200) {
 			const cleaned = directText.replace(/^(?:\d+|[*†‡§¶])(?:[.)\s])\s*/, "").trim();
-			const t = truncatePreviewText(cleaned.length >= 12 ? cleaned : directText);
-			return { kind: "text", ...t };
+			return { kind: "text", text: truncatePreviewText(cleaned.length >= 12 ? cleaned : directText) };
 		}
 	}
 
@@ -322,10 +320,8 @@ export async function renderSpineRange(
 	startSpine: number,
 	endSpine: number,
 	container: HTMLElement,
-	options?: { onItemRendered?: (index: number) => void; preserveContainer?: boolean },
 ): Promise<void> {
-	const preserveContainer = options?.preserveContainer ?? false;
-	if (!preserveContainer) container.empty();
+	container.empty();
 
 	const start = Math.max(0, startSpine);
 	const end = Math.min(endSpine, book.spine.length - 1);
@@ -412,8 +408,7 @@ export async function renderSpineRange(
 		// Wrap [N] citation markers in body text with hoverable .tmr-citation spans
 		wrapCitations(wrapper, book.citations);
 
-		// Notify caller and yield to the browser so Obsidian stays responsive
-		options?.onItemRendered?.(i);
+		// Yield to the browser so Obsidian stays responsive
 		await new Promise<void>(r => requestAnimationFrame(() => r()));
 	}
 }
@@ -509,7 +504,7 @@ function buildImagePreview(target: Element, path: string, book: EpubBook): EpubL
 	const caption = normalizePreviewText(
 		block.querySelector("figcaption, .caption, p")?.textContent ?? ""
 	);
-	const previewCaption = caption ? truncatePreviewText(caption).text : undefined;
+	const previewCaption = caption ? truncatePreviewText(caption) : undefined;
 	return {
 		kind: "image",
 		imageSrc: blobUrl,
@@ -524,8 +519,7 @@ function buildTextPreview(target: Element, path: string): EpubLinkPreview | null
 		if (!isTextPreviewCandidate(block, pathLooksNoteLike)) continue;
 		const text = normalizePreviewText(block.textContent ?? "");
 		if (!text) continue;
-		const previewText = truncatePreviewText(text);
-		return { kind: "text", text: previewText.text, truncated: previewText.truncated };
+		return { kind: "text", text: truncatePreviewText(text) };
 	}
 	return null;
 }
@@ -598,12 +592,9 @@ function normalizePreviewText(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
 }
 
-function truncatePreviewText(text: string): { text: string; truncated: boolean } {
-	if (text.length <= PREVIEW_MAX_CHARS) return { text, truncated: false };
-	return {
-		text: text.slice(0, PREVIEW_MAX_CHARS).trimEnd() + "…",
-		truncated: true,
-	};
+function truncatePreviewText(text: string): string {
+	if (text.length <= PREVIEW_MAX_CHARS) return text;
+	return text.slice(0, PREVIEW_MAX_CHARS).trimEnd() + "…";
 }
 
 function findClosest<T extends Element>(el: Element | null, selector: string): T | null {
@@ -707,7 +698,7 @@ function applyLayoutStyles(body: Element, cssTexts: string[]): void {
 	try {
 		sheet = new CSSStyleSheet();
 		// @import is not supported in constructable stylesheets — strip it
-		(sheet as any).replaceSync(allCss.replace(/@import\s+[^;]+;/g, ''));
+		sheet.replaceSync(allCss.replace(/@import\s+[^;]+;/g, ''));
 	} catch {
 		return; // CSS parse error — skip gracefully
 	}
@@ -913,7 +904,7 @@ function ensurePurifyHook(): void {
 	// Strip those here. Anchor hrefs are left alone — they navigate on click,
 	// they don't auto-load, so they're not a silent phone-home vector.
 	DOMPurify.addHook("afterSanitizeAttributes", (node) => {
-		const el = node as Element;
+		const el = node;
 		for (const attr of RESOURCE_ATTRS) {
 			const v = el.getAttribute(attr);
 			if (v && REMOTE_URL.test(v)) el.removeAttribute(attr);
@@ -1028,7 +1019,7 @@ function parseTocOl(ol: Element): EpubTocItem[] {
 
 // ─── ToC href resolution ──────────────────────────────────────────────────────
 
-function resolveRelativePath(path: string): string {
+export function resolveRelativePath(path: string): string {
 	const parts = path.split("/");
 	const resolved: string[] = [];
 	for (const part of parts) {

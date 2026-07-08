@@ -6,3 +6,6 @@ data.json
 
 # macOS
 .DS_Store
+
+# Build artifact — BRAT installs from release assets, not the repo tree
+main.js

@@ -486,11 +486,23 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	text-underline-offset: 2px;
 }
 
-/* Footnote ref superscripts */
+/* Footnote ref superscripts — floor the size and add weight so markers stay
+   findable and legible no matter how small the book ships them. Covering bare
+   <sup> (lettered note series, and epubs that don't anchor their refs) is the
+   key fix: the `a sup` selector alone misses them, so they fell back to the
+   book's own miniscule sizing. Only anchored refs take the accent colour +
+   pointer — teal signals "click/hover for more", which the bare lettered
+   series has no target for, so those stay in body colour. */
+.tmr-content sup,
+.tmr-content a sup,
+.tmr-content sup a {
+	font-size: max(0.82em, 12px);
+	font-weight: 600;
+}
+
 .tmr-content a sup,
 .tmr-content sup a {
 	color: var(--primary);
-	font-size: 0.75em;
 	cursor: pointer;
 }
 
@@ -512,6 +524,15 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 /* Tooltip lives on document.body (outside .tmr-root) so it needs its own
    opaque token defaults. Obsidian vars (--bg2 etc.) may contain alpha or
    be undefined at body scope — hardcode fallbacks for both native + 3C. */
+/* Off-screen hidden spread used for column/height measurement passes */
+.tmr-measure-host {
+	position: absolute;
+	left: -99999px;
+	top: 0;
+	visibility: hidden;
+	pointer-events: none;
+}
+
 .tmr-tooltip {
 	position: fixed;
 	z-index: 9999;
@@ -542,6 +563,14 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	color: #6a6458;
 	border-color: #a4a3a7;
 	box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+}
+
+/* Image previews inside link tooltips (footnote/figure hover) */
+.tmr-tooltip img {
+	max-width: 280px;
+	height: auto;
+	display: block;
+	border-radius: 4px;
 }
 
 .tmr-tooltip-caption {
@@ -717,13 +746,6 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 .tmr-gloss-bar:not(.tmr-3c-mode) .tmr-gloss-tile[data-gloss-mode="examine"]   { color: var(--tmr-c-examine); }
 .tmr-gloss-bar:not(.tmr-3c-mode) .tmr-gloss-tile[data-gloss-mode="enquiry"]   { color: var(--tmr-c-enquiry); }
 .tmr-gloss-bar:not(.tmr-3c-mode) .tmr-gloss-tile:hover { background: var(--background-modifier-hover, rgba(127, 127, 127, 0.15)) !important; }
-
-.tmr-gloss-tile-disabled,
-.tmr-gloss-tile-disabled:hover {
-	opacity: 0.45;
-	cursor: not-allowed;
-	background: transparent;
-}
 
 /* Separator stroke between the Emphasise tile and the AI tiles. */
 .tmr-gloss-sep {
@@ -1193,7 +1215,8 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	left: 2.9375rem;
 }
 
-.tmr-toc-toggle.tmr-toc-toggle-hidden {
+.tmr-toc-toggle.tmr-toc-toggle-hidden,
+.tmr-help-toggle.tmr-toc-toggle-hidden {
 	opacity: 0 !important;
 	pointer-events: none;
 }
@@ -1237,20 +1260,20 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
  * identically regardless of the active Obsidian theme. Proportions scaled up
  * from the 311px Pencil artboard for on-screen readability. */
 .modal.tmr-help-modal {
-	width: 460px;
+	width: 530px;
 	max-width: 90vw;
 	padding: 0;
 	background: #1f1f1f;
 	border: 1px solid #353535;
-	border-radius: 6px;
+	border-radius: 7px;
 }
 
 .modal.tmr-help-modal .modal-content {
 	margin: 0;
-	padding: 22px;
+	padding: 25px;
 	display: flex;
 	flex-direction: column;
-	gap: 14px;
+	gap: 16px;
 }
 
 .modal.tmr-help-modal .modal-close-button {
@@ -1260,13 +1283,13 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 .tmr-help-header {
 	display: flex;
 	flex-direction: column;
-	gap: 6px;
+	gap: 7px;
 }
 
 .tmr-help-title {
 	margin: 0;
 	font-family: "Rosarivo", var(--font-text), serif;
-	font-size: 20px;
+	font-size: 23px;
 	font-weight: 700;
 	line-height: 1.08;
 	letter-spacing: -0.01em;
@@ -1277,7 +1300,7 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 .tmr-help-intro {
 	margin: 0;
 	font-family: "Labrada", var(--font-text), sans-serif;
-	font-size: 12px;
+	font-size: 14px;
 	font-weight: 500;
 	line-height: 1.45;
 	color: #c8c5c8;
@@ -1290,38 +1313,38 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 
 .tmr-help-group {
 	font-family: "Labrada", var(--font-text), sans-serif;
-	font-size: 12px;
+	font-size: 14px;
 	font-weight: 700;
 	color: #c8c5c8;
-	padding-bottom: 4px;
+	padding-bottom: 5px;
 }
 
 .tmr-help-row {
 	display: flex;
 	align-items: center;
-	gap: 14px;
-	padding: 5px 0;
+	gap: 16px;
+	padding: 6px 0;
 	border-bottom: 1px solid #353535;
 }
 
 /* Fixed-width column so every description starts at the same x, regardless of
  * how wide the keycap chip is. The chip inside hugs its own content. */
 .tmr-help-keycol {
-	flex: 0 0 116px;
+	flex: 0 0 133px;
 	display: flex;
 }
 
 .tmr-help-keycap {
 	flex: 0 0 auto;
-	min-width: 26px;
+	min-width: 30px;
 	box-sizing: border-box;
 	text-align: center;
-	padding: 3px 8px;
+	padding: 4px 9px;
 	background: #1f1f1f;
 	border: 1px solid #353535;
-	border-radius: 4px;
+	border-radius: 5px;
 	font-family: "Kode Mono", var(--font-monospace), monospace;
-	font-size: 10px;
+	font-size: 12px;
 	line-height: 1.2;
 	color: #e3e1e2;
 	white-space: nowrap;
@@ -1330,20 +1353,20 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 .tmr-help-desc {
 	flex: 1 1 auto;
 	font-family: "Labrada", var(--font-text), sans-serif;
-	font-size: 12px;
+	font-size: 14px;
 	line-height: 1.3;
 	color: #c8c5c8;
 }
 
 .tmr-help-mode {
 	font-weight: 600;
-	margin-right: 6px;
+	margin-right: 7px;
 }
 
 .tmr-help-foot {
 	margin: 0;
 	font-family: "Labrada", var(--font-text), sans-serif;
-	font-size: 11px;
+	font-size: 13px;
 	font-weight: 500;
 	line-height: 1.4;
 	color: #9a9799;
@@ -1724,21 +1747,6 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 .callout[data-callout="enquiry"] {
 	--callout-color: 140, 135, 135;             /* Shadow / Empire-900W */
 	--callout-icon: lucide-message-circle-more;
-}
-
-/* AI exchange text — styled muted italic at reduced size. Activated by the
-   Phase 4 write path, which will wrap AI responses in
-   `<span class="tmr-ai-line">…</span>` so the two-turn inline exchange is
-   visually distinguishable from the user's own annotation. Placeholder rule
-   sits here now so Phase 4 is pure wiring. */
-.callout[data-callout="exclaim"]   .tmr-ai-line,
-.callout[data-callout="explain"]   .tmr-ai-line,
-.callout[data-callout="examine"]   .tmr-ai-line,
-.callout[data-callout="emphasise"] .tmr-ai-line,
-.callout[data-callout="enquiry"]   .tmr-ai-line {
-	font-style: italic;
-	font-size: 0.88em;
-	color: var(--text-muted);
 }
 
 /* ── GlossBar tile tooltip (body-scoped, tinted per mode) ──────────────────── */

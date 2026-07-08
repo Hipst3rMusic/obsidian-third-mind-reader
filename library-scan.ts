@@ -1,4 +1,4 @@
-import { type Vault, TFile, TFolder } from "obsidian";
+import { type Vault, TFile, TFolder, normalizePath } from "obsidian";
 import { readEpubMeta } from "./epub";
 
 /** Minimal shape the scan needs from `settings.bookPositions[path]`: the cached
@@ -55,13 +55,21 @@ export function invalidateMetaCache(path?: string): void {
 	else metaCache.clear();
 }
 
+/** Make a book title safe for use as a vault file name: illegal filename
+ *  characters → `_`, whitespace collapsed, "Book" fallback for empty results.
+ *  Single source of truth — the reader, the Library scan, and the importer all
+ *  sanitise through here. */
+export function sanitizeFileName(raw: string): string {
+	return raw.replace(/[\\/:*?"<>|]+/g, "_").replace(/\s+/g, " ").trim() || "Book";
+}
+
 /** Resolve a book's companion-doc path from its **raw OPF title**. The reader
  *  keys the doc by `book.title` (the parsed OPF title, not the Library display
- *  override), so marks must resolve against `rawTitle`, sanitised identically to
- *  the reader's `getCompanionDocPath`. */
-function companionDocPath(rawTitle: string): string {
-	const safe = rawTitle.replace(/[\\/:*?"<>|]+/g, "_").replace(/\s+/g, " ").trim() || "Book";
-	return `${ANNOTATIONS_PREFIX}${safe}-Annotations.md`;
+ *  override), so marks must resolve against `rawTitle`. Shared by the reader's
+ *  `getCompanionDocPath` and the Library scan, so the write and read paths can
+ *  never drift apart. */
+export function companionDocPath(rawTitle: string): string {
+	return normalizePath(`${ANNOTATIONS_PREFIX}${sanitizeFileName(rawTitle)}-Annotations.md`);
 }
 
 /** Each Gloss entry begins with a `> [!mode]-` header line (see `buildCallout`),

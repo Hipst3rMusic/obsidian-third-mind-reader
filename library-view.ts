@@ -379,20 +379,22 @@ export class LibraryView extends ItemView {
 		if (!group || !indicator) return;
 		const active = group.querySelector<HTMLElement>(".tmr-lib-tab-active");
 		if (!active) {
-			indicator.style.opacity = "0";
+			indicator.setCssProps({ opacity: "0" });
 			return;
 		}
 		if (active.offsetWidth === 0) {
-			indicator.style.opacity = "0";
+			indicator.setCssProps({ opacity: "0" });
 			if (retries < 60 && indicator.isConnected) {
 				requestAnimationFrame(() => this.positionTabIndicator(false, retries + 1));
 			}
 			return;
 		}
 		const place = () => {
-			indicator.style.opacity = "1";
-			indicator.style.left = `${active.offsetLeft}px`;
-			indicator.style.width = `${active.offsetWidth}px`;
+			indicator.setCssProps({
+				opacity: "1",
+				left: `${active.offsetLeft}px`,
+				width: `${active.offsetWidth}px`,
+			});
 		};
 		if (animate) {
 			// Glide to the target; hold off the resize-snap until it settles.
@@ -405,10 +407,10 @@ export class LibraryView extends ItemView {
 		} else {
 			// Resize/layout reposition — but never snap over a slide in progress.
 			if (this.tabIndicatorAnimating) return;
-			indicator.style.transition = "none";
+			indicator.setCssProps({ transition: "none" });
 			place();
 			void indicator.offsetWidth; // flush so the next change animates
-			indicator.style.transition = "";
+			indicator.setCssProps({ transition: "" });
 		}
 	}
 
@@ -427,6 +429,7 @@ export class LibraryView extends ItemView {
 	 *  any other open Library, including when toggled from the reader). */
 	private render3cToggle(strip: HTMLElement): void {
 		const btn = strip.createEl("button", { cls: "tmr-lib-icon-btn tmr-lib-3c-btn" });
+		// eslint-disable-next-line no-unsanitized/property -- Safe: LOGO_3C_SVG is a compile-time SVG constant.
 		btn.innerHTML = LOGO_3C_SVG;
 		this.registerDomEvent(btn, "click", async () => {
 			this.plugin.settings.tmrMode = this.plugin.settings.tmrMode === "3c" ? "obsidian" : "3c";
@@ -453,7 +456,10 @@ export class LibraryView extends ItemView {
 	/** Opens the plugin's settings tab (where the book importer lives), not a
 	 *  standalone importer — every "import" entry point routes here. */
 	private openSettings(): void {
-		const setting = (this.app as any).setting;
+		// Undocumented app.setting API — the only route to a specific settings tab.
+		const setting = (this.app as unknown as {
+			setting?: { open?: () => void; openTabById?: (id: string) => void };
+		}).setting;
 		setting?.open?.();
 		setting?.openTabById?.(this.plugin.manifest.id);
 	}

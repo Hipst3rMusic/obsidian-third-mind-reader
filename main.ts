@@ -5,6 +5,9 @@ import {
 	App,
 	ItemView,
 	WorkspaceLeaf,
+	FileSystemAdapter,
+	type ViewStateResult,
+	type ViewState,
 	TFile,
 	TFolder,
 	MarkdownRenderer,
@@ -30,6 +33,7 @@ import {
 	revokeImageUrls,
 	extractLinkPreview,
 	resolveEpubHref,
+	resolveRelativePath,
 	EpubBook,
 	EpubTocItem,
 	type EpubLinkPreview,
@@ -37,7 +41,7 @@ import {
 import { OffsetMap, type CursorRange } from "./pretext-layer";
 import { chat, probeProvider, probeModelLoaded, type AiProvider, type ChatMessage, type ProviderKind, type LocalRuntime } from "./ai-client";
 import { LibraryView, LIBRARY_VIEW_TYPE } from "./library-view";
-import { type LibraryOverride, invalidateMetaCache, LIBRARY_ROOT } from "./library-scan";
+import { type LibraryOverride, invalidateMetaCache, LIBRARY_ROOT, companionDocPath, sanitizeFileName } from "./library-scan";
 // Bundled 3C typefaces (OFL/Apache). Imported as base64 data URLs (see
 // esbuild.config.mjs `dataurl` loader) so they ship inside main.js and render
 // for BRAT testers, whose vaults never receive the loose fonts/ folder.
@@ -48,11 +52,6 @@ import LabradaItalic from "./fonts/Labrada-Italic-VariableFont_wght.ttf";
 import KodeMono from "./fonts/KodeMono-VariableFont_wght.ttf";
 
 export const READER_VIEW_TYPE = "third-mind-reader";
-
-/** Per-mode model overrides. Only set when the user wants a non-default
- *  routing for that mode (e.g. Examine pinned to a stronger cloud model).
- *  Each entry references a provider by id + a model id within it. */
-type GlossModeId = "explain" | "examine" | "exclaim" | "enquiry";
 
 interface ImportEntry {
 	folderPath: string;
@@ -67,8 +66,6 @@ interface AiDefaults {
 	 *  exchanges; new turns are blocked with an "configure AI provider"
 	 *  notice). */
 	primaryProviderId: string | null;
-	/** Optional per-mode override. Empty object = global default for all. */
-	perMode: Partial<Record<GlossModeId, { providerId: string; model: string }>>;
 }
 
 interface ThirdMindReaderSettings {
@@ -90,8 +87,6 @@ interface ThirdMindReaderSettings {
 	 *  submitted no text and no AI turn followed (Exclaim/Enquiry edge cases).
 	 *  Toggled per-pane via the chat-box gear popover; off by default. */
 	showBareFlaggedConversations: boolean;
-	/** Last-used source folder for the Apple Books importer (retained for migration only). */
-	importSourceFolder?: string;
 	/** Editable system-prompt templates per AI Gloss mode. `{book}` is
 	 *  substituted with the book title; the selected passage is appended
 	 *  automatically by `buildAiSystemPrompt`. */
@@ -147,7 +142,7 @@ const DEFAULT_SETTINGS: ThirdMindReaderSettings = {
 	tmrTheme: "dark",
 	bookPositions: {},
 	aiProviders: [],
-	aiDefaults: { primaryProviderId: null, perMode: {} },
+	aiDefaults: { primaryProviderId: null },
 	aiFeaturesEnabled: false,
 	streaming: true,
 	showBareFlaggedConversations: false,
@@ -192,13 +187,6 @@ function pendingLabel(phase: "connecting" | "loading" | "thinking"): string {
 		: "Thinking";
 }
 
-/** Every mode whose callouts should surface in the Conversations tab,
- *  regardless of whether the AI has actually responded yet. Includes
- *  Exclaim and Enquiry so Phase 2 reactions and freeform prompts
- *  (currently AI-less) still show up — they will gain AI turns once
- *  Phase D lands. Emphasise is permanently excluded. */
-const GLOSS_AI_MODES_ALL = new Set(["exclaim", "explain", "examine", "enquiry"]);
-
 /** Sort priority for the Conversations list: Exclaim → Explain → Examine
  *  → Enquiry, matching the GlossBar tile order. Spec §"Sort order". */
 const CONV_MODE_PRIORITY: Record<string, number> = {
@@ -236,11 +224,6 @@ interface SavedHighlight {
 	/** Source text quoted inside the callout (`> > ...` lines). Shown in the
 	 *  hover preview as context under the annotation. */
 	quote: string;
-	/** Legacy pretext cursors, populated only when the anchor was written in
-	 *  the pre-CFI format. Used as a last-resort fallback when char offsets
-	 *  aren't available. */
-	legacyCursors: { start: { segmentIndex: number; graphemeIndex: number };
-	                 end:   { segmentIndex: number; graphemeIndex: number } } | null;
 	/** Alternating user/assistant turns parsed from `User:` / `AI:` line
 	 *  prefixes within the callout body. Phase 2 callouts (no prefixes)
 	 *  produce an empty array and surface their content via `userText`. */
@@ -310,7 +293,7 @@ function parseSavedHighlights(md: string): SavedHighlight[] {
 	const result: SavedHighlight[] = [];
 	const modeRe = /^>\s*\[!(exclaim|explain|examine|emphasise|enquiry)\]/;
 	const anchorRe = /<!--\s*tmr-anchor\s+([^>]*?)-->/;
-	const fieldRe = /(spine|para|chars|start|end|prefix|endPara|endChars):(?:"((?:[^"\\]|\\.)*)"|(\S+))/g;
+	const fieldRe = /(spine|para|chars|prefix|endPara|endChars):(?:"((?:[^"\\]|\\.)*)"|(\S+))/g;
 	const lines = md.split(/\r?\n/);
 
 	let pendingMode: string | null = null;
@@ -341,18 +324,6 @@ function parseSavedHighlights(md: string): SavedHighlight[] {
 		if (endParaIdHint && fields.endChars) {
 			const e = parseInt(fields.endChars, 10);
 			if (Number.isFinite(e)) endChar = e;
-		}
-
-		let legacyCursors: SavedHighlight["legacyCursors"] = null;
-		if (fields.start && fields.end) {
-			const [ss, sg] = fields.start.split(",").map((n) => parseInt(n, 10));
-			const [es, eg] = fields.end.split(",").map((n) => parseInt(n, 10));
-			if ([ss, sg, es, eg].every(Number.isFinite)) {
-				legacyCursors = {
-					start: { segmentIndex: ss, graphemeIndex: sg },
-					end:   { segmentIndex: es, graphemeIndex: eg },
-				};
-			}
 		}
 
 		const prefix = fields.prefix ? decodeURIComponent(fields.prefix) : "";
@@ -431,7 +402,6 @@ function parseSavedHighlights(md: string): SavedHighlight[] {
 			prefix,
 			userText,
 			quote: quoteLines.join("\n").trim(),
-			legacyCursors,
 			turns,
 			aiState,
 			aiError,
@@ -487,6 +457,16 @@ interface ReaderPosition {
 
 type LayoutMode = "spread" | "single";
 
+/** Persisted reader leaf state (getState/setState round-trip). Obsidian
+ *  sometimes hands the state back nested one level deep on tab restore,
+ *  hence the recursive `state` field. */
+interface ReaderViewState extends Record<string, unknown> {
+	file?: string;
+	unitIndex?: number;
+	spread?: number;
+	state?: ReaderViewState;
+}
+
 /** Render inline markdown (bold, italic, code) into `el` synchronously.
  *  HTML-escapes the text first so this is safe for untrusted content.
  *  Handles: **bold**, *italic*, ***bold-italic***, `code`. */
@@ -494,6 +474,7 @@ function setInlineMarkdown(el: HTMLElement, text: string): void {
 	const esc = text
 		.replace(/&/g, "&amp;").replace(/</g, "&lt;")
 		.replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+	// eslint-disable-next-line no-unsanitized/property -- Safe: the text is fully HTML-escaped above, so the only markup that can reach the DOM is the tags these replaces emit.
 	el.innerHTML = esc
 		.replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>")
 		.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
@@ -807,7 +788,7 @@ export class ReaderView extends ItemView {
 		// those live in `addReaderCommands`. Escape is also handled here (universal
 		// cancel; fires even while a panel input has focus).
 		this.registerDomEvent(document, "keydown", (e: KeyboardEvent) => {
-			if (this.app.workspace.activeLeaf !== this.leaf) return;
+			if (this.app.workspace.getActiveViewOfType(ReaderView) !== this) return;
 			if (e.key === "Escape" && this.isGlossActive()) {
 				this.dismissGloss();
 				return;
@@ -896,11 +877,12 @@ export class ReaderView extends ItemView {
 		this.contentEl.empty();
 	}
 
-	async setState(state: any, result: any): Promise<void> {
-		const filePath: string | undefined = state?.state?.file ?? state?.file;
+	async setState(state: unknown, result: ViewStateResult): Promise<void> {
+		const s = (state ?? {}) as ReaderViewState;
+		const filePath = s.state?.file ?? s.file;
 		if (filePath) {
-			const incomingUnit = state?.state?.unitIndex ?? state?.unitIndex;
-			const incomingSpread = state?.state?.spread ?? state?.spread;
+			const incomingUnit = s.state?.unitIndex ?? s.unitIndex;
+			const incomingSpread = s.state?.spread ?? s.spread;
 			const storedPos = this.plugin.settings.bookPositions[filePath];
 			const savedUnitIndex: number = incomingUnit ?? storedPos?.unitIndex ?? 0;
 			const savedSpread: number = incomingSpread ?? storedPos?.spread ?? 0;
@@ -926,15 +908,18 @@ export class ReaderView extends ItemView {
 
 			// First open (Obsidian opened the epub, not us). Two cases:
 			if (!this.plugin._openingEpub) {
-				const hist = (this.leaf as any).history;
+				// Undocumented but stable leaf-internal history — the only way to
+				// know whether this leaf held content before the epub landed in it.
+				const hist = (this.leaf as unknown as { history?: { back?: { state: ViewState }[] } }).history;
 				if (hist?.back?.length) {
 					// The leaf already holds content the user navigated to (e.g. Cmd+O
 					// replacing the active tab). Don't clobber it: open the book in a
 					// dedicated tab and revert this leaf to where it was.
 					const originatingLeaf = this.leaf;
+					const restoreState = hist.back[hist.back.length - 1].state;
 					void this.plugin.openEpubInNewTab(filePath);
 					setTimeout(() => {
-						originatingLeaf.setViewState(hist.back[hist.back.length - 1].state);
+						void originatingLeaf.setViewState(restoreState);
 					}, 0);
 					return;
 				}
@@ -959,7 +944,7 @@ export class ReaderView extends ItemView {
 		await super.setState(state, result);
 	}
 
-	getState(): any {
+	getState(): ReaderViewState {
 		return {
 			file: this.currentFile?.path ?? this.currentFolder?.path,
 			unitIndex: this.currentUnitIndex,
@@ -998,8 +983,8 @@ export class ReaderView extends ItemView {
 	}
 
 	private updateTocFooter(): void {
-		const modeBtn = this.contentEl.querySelector(".tmr-toc-mode-btn") as HTMLElement | null;
-		const themeBtn = this.contentEl.querySelector(".tmr-toc-theme-btn") as HTMLElement | null;
+		const modeBtn = this.contentEl.querySelector<HTMLElement>(".tmr-toc-mode-btn");
+		const themeBtn = this.contentEl.querySelector<HTMLElement>(".tmr-toc-theme-btn");
 		if (!modeBtn || !themeBtn) return;
 		const { tmrMode, tmrTheme } = this.plugin.settings;
 		modeBtn.toggleClass("tmr-toc-footer-btn-active", tmrMode === "3c");
@@ -1051,6 +1036,7 @@ export class ReaderView extends ItemView {
 
 		const tocFooter = tocPanel.createEl("div", { cls: "tmr-toc-footer" });
 		const modeBtn = tocFooter.createEl("button", { cls: "tmr-toc-mode-btn" });
+		// eslint-disable-next-line no-unsanitized/property -- Safe: LOGO_3C_SVG is a compile-time SVG constant.
 		modeBtn.innerHTML = LOGO_3C_SVG;
 		this.registerDomEvent(modeBtn, "click", () => void this.toggleTmrMode());
 		const themeBtn = tocFooter.createEl("button", { cls: "tmr-toc-theme-btn" });
@@ -1132,17 +1118,17 @@ export class ReaderView extends ItemView {
 
 		this.registerDomEvent(this.spreadEl, "mouseover", (e: MouseEvent) => {
 			const target = e.target as Element;
-			const cite = target.closest(".tmr-citation") as HTMLElement | null;
-			const anchor = target.closest("a[href]") as HTMLAnchorElement | null;
-			const ridEl = target.closest("[data-rid]") as HTMLElement | null;
+			const cite = target.closest<HTMLElement>(".tmr-citation");
+			const anchor = target.closest<HTMLAnchorElement>("a[href]");
+			const ridEl = target.closest<HTMLElement>("[data-rid]");
 
 			if (cite) {
 				const text = cite.dataset.citeText;
 				if (text) this.renderTooltip(this.buildInlineTextPreview(text), e);
 			} else if (anchor) {
 				this.handleLinkHover(anchor, e);
-			} else if (ridEl) {
-				const targetEl = this.findTarget(ridEl.dataset.rid!);
+			} else if (ridEl?.dataset.rid) {
+				const targetEl = this.findTarget(ridEl.dataset.rid);
 				if (targetEl) this.showTooltip(targetEl, e);
 			}
 		});
@@ -1177,7 +1163,7 @@ export class ReaderView extends ItemView {
 				e.preventDefault();
 				return;
 			}
-			const anchor = (e.target as Element).closest("a[href]") as HTMLAnchorElement | null;
+			const anchor = (e.target as Element).closest("a[href]");
 			if (!anchor) return;
 			const href = anchor.getAttribute("href") ?? "";
 			if (href.startsWith("#")) {
@@ -1280,10 +1266,14 @@ export class ReaderView extends ItemView {
 		const toc = this.contentEl.querySelector(".tmr-toc");
 		const backdrop = this.contentEl.querySelector(".tmr-toc-backdrop");
 		const toggle = this.contentEl.querySelector(".tmr-toc-toggle");
+		// The help button shares the ToC toggle's corner; hide it the same way
+		// while the ToC pane is open so it doesn't float over the panel.
+		const helpToggle = this.contentEl.querySelector(".tmr-help-toggle");
 		if (this.tocOpen) {
 			toc?.addClass("tmr-toc-open");
 			backdrop?.addClass("tmr-toc-backdrop-visible");
 			toggle?.addClass("tmr-toc-toggle-hidden");
+			helpToggle?.addClass("tmr-toc-toggle-hidden");
 			requestAnimationFrame(() => {
 				const active = this.contentEl.querySelector(".tmr-toc-item.tmr-toc-active");
 				active?.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -1292,6 +1282,7 @@ export class ReaderView extends ItemView {
 			toc?.removeClass("tmr-toc-open");
 			backdrop?.removeClass("tmr-toc-backdrop-visible");
 			toggle?.removeClass("tmr-toc-toggle-hidden");
+			helpToggle?.removeClass("tmr-toc-toggle-hidden");
 		}
 	}
 
@@ -1724,11 +1715,10 @@ export class ReaderView extends ItemView {
 		if (!ok) return;
 
 		const path = this.getCompanionDocPath();
-		if (path) {
+		const file = path ? this.app.vault.getFileByPath(path) : null;
+		if (file) {
 			try {
-				const doc = await this.app.vault.adapter.read(path);
-				const updated = this.removeCalloutFromDoc(doc, saved);
-				if (updated !== doc) await this.app.vault.adapter.write(path, updated);
+				await this.app.vault.process(file, (doc) => this.removeCalloutFromDoc(doc, saved));
 			} catch (err) {
 				console.error("[ThirdMindReader] deleteHighlightAt failed", err);
 				new Notice("Third Mind Reader: failed to delete annotation");
@@ -1769,7 +1759,7 @@ export class ReaderView extends ItemView {
 		const showBare = this.plugin.settings.showBareFlaggedConversations;
 		const conversations = this.savedHighlights
 			.map((saved, idx) => ({ saved, idx }))
-			.filter(({ saved }) => GLOSS_AI_MODES_ALL.has(saved.mode))
+			.filter(({ saved }) => GLOSS_AI_MODES.has(saved.mode))
 			.filter(({ saved }) => showBare || !this.isBareFlaggedConversation(saved));
 
 		const hasConversations = conversations.length > 0;
@@ -1956,14 +1946,14 @@ export class ReaderView extends ItemView {
 		const textarea = chatboxTop.createEl("textarea", {
 			cls: "tmr-conv-textarea",
 			attr: { placeholder: "Say something…", rows: "1" },
-		}) as HTMLTextAreaElement;
+		});
 		const sendBtn = chatboxTop.createEl("button", { cls: "tmr-conv-send" });
 		setIcon(sendBtn, "send-horizontal");
-		(sendBtn as HTMLButtonElement).disabled = true;
+		(sendBtn).disabled = true;
 
 		// Bottom: model picker + settings button.
 		const chatboxBottom = chatbox.createEl("div", { cls: "tmr-conv-chatbox-bottom" });
-		const provider = this.getActiveProvider(saved.mode as GlossModeId);
+		const provider = this.getActiveProvider();
 		const modelStr = provider?.defaultModel ?? "No model configured";
 		const modelPicker = chatboxBottom.createEl("div", { cls: "tmr-conv-model-picker" });
 		setIcon(modelPicker, "chevron-down");
@@ -1974,10 +1964,10 @@ export class ReaderView extends ItemView {
 			modelPicker.addClass("tmr-conv-model-picker-clickable");
 			this.registerDomEvent(modelPicker, "click", (e: MouseEvent) => {
 				e.stopPropagation();
-				void pickModel(this.app, provider, async (model) => {
+				void pickModel(this.app, provider, (model) => {
 					provider.defaultModel = model;
 					modelLabel.textContent = model;
-					await this.plugin.saveSettings();
+					void this.plugin.saveSettings();
 				});
 			});
 		}
@@ -1990,9 +1980,9 @@ export class ReaderView extends ItemView {
 
 		// Textarea auto-resize + send enable/disable.
 		this.registerDomEvent(textarea, "input", () => {
-			textarea.style.height = "auto";
-			textarea.style.height = Math.min(textarea.scrollHeight, 80) + "px";
-			(sendBtn as HTMLButtonElement).disabled = textarea.value.trim().length === 0;
+			textarea.setCssProps({ height: "auto" });
+			textarea.setCssProps({ height: Math.min(textarea.scrollHeight, 80) + "px" });
+			(sendBtn).disabled = textarea.value.trim().length === 0;
 		});
 		// Prevent input clicks from bubbling to the card-row toggle.
 		this.registerDomEvent(textarea, "click", (e: MouseEvent) => e.stopPropagation());
@@ -2001,15 +1991,15 @@ export class ReaderView extends ItemView {
 			const text = textarea.value.trim();
 			if (!text) return;
 			textarea.value = "";
-			textarea.style.height = "auto";
-			(sendBtn as HTMLButtonElement).disabled = true;
+			textarea.setCssProps({ height: "auto" });
+			(sendBtn).disabled = true;
 			this.submitConversationMessage(card, saved, log, text);
 		});
 		this.registerDomEvent(chatbox, "click", (e: MouseEvent) => e.stopPropagation());
 		this.registerDomEvent(textarea, "keydown", (e: KeyboardEvent) => {
 			if (e.key === "Enter" && !e.shiftKey) {
 				e.preventDefault();
-				if (!(sendBtn as HTMLButtonElement).disabled) sendBtn.click();
+				if (!(sendBtn).disabled) sendBtn.click();
 			}
 		});
 
@@ -2182,7 +2172,7 @@ export class ReaderView extends ItemView {
 		// network round-trip.
 		await this.patchCalloutInDoc(saved);
 
-		const provider = this.getActiveProvider(saved.mode as GlossModeId);
+		const provider = this.getActiveProvider();
 		if (!provider) {
 			saved.aiState = "error";
 			saved.aiError = "No AI provider configured — open plugin settings.";
@@ -2321,14 +2311,16 @@ export class ReaderView extends ItemView {
 	private async patchCalloutInDoc(saved: SavedHighlight): Promise<void> {
 		const path = this.getCompanionDocPath();
 		if (!path) return;
+		const file = this.app.vault.getFileByPath(path);
+		if (!file) return;
 		try {
-			const doc = await this.app.vault.adapter.read(path);
 			// AI-bearing callouts are rebuilt from `turns`; non-AI (Emphasise)
 			// callouts carry a free-text note in `userText` instead.
-			const patched = GLOSS_AI_MODES.has(saved.mode)
-				? this.rewriteCalloutBody(doc, saved)
-				: this.rewriteEmphasiseNote(doc, saved);
-			if (patched !== doc) await this.app.vault.adapter.write(path, patched);
+			await this.app.vault.process(file, (doc) =>
+				GLOSS_AI_MODES.has(saved.mode)
+					? this.rewriteCalloutBody(doc, saved)
+					: this.rewriteEmphasiseNote(doc, saved),
+			);
 		} catch (err) {
 			console.error("[ThirdMindReader] patchCalloutInDoc failed", err);
 		}
@@ -2532,13 +2524,8 @@ export class ReaderView extends ItemView {
 		menu.showAtPosition({ x: rect.left, y: rect.top });
 	}
 
-	private getActiveProvider(mode: GlossModeId): AiProvider | null {
+	private getActiveProvider(): AiProvider | null {
 		const s = this.plugin.settings;
-		const override = s.aiDefaults.perMode[mode];
-		if (override) {
-			const p = s.aiProviders.find((p) => p.id === override.providerId);
-			if (p) return p;
-		}
 		const primary = s.aiProviders.find((p) => p.id === s.aiDefaults.primaryProviderId);
 		return primary ?? s.aiProviders[0] ?? null;
 	}
@@ -2580,8 +2567,6 @@ export class ReaderView extends ItemView {
 				const data = await this.app.vault.readBinary(file);
 				return parseEpub(data);
 			}, initialPos);
-		} else if (file.extension === "md") {
-			await this.loadMarkdown(file);
 		} else {
 			this.showError(`Unsupported file type: .${file.extension}`);
 		}
@@ -2590,8 +2575,8 @@ export class ReaderView extends ItemView {
 	private async loadFolder(folder: TFolder, initialPos?: { unitIndex: number; spread: number }): Promise<void> {
 		this.resetViewState();
 		this.renderShell();
-		const adapter = this.app.vault.adapter as any;
-		const basePath: string = adapter.basePath ?? adapter.getBasePath?.() ?? "";
+		const adapter = this.app.vault.adapter;
+		const basePath = adapter instanceof FileSystemAdapter ? adapter.getBasePath() : "";
 		const absPath = nodePath.join(basePath, folder.path);
 		await this.loadEpub(() => parseEpubDir(absPath), initialPos);
 	}
@@ -2669,14 +2654,6 @@ export class ReaderView extends ItemView {
 		}
 	}
 
-	private async loadMarkdown(file: TFile): Promise<void> {
-		if (!this.contentNode) return;
-		const content = await this.app.vault.cachedRead(file);
-		await MarkdownRenderer.render(this.app, content, this.contentNode, file.path, this);
-		this.paginateVisibleContent();
-		this.showSpread();
-	}
-
 	// ─── REGION: Section & Unit Modeling ─────────────────────────────────────
 	private buildSectionIndex(): void {
 		if (!this.book) return;
@@ -2722,7 +2699,7 @@ export class ReaderView extends ItemView {
 		});
 
 		this.sectionIndexById.clear();
-		this.sectionIndexBySpine = new Array(this.book.spine.length).fill(0);
+		this.sectionIndexBySpine = new Array<number>(this.book.spine.length).fill(0);
 		this.sections.forEach((section, idx) => {
 			this.sectionIndexById.set(section.id, idx);
 			for (let s = section.startSpine; s <= section.endSpine; s++) this.sectionIndexBySpine[s] = idx;
@@ -2776,12 +2753,7 @@ export class ReaderView extends ItemView {
 
 	private ensureMeasurementNodes(): void {
 		if (!this.contentEl || this.measurementSpreadEl) return;
-		const spread = this.contentEl.createEl("div", { cls: "tmr-spread" });
-		spread.style.position = "absolute";
-		spread.style.left = "-99999px";
-		spread.style.top = "0";
-		spread.style.visibility = "hidden";
-		spread.style.pointerEvents = "none";
+		const spread = this.contentEl.createEl("div", { cls: "tmr-spread tmr-measure-host" });
 		const content = spread.createEl("div", { cls: "tmr-content" });
 		this.measurementSpreadEl = spread;
 		this.measurementContentEl = content;
@@ -2839,9 +2811,9 @@ export class ReaderView extends ItemView {
 		const savedColWidth = content.style.columnWidth;
 		const savedColGap = content.style.columnGap;
 		const savedWidth = content.style.width;
-		content.style.columnWidth = "";
-		content.style.columnGap = "";
-		content.style.width = `${colWidth}px`;
+		content.style.removeProperty("column-width");
+		content.style.removeProperty("column-gap");
+		content.setCssProps({ width: `${colWidth}px` });
 
 		const naturalHeight = content.scrollHeight;
 
@@ -2893,9 +2865,9 @@ export class ReaderView extends ItemView {
 		if (!this.book) return;
 		this.units = [];
 		this.unitIndexBySection.clear();
-		this.sectionSpreadCounts = new Array(this.sections.length).fill(1);
-		this.sectionColumnCounts = new Array(this.sections.length).fill(1);
-		this.sectionStartSpreads = new Array(this.sections.length).fill(0);
+		this.sectionSpreadCounts = new Array<number>(this.sections.length).fill(1);
+		this.sectionColumnCounts = new Array<number>(this.sections.length).fill(1);
+		this.sectionStartSpreads = new Array<number>(this.sections.length).fill(0);
 		this.unitStartSpreads = [];
 		this.totalSpreads = 0;
 
@@ -2957,7 +2929,7 @@ export class ReaderView extends ItemView {
 		});
 		this.totalSpreads = Math.max(1, unitAcc);
 
-		this.sectionStartSpreads = new Array(this.sections.length).fill(0);
+		this.sectionStartSpreads = new Array<number>(this.sections.length).fill(0);
 		this.units.forEach((unit, unitIdx) => {
 			const base = this.unitStartSpreads[unitIdx] ?? 0;
 			unit.sectionIds.forEach((id, idx) => {
@@ -2999,9 +2971,6 @@ export class ReaderView extends ItemView {
 		this.contentNode.appendChild(currentDom);
 		this.applyContentLayout(unit);
 		this.preloadLinkPreviewsForUnit(currentDom);
-		// Relayout pretext at the current column width for cursor-precise offsets.
-		const colWidth = this.getRenderColumnWidth(unit);
-		this.offsetMap.relayout(colWidth);
 		this.buildTocAnchorPageMap();
 		this.currentSpread = Math.max(0, Math.min(spread, unit.spreadCount - 1));
 		this.goToSpread(this.currentSpread);
@@ -3171,8 +3140,8 @@ export class ReaderView extends ItemView {
 		}
 		if (unit.singlePage) {
 			// Clear inline column styles so the CSS class takes over
-			this.contentNode.style.columnWidth = "";
-			this.contentNode.style.columnGap = "";
+			this.contentNode.style.removeProperty("column-width");
+			this.contentNode.style.removeProperty("column-gap");
 			this.contentNode.addClass("tmr-single-page");
 		} else {
 			this.contentNode.removeClass("tmr-single-page");
@@ -3290,7 +3259,9 @@ export class ReaderView extends ItemView {
 	 *  <1 zoomed out. Falls back to 1 if unavailable. */
 	private getZoomFactor(): number {
 		try {
-			const factor = require("electron").webFrame.getZoomFactor();
+			// eslint-disable-next-line @typescript-eslint/no-require-imports -- Electron's webFrame is only reachable via require() in Obsidian's renderer.
+			const { webFrame } = require("electron") as { webFrame: { getZoomFactor: () => number } };
+			const factor = webFrame.getZoomFactor();
 			return Number.isFinite(factor) && factor > 0 ? factor : 1;
 		} catch {
 			return 1;
@@ -3332,14 +3303,6 @@ export class ReaderView extends ItemView {
 
 	private getNavigationStride(): number {
 		return this.getPageWidth() + this.getColumnGap();
-	}
-
-	private getRenderColumnWidth(unit: RenderUnit | null): number {
-		const pageWidth = this.getPageWidth();
-		if (pageWidth <= 0) return 340;
-		if (this.layoutMode === "single") return pageWidth;
-		if (unit?.singlePage) return Math.max(100, Math.min(pageWidth, this.getReadableLineWidth()));
-		return Math.max(100, (pageWidth - ReaderView.GAP) / 2);
 	}
 
 	private getSinglePageGap(spread: HTMLElement | null = this.spreadEl): number {
@@ -3404,7 +3367,7 @@ export class ReaderView extends ItemView {
 
 	private getAnchorSourceHref(anchor: HTMLAnchorElement): string | null {
 		if (!this.book) return null;
-		const spineHost = anchor.closest(".tmr-spine-item") as HTMLElement | null;
+		const spineHost = anchor.closest<HTMLElement>(".tmr-spine-item");
 		const spineIndex = parseInt(spineHost?.dataset.spineIndex ?? "", 10);
 		if (Number.isFinite(spineIndex) && this.book.spine[spineIndex]) {
 			return this.book.spine[spineIndex].href;
@@ -3441,16 +3404,6 @@ export class ReaderView extends ItemView {
 		return task;
 	}
 
-	private resolveRelativePath(path: string): string {
-		const parts = path.split("/");
-		const resolved: string[] = [];
-		for (const part of parts) {
-			if (part === "..") resolved.pop();
-			else if (part !== "." && part !== "") resolved.push(part);
-		}
-		return resolved.join("/");
-	}
-
 	private async navigateToHref(href: string): Promise<void> {
 		if (!this.book) return;
 		this.savePosition();
@@ -3459,7 +3412,7 @@ export class ReaderView extends ItemView {
 		const currentDir = currentItem?.href.includes("/")
 			? currentItem.href.substring(0, currentItem.href.lastIndexOf("/") + 1)
 			: "";
-		const resolved = rawPath ? this.resolveRelativePath(currentDir + rawPath) : currentItem?.href ?? "";
+		const resolved = rawPath ? resolveRelativePath(currentDir + rawPath) : currentItem?.href ?? "";
 		const targetSpine = this.book.spine.findIndex((s) => s.href === resolved);
 		if (targetSpine < 0) return;
 		await this.jumpToSpine(targetSpine, fragment ?? null);
@@ -3942,8 +3895,7 @@ export class ReaderView extends ItemView {
 	/** Position a fixed-position floater (bar or input) relative to a selection
 	 *  rect, flipping below if above doesn't fit and clamping to the viewport. */
 	private positionFloater(el: HTMLElement, selectionRect: DOMRect): void {
-		el.style.left = "0px";
-		el.style.top = "0px";
+		el.setCssProps({ left: "0px", top: "0px" });
 		const rect = el.getBoundingClientRect();
 		const margin = 8;
 		const flipBelow = selectionRect.top < rect.height + margin + 16;
@@ -4019,7 +3971,7 @@ export class ReaderView extends ItemView {
 		const panel = this.ensureGlossInput();
 		this.syncGlossInputTheme();
 		panel.dataset.glossMode = modeId;
-		const input = panel.querySelector(".tmr-gloss-input-field") as HTMLInputElement | null;
+		const input = panel.querySelector<HTMLInputElement>(".tmr-gloss-input-field");
 		if (input) {
 			input.value = "";
 			input.placeholder = GLOSS_PLACEHOLDERS[modeId] ?? "";
@@ -4077,10 +4029,12 @@ export class ReaderView extends ItemView {
 		const path = this.getCompanionDocPath();
 		if (!path) return;
 		const callout = this.buildCallout(modeId, userText, quote, highlight);
-		await this.ensureCompanionDoc(path);
-		const existing = await this.app.vault.adapter.read(path);
-		const pad = existing.endsWith("\n\n") ? "" : existing.endsWith("\n") ? "\n" : "\n\n";
-		await this.app.vault.adapter.write(path, existing + pad + callout + "\n");
+		const file = await this.ensureCompanionDoc(path);
+		if (!file) return;
+		await this.app.vault.process(file, (existing) => {
+			const pad = existing.endsWith("\n\n") ? "" : existing.endsWith("\n") ? "\n" : "\n\n";
+			return existing + pad + callout + "\n";
+		});
 
 		const chars = this.offsetMap.cursorRangeToChars(highlight);
 		const entry = this.offsetMap.get(highlight.paraId);
@@ -4100,7 +4054,6 @@ export class ReaderView extends ItemView {
 			quote,
 			turns: [],
 			aiState: isAiMode ? "pending" : "complete",
-			legacyCursors: null,
 		});
 		this.renderSavedHighlights();
 		new Notice(`${modeId[0].toUpperCase()}${modeId.slice(1)} saved`);
@@ -4115,10 +4068,10 @@ export class ReaderView extends ItemView {
 		this.savedHighlights = [];
 		const path = this.getCompanionDocPath();
 		if (!path) return;
-		const adapter = this.app.vault.adapter;
 		try {
-			if (!(await adapter.exists(path))) return;
-			const content = await adapter.read(path);
+			const file = this.app.vault.getFileByPath(path);
+			if (!file) return;
+			const content = await this.app.vault.cachedRead(file);
 			this.savedHighlights = parseSavedHighlights(content);
 		} catch (err) {
 			console.error("[ThirdMindReader] loadSavedHighlights failed", err);
@@ -4173,8 +4126,6 @@ export class ReaderView extends ItemView {
 			if (saved.startChar >= 0 && saved.endChar >= 0) {
 				cursorRange = this.offsetMap.charRangeToCursorRange(
 					resolvedId, saved.startChar, saved.endChar, endParaId);
-			} else if (saved.legacyCursors) {
-				cursorRange = { paraId: resolvedId, ...saved.legacyCursors };
 			}
 			if (!cursorRange) continue;
 
@@ -4263,7 +4214,7 @@ export class ReaderView extends ItemView {
 		if (matchedIdx === -1) return false;
 
 		const saved = this.savedHighlights[matchedIdx];
-		if (!saved || !GLOSS_AI_MODES_ALL.has(saved.mode)) return false;
+		if (!saved || !GLOSS_AI_MODES.has(saved.mode)) return false;
 
 		// Bare-flagged callouts (Exclaim/Enquiry with no prompt and no AI
 		// turn) only show in the Conversations list when the corresponding
@@ -4383,16 +4334,16 @@ export class ReaderView extends ItemView {
 
 	private getCompanionDocPath(): string | null {
 		if (!this.book && !this.currentFile) return null;
-		const raw = this.book?.title || this.currentFile?.basename || "Book";
-		const safe = raw.replace(/[\\/:*?"<>|]+/g, "_").replace(/\s+/g, " ").trim() || "Book";
-		return `Library/Annotations/${safe}-Annotations.md`;
+		return companionDocPath(this.book?.title || this.currentFile?.basename || "Book");
 	}
 
-	private async ensureCompanionDoc(path: string): Promise<void> {
-		const adapter = this.app.vault.adapter;
-		if (await adapter.exists(path)) return;
+	/** Resolve the companion doc's `TFile`, creating doc (and folder) on first
+	 *  use. Null only if creation fails outright. */
+	private async ensureCompanionDoc(path: string): Promise<TFile | null> {
+		const existing = this.app.vault.getFileByPath(path);
+		if (existing) return existing;
 		const folder = path.substring(0, path.lastIndexOf("/"));
-		if (folder && !(await adapter.exists(folder))) {
+		if (folder && !this.app.vault.getFolderByPath(folder)) {
 			try {
 				await this.app.vault.createFolder(folder);
 			} catch {
@@ -4412,7 +4363,12 @@ export class ReaderView extends ItemView {
 			`# ${title} — Annotations`,
 			"",
 		].join("\n");
-		await adapter.write(path, frontmatter);
+		try {
+			return await this.app.vault.create(path, frontmatter);
+		} catch {
+			// Doc may have been created in a parallel call — re-resolve.
+			return this.app.vault.getFileByPath(path);
+		}
 	}
 
 	private buildCallout(
@@ -4550,7 +4506,7 @@ export class ReaderView extends ItemView {
 				e,
 			);
 		} else {
-			const text = (el.textContent ?? "").trim().replace(/^\d+[\.\)]\s*/, "");
+			const text = (el.textContent ?? "").trim().replace(/^\d+[.)]\s*/, "");
 			if (!text) return;
 			this.renderTooltip(this.buildInlineTextPreview(text), e);
 		}
@@ -4564,9 +4520,8 @@ export class ReaderView extends ItemView {
 		const tooltip = this.ensureTooltipNode();
 		tooltip.empty();
 		if (preview.kind === "image" && preview.imageSrc) {
-			const img = createEl("img") as HTMLImageElement;
+			const img = createEl("img");
 			img.src = preview.imageSrc;
-			img.style.cssText = "max-width:280px;height:auto;display:block;border-radius:4px;";
 			tooltip.appendChild(img);
 			if (preview.caption?.trim()) {
 				tooltip.createEl("p", { cls: "tmr-tooltip-caption", text: preview.caption.trim() });
@@ -4578,9 +4533,7 @@ export class ReaderView extends ItemView {
 			});
 		}
 
-		tooltip.style.left = "0px";
-		tooltip.style.top = "0px";
-		tooltip.style.visibility = "hidden";
+		tooltip.setCssProps({ left: "0px", top: "0px", visibility: "hidden" });
 		tooltip.removeClass("tmr-hidden");
 
 		const rect = tooltip.getBoundingClientRect();
@@ -4597,14 +4550,12 @@ export class ReaderView extends ItemView {
 				ReaderView.TOOLTIP_MARGIN,
 				Math.min(preferredAbove, window.innerHeight - rect.height - ReaderView.TOOLTIP_MARGIN),
 			);
-		tooltip.style.left = `${x}px`;
-		tooltip.style.top = `${y}px`;
-		tooltip.style.visibility = "";
+		tooltip.setCssProps({ left: `${x}px`, top: `${y}px`, visibility: "" });
 	}
 
 	private hideTooltip(): void {
 		if (!this.tooltipEl) return;
-		this.tooltipEl.style.visibility = "";
+		this.tooltipEl.setCssProps({ visibility: "" });
 		this.tooltipEl.addClass("tmr-hidden");
 	}
 
@@ -4616,7 +4567,6 @@ export class ReaderView extends ItemView {
 		return {
 			kind: "text",
 			text: trimmed.slice(0, ReaderView.TOOLTIP_MAX_CHARS).trimEnd() + "…",
-			truncated: true,
 		};
 	}
 
@@ -4653,22 +4603,22 @@ export class ReaderView extends ItemView {
 
 		this.contentEl.querySelectorAll(".tmr-progress-segment").forEach((seg) => {
 			const sectionIdx = parseInt((seg as HTMLElement).dataset.section ?? "0", 10);
-			const fill = seg.querySelector(".tmr-progress-segment-fill") as HTMLElement | null;
+			const fill = seg.querySelector<HTMLElement>(".tmr-progress-segment-fill");
 			if (!fill) return;
 			const start = this.sectionStartSpreads[sectionIdx] ?? 0;
 			const count = this.sectionSpreadCounts[sectionIdx] ?? 1;
 			const end = start + count - 1;
 			if (globalSpread > end) {
-				fill.style.width = "100%";
+				fill.setCssProps({ width: "100%" });
 				seg.addClass("tmr-progress-complete");
 				seg.removeClass("tmr-progress-current");
 			} else if (globalSpread >= start) {
 				const local = globalSpread - start;
-				fill.style.width = `${((local + 1) / count) * 100}%`;
+				fill.setCssProps({ width: `${((local + 1) / count) * 100}%` });
 				seg.removeClass("tmr-progress-complete");
 				seg.addClass("tmr-progress-current");
 			} else {
-				fill.style.width = "0%";
+				fill.setCssProps({ width: "0%" });
 				seg.removeClass("tmr-progress-complete");
 				seg.removeClass("tmr-progress-current");
 			}
@@ -4698,7 +4648,7 @@ export class ReaderView extends ItemView {
 
 	private showProgressTooltip(e: MouseEvent): void {
 		if (!this.progressBarEl || !this.progressTipEl) return;
-		const seg = (e.target as Element).closest(".tmr-progress-segment") as HTMLElement | null;
+		const seg = (e.target as Element).closest<HTMLElement>(".tmr-progress-segment");
 		if (!seg) {
 			this.progressTipEl.addClass("tmr-hidden");
 			return;
@@ -4718,7 +4668,7 @@ export class ReaderView extends ItemView {
 
 	private async seekToProgressPosition(e: MouseEvent): Promise<void> {
 		if (!this.progressBarEl || !this.book) return;
-		const seg = (e.target as Element).closest(".tmr-progress-segment") as HTMLElement | null;
+		const seg = (e.target as Element).closest<HTMLElement>(".tmr-progress-segment");
 		const barRect = this.progressBarEl.getBoundingClientRect();
 		let targetSectionIdx = 0;
 		let sectionFraction = 0;
@@ -4801,8 +4751,8 @@ export class ReaderView extends ItemView {
 	}
 
 	private updateBackMarker(): void {
-		const backBtn = this.contentEl.querySelector(".tmr-progress-back") as HTMLElement | null;
-		const marker = this.contentEl.querySelector(".tmr-progress-back-marker") as HTMLElement | null;
+		const backBtn = this.contentEl.querySelector<HTMLElement>(".tmr-progress-back");
+		const marker = this.contentEl.querySelector<HTMLElement>(".tmr-progress-back-marker");
 		if (!backBtn) return;
 		if (!this.previousPosition || !this.progressBarEl) {
 			backBtn.addClass("tmr-hidden");
@@ -4835,7 +4785,7 @@ export class ReaderView extends ItemView {
 			return prevGlobalSpread >= start && prevGlobalSpread < start + count;
 		});
 		const segEl = sectionIdx >= 0
-			? this.progressBarEl.querySelector(`.tmr-progress-segment[data-section="${sectionIdx}"]`) as HTMLElement | null
+			? this.progressBarEl.querySelector<HTMLElement>(`.tmr-progress-segment[data-section="${sectionIdx}"]`)
 			: null;
 		if (segEl && sectionIdx >= 0) {
 			const start = this.sectionStartSpreads[sectionIdx] ?? 0;
@@ -4901,11 +4851,11 @@ export default class ThirdMindReader extends Plugin {
 		// Runs in capture phase so it fires before Obsidian's own click handler.
 		this.registerDomEvent(document, "click", (e: MouseEvent) => {
 			if (e.button !== 0) return;
-			const fileTitle = (e.target as Element).closest(".nav-file-title") as HTMLElement | null;
+			const fileTitle = (e.target as Element).closest<HTMLElement>(".nav-file-title");
 			if (!fileTitle) return;
 			const path =
 				fileTitle.dataset.path ??
-				(fileTitle.closest(".nav-file") as HTMLElement | null)?.dataset.path;
+				fileTitle.closest<HTMLElement>(".nav-file")?.dataset.path;
 			if (!path?.endsWith(".epub")) return;
 			e.stopImmediatePropagation();
 			const file = this.app.vault.getAbstractFileByPath(path);
@@ -4919,8 +4869,7 @@ export default class ThirdMindReader extends Plugin {
 	 *  has the folder the empty-state prompt tells users to drop epubs into.
 	 *  Idempotent and tolerant of a parallel creation race. */
 	private async ensureLibraryFolder(): Promise<void> {
-		const adapter = this.app.vault.adapter;
-		if (await adapter.exists(LIBRARY_ROOT)) return;
+		if (this.app.vault.getFolderByPath(LIBRARY_ROOT)) return;
 		try {
 			await this.app.vault.createFolder(LIBRARY_ROOT);
 		} catch {
@@ -5007,8 +4956,6 @@ export default class ThirdMindReader extends Plugin {
 
 	onunload(): void {
 		document.getElementById("tmr-bundled-fonts")?.remove();
-		this.app.workspace.detachLeavesOfType(READER_VIEW_TYPE);
-		this.app.workspace.detachLeavesOfType(LIBRARY_VIEW_TYPE);
 	}
 
 	/** The reader view of the currently-active leaf, or null. Reader commands
@@ -5076,6 +5023,10 @@ export default class ThirdMindReader extends Plugin {
 			`@font-face { font-family: "${family}"; font-weight: ${weight}; font-style: ${style}; src: url("${url}") format("truetype"); }`
 		).join("\n");
 
+		// obsidianmd/no-forbidden-elements is switched off for this file in
+		// eslint.config.mjs because of this one site: the @font-face data-URLs
+		// are compiled into main.js (esbuild dataurl loader), so this CSS only
+		// exists at runtime and can't live in styles.css.
 		const el = document.createElement("style");
 		el.id = "tmr-bundled-fonts";
 		el.textContent = css;
@@ -5091,7 +5042,7 @@ export default class ThirdMindReader extends Plugin {
 			return view instanceof ReaderView && view.getState()?.file === filePath;
 		});
 		if (existing) {
-			this.app.workspace.revealLeaf(existing);
+			await this.app.workspace.revealLeaf(existing);
 			return;
 		}
 		this._openingEpub = true;
@@ -5101,12 +5052,12 @@ export default class ThirdMindReader extends Plugin {
 			active: true,
 			state: { file: filePath },
 		});
-		this.app.workspace.revealLeaf(leaf);
+		await this.app.workspace.revealLeaf(leaf);
 		this._openingEpub = false;
 	}
 
 	async loadSettings(): Promise<void> {
-		const data = await this.loadData();
+		const data = (await this.loadData()) as Partial<ThirdMindReaderSettings> | null;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
 		// Beta-only: re-show the Library feedback hint after every reload/update so
 		// testers are reminded where to report. Reset in-memory on each load (no
@@ -5187,7 +5138,7 @@ export default class ThirdMindReader extends Plugin {
 			leaf = workspace.getLeaf("tab");
 			await leaf.setViewState({ type: LIBRARY_VIEW_TYPE, active: true });
 		}
-		workspace.revealLeaf(leaf);
+		await workspace.revealLeaf(leaf);
 	}
 }
 
@@ -5197,11 +5148,8 @@ export default class ThirdMindReader extends Plugin {
  *
  *  Each provider is rendered as an inline editor with a "Test connection"
  *  button (calls `probeProvider()`) and a delete affordance. The default-
- *  model picker at the top selects which provider new conversations use.
- *
- *  Per-mode overrides land in Phase D when the GlossBar tile activations
- *  are wired to chat() — until then `aiDefaults.perMode` stays empty and
- *  every mode falls through to `primaryProviderId`. */
+ *  model picker selects which provider new conversations use; every mode
+ *  falls through to `primaryProviderId`. */
 // ─── Beta feedback form ──────────────────────────────────────────────────────
 // Opens an anonymous Google Form in the browser with the plugin/Obsidian/OS
 // versions prefilled. Flip FEEDBACK_BETA to false (or delete the Setting block in
@@ -5242,7 +5190,6 @@ class TmrSettingTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-		new Setting(containerEl).setName("Third Mind Reader").setHeading();
 
 		// ── Beta feedback (kept at the top so testers don't miss it) ──────
 		if (FEEDBACK_BETA) {
@@ -5401,10 +5348,10 @@ class TmrSettingTab extends PluginSettingTab {
 			.addExtraButton(b => b
 				.setIcon("list")
 				.setTooltip("Browse models from the server")
-				.onClick(() => void pickModel(this.app, provider, async (model) => {
+				.onClick(() => void pickModel(this.app, provider, (model) => {
 					provider.defaultModel = model;
 					modelText?.setValue(model);
-					await this.plugin.saveSettings();
+					void this.plugin.saveSettings();
 				})));
 
 		new Setting(wrap)
@@ -5552,13 +5499,13 @@ class TmrSettingTab extends PluginSettingTab {
 
 		for (const entry of this.importEntries) {
 			const row = container.createEl("div", { cls: "tmr-settings-import-entry" });
-			const cb = row.createEl("input") as HTMLInputElement;
+			const cb = row.createEl("input");
 			cb.type = "checkbox";
 			cb.checked = entry.checked;
 			cb.addEventListener("change", () => { entry.checked = cb.checked; });
 			row.createSpan({ cls: "tmr-settings-import-entry-name", text: entry.name });
 			row.createSpan({ cls: "tmr-settings-import-entry-arrow", text: "→" });
-			const nameInput = row.createEl("input") as HTMLInputElement;
+			const nameInput = row.createEl("input");
 			nameInput.type = "text";
 			nameInput.className = "tmr-settings-import-entry-rename";
 			nameInput.value = entry.finalName;
@@ -5568,7 +5515,7 @@ class TmrSettingTab extends PluginSettingTab {
 		const footer = container.createEl("div", { cls: "tmr-settings-import-footer" });
 		const statusEl = footer.createEl("div", { cls: "tmr-settings-import-status" });
 		const btn = footer.createEl("button", { cls: "mod-cta", text: "Import selected" });
-		btn.addEventListener("click", async () => {
+		const onImportClick = async () => {
 			const toImport = this.importEntries.filter(e => e.checked);
 			if (!toImport.length) { new Notice("No books selected."); return; }
 			btn.disabled = true;
@@ -5576,7 +5523,8 @@ class TmrSettingTab extends PluginSettingTab {
 			const imported = await this.importBooks(toImport, statusEl);
 			btn.textContent = "Import selected";
 			btn.disabled = imported > 0;
-		});
+		};
+		btn.addEventListener("click", () => void onImportClick());
 	}
 
 	private validateEpubFolders(paths: string[]): ImportEntry[] {
@@ -5604,7 +5552,8 @@ class TmrSettingTab extends PluginSettingTab {
 	}
 
 	private async importBooks(entries: ImportEntry[], statusEl: HTMLElement): Promise<number> {
-		const vaultBase = (this.plugin.app.vault.adapter as any).basePath as string;
+		const adapter = this.plugin.app.vault.adapter;
+		const vaultBase = adapter instanceof FileSystemAdapter ? adapter.getBasePath() : "";
 		const outputDir = nodePath.join(vaultBase, "Library", "Imported");
 		try {
 			fs.mkdirSync(outputDir, { recursive: true });
@@ -5616,7 +5565,7 @@ class TmrSettingTab extends PluginSettingTab {
 		statusEl.empty();
 		let imported = 0;
 		for (const entry of entries) {
-			const safe = (entry.finalName || entry.name).replace(/[\\/:*?"<>|]+/g, "_").trim() || "Book";
+			const safe = sanitizeFileName(entry.finalName || entry.name);
 			let outputPath = nodePath.join(outputDir, `${safe}.epub`);
 			let n = 2;
 			while (fs.existsSync(outputPath)) {
@@ -5648,7 +5597,18 @@ class TmrSettingTab extends PluginSettingTab {
 
 	private async pickEpubFolders(): Promise<string[]> {
 		try {
-			const electron = require("electron") as any;
+			// eslint-disable-next-line @typescript-eslint/no-require-imports -- Electron's remote dialog is only reachable via require() in Obsidian's renderer.
+			const electron = require("electron") as {
+				remote?: {
+					dialog?: {
+						showOpenDialog: (opts: {
+							properties: string[];
+							filters: { name: string; extensions: string[] }[];
+							title: string;
+						}) => Promise<{ canceled: boolean; filePaths: string[] }>;
+					};
+				};
+			};
 			const dialog = electron.remote?.dialog;
 			if (!dialog) {
 				new Notice("Folder picker unavailable in this version of Obsidian.");

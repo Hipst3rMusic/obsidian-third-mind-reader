@@ -7,13 +7,7 @@
  *                          (Ollama, LM Studio, llama.cpp server, vLLM, etc.)
  *
  *  Local-first: probe results in main.ts settings rank reachable local
- *  endpoints above cloud providers when picking the global default.
- *
- *  v1 = single-shot, awaited responses. Streaming will be added later if
- *  awaited responses feel sluggish on local Ollama. Tools / web search are
- *  passed through opaquely (provider-specific spec) so each mode adapter
- *  in main.ts can decorate the request without this file knowing about
- *  Anthropic vs OpenAI tool schema differences. */
+ *  endpoints above cloud providers when picking the global default. */
 
 import { requestUrl } from "obsidian";
 
@@ -35,12 +29,7 @@ export interface ChatMessage {
 export interface ChatRequest {
 	messages: ChatMessage[];
 	systemPrompt?: string;
-	temperature?: number;
 	maxTokens?: number;
-	/** Provider-specific tool spec list. Anthropic uses `{name, description,
-	 *  input_schema}`; OpenAI uses `{type:"function", function:{...}}`.
-	 *  Caller is responsible for shape; this client passes through. */
-	tools?: unknown[];
 	/** Request a token-by-token stream. Only honoured for openai-compatible
 	 *  providers (local servers like LM Studio / Ollama, which permit a direct
 	 *  browser `fetch`); anthropic/openai cloud kinds ignore it and return a
@@ -67,7 +56,21 @@ export interface ChatResponse {
 	content: string;
 	/** Original provider response for callers that need tool_use blocks,
 	 *  citation metadata, finish reasons, token counts, etc. */
-	raw: any;
+	raw: unknown;
+}
+
+/** Minimal response shapes for the fields we actually read. */
+interface ModelListResponse {
+	data?: { id?: string; state?: string }[];
+}
+interface OllamaPsResponse {
+	models?: { model?: string; name?: string }[];
+}
+interface AnthropicMessagesResponse {
+	content?: { type?: string; text?: string }[];
+}
+interface OpenAIChatResponse {
+	choices?: { message?: { content?: string }; delta?: { content?: string } }[];
 }
 
 export interface AiProvider {
@@ -128,8 +131,8 @@ export async function probeProvider(provider: AiProvider): Promise<ProbeResult> 
 			if (res.status >= 400) {
 				return { available: false, models: [], error: `HTTP ${res.status}` };
 			}
-			const data = res.json?.data ?? [];
-			return { available: true, models: data.map((m: any) => m.id) };
+			const data = (res.json as ModelListResponse | undefined)?.data ?? [];
+			return { available: true, models: data.map((m) => m.id ?? "") };
 		}
 
 		const endpoint = endpointFor(provider);
@@ -146,8 +149,8 @@ export async function probeProvider(provider: AiProvider): Promise<ProbeResult> 
 		if (res.status >= 400) {
 			return { available: false, models: [], error: `HTTP ${res.status}` };
 		}
-		const data = res.json?.data ?? [];
-		return { available: true, models: data.map((m: any) => m.id) };
+		const data = (res.json as ModelListResponse | undefined)?.data ?? [];
+		return { available: true, models: data.map((m) => m.id ?? "") };
 	} catch (err) {
 		return { available: false, models: [], error: (err as Error).message };
 	}
@@ -189,9 +192,9 @@ async function probeLmStudioLoaded(
 		if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
 		const res = await requestUrl({ url: `${endpoint}/api/v0/models`, headers, throw: false });
 		if (res.status >= 400) return null;
-		const data = res.json?.data;
+		const data = (res.json as ModelListResponse | undefined)?.data;
 		if (!Array.isArray(data)) return null;
-		const entry = data.find((m: any) => m?.id === model);
+		const entry = data.find((m) => m?.id === model);
 		// Model absent from the list → not an LM Studio model we can speak to.
 		if (!entry) return null;
 		return entry.state === "loaded";
@@ -207,10 +210,10 @@ async function probeOllamaLoaded(
 	try {
 		const res = await requestUrl({ url: `${endpoint}/api/ps`, throw: false });
 		if (res.status >= 400) return null;
-		const models = res.json?.models;
+		const models = (res.json as OllamaPsResponse | undefined)?.models;
 		if (!Array.isArray(models)) return null;
 		// /api/ps lists only resident models — presence == loaded.
-		return models.some((m: any) => m?.model === model || m?.name === model);
+		return models.some((m) => m?.model === model || m?.name === model);
 	} catch {
 		return null;
 	}
@@ -259,8 +262,6 @@ async function chatAnthropic(
 		})),
 	};
 	if (req.systemPrompt) body.system = req.systemPrompt;
-	if (req.temperature !== undefined) body.temperature = req.temperature;
-	if (req.tools?.length) body.tools = req.tools;
 
 	const res = await requestUrl({
 		url: "https://api.anthropic.com/v1/messages",
@@ -276,10 +277,10 @@ async function chatAnthropic(
 	if (res.status >= 400) {
 		throw new Error(`Anthropic ${res.status}: ${truncate(res.text)}`);
 	}
-	const json = res.json;
+	const json = res.json as AnthropicMessagesResponse;
 	const content = (json.content ?? [])
-		.filter((c: any) => c.type === "text")
-		.map((c: any) => c.text)
+		.filter((c) => c.type === "text")
+		.map((c) => c.text ?? "")
 		.join("");
 	return { content, raw: json };
 }
@@ -298,8 +299,6 @@ async function chatOpenAILike(
 		messages: messages.map(m => ({ role: m.role, content: m.content })),
 	};
 	if (req.maxTokens) body.max_tokens = req.maxTokens;
-	if (req.temperature !== undefined) body.temperature = req.temperature;
-	if (req.tools?.length) body.tools = req.tools;
 
 	const headers: Record<string, string> = { "content-type": "application/json" };
 	if (provider.apiKey) headers["Authorization"] = `Bearer ${provider.apiKey}`;
@@ -314,7 +313,7 @@ async function chatOpenAILike(
 	if (res.status >= 400) {
 		throw new Error(`${provider.kind} ${res.status}: ${truncate(res.text)}`);
 	}
-	const json = res.json;
+	const json = res.json as OpenAIChatResponse;
 	const content = json.choices?.[0]?.message?.content ?? "";
 	return { content, raw: json };
 }
@@ -343,9 +342,6 @@ async function chatOpenAILikeStreaming(
 		stream: true,
 	};
 	if (req.maxTokens) body.max_tokens = req.maxTokens;
-	if (req.temperature !== undefined) body.temperature = req.temperature;
-	// `tools` intentionally omitted: streamed tool_call deltas need reassembly
-	// and no conversation mode passes tools through the streaming path yet.
 
 	const headers: Record<string, string> = { "content-type": "application/json" };
 	if (provider.apiKey) headers["Authorization"] = `Bearer ${provider.apiKey}`;
@@ -377,7 +373,7 @@ async function chatOpenAILikeStreaming(
 	const decoder = new TextDecoder();
 	let buffer = "";
 	let content = "";
-	let lastRaw: any = null;
+	let lastRaw: unknown = null;
 
 	// SSE frames are newline-delimited `data: {json}` lines; a single frame's
 	// JSON never contains a raw newline, so splitting on "\n" is safe. Any
@@ -395,7 +391,7 @@ async function chatOpenAILikeStreaming(
 			const payload = line.slice(5).trim();
 			if (payload === "" || payload === "[DONE]") continue;
 			try {
-				const json = JSON.parse(payload);
+				const json = JSON.parse(payload) as OpenAIChatResponse;
 				lastRaw = json;
 				const delta = json.choices?.[0]?.delta?.content;
 				if (delta) {
