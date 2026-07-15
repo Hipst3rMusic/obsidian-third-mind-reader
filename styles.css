@@ -50,6 +50,15 @@
 	--tmr-c-emphasise:    var(--color-green, #50805c);
 	--tmr-c-enquiry:      #8c8787;
 
+	/* Update2 conversation-card border tokens — mode colour (icon-bright red
+	   for Exclaim, Empire-800W for Enquiry) at 33% alpha. color-mix resolves
+	   at use time, so these track the --tmr-c-* palette in every theme block;
+	   only Enquiry needs a light-theme override (66%, see light block). */
+	--tmr-border-exclaim: color-mix(in srgb, var(--tmr-c-exclaim-icon) 33%, transparent);
+	--tmr-border-explain: color-mix(in srgb, var(--tmr-c-explain) 33%, transparent);
+	--tmr-border-examine: color-mix(in srgb, var(--tmr-c-examine) 33%, transparent);
+	--tmr-border-enquiry: color-mix(in srgb, #a7a3a5 33%, transparent);
+
 	/* shape & type */
 	--radius-min: 9px;
 	--radius-s: 12px;
@@ -179,6 +188,9 @@
 	--tmr-c-examine:      #6396a2;
 	--tmr-c-emphasise:    #50805c;
 	--tmr-c-enquiry:      #8c8787;
+	/* Enquiry's neutral border reads too faint on light Empire surfaces — the
+	   DLS doubles its alpha there (design token #a6a2a4a8 vs …54 in dark). */
+	--tmr-border-enquiry: color-mix(in srgb, #a7a3a5 66%, transparent);
 
 	/* user-tunable vars — light-mode DLS picks */
 	--h2-color: #6f7654;             /* Dusk-600 */
@@ -2187,7 +2199,15 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	background: transparent !important;
 	border: 1px solid transparent !important;
 	box-shadow: none !important;
-	border-radius: 0.5625rem;
+	/* !important: theme `button` radius outranks a bare class and only shows
+	   when the hover background paints the button's own box — the idle tab
+	   and the ::before active pill never revealed it. */
+	border-radius: var(--radius-min) !important;
+	/* Stock buttons carry an explicit height (--input-height, 30px), which
+	   defeats the row's align-items: stretch and leaves the hover box shorter
+	   and off-centre against the ::before active pill (measured 4.5px top /
+	   6px bottom). 100% re-pins it to the row's content box. */
+	height: 100% !important;
 	padding: 0 0.75rem;
 	cursor: pointer;
 	transition: background 150ms ease, color 150ms ease;
@@ -2205,6 +2225,8 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 /* ── Conversations list container (#1f1f1f rounded frame) ─────────────────── */
 
 .tmr-conversations-list {
+	/* Containing block for the chat-screen overlay */
+	position: relative;
 	flex: 1 1 auto;
 	min-height: 0;
 	overflow: hidden;
@@ -2225,22 +2247,6 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	display: flex;
 	flex-direction: column;
 	gap: 0.75rem;
-}
-
-/* Focused: one conversation open — cards area locks scroll */
-.tmr-conv-cards.tmr-conv-list-focused {
-	overflow-y: hidden;
-	gap: 0;
-}
-
-/* Hide all other cards while one is expanded */
-.tmr-conv-cards.tmr-conv-list-focused .tmr-conv-card:not(.tmr-conv-card-expanded) {
-	display: none;
-}
-
-/* Hide filter row while a conversation is open */
-.tmr-conv-cards.tmr-conv-list-focused ~ .tmr-conv-filter-row {
-	display: none;
 }
 
 /* ── Conversations filter row ────────────────────────────────────────────── */
@@ -2288,11 +2294,11 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 }
 
 .tmr-conv-sort-btn:hover:not(.tmr-conv-sort-btn-active) {
-	color: var(--foreground) !important;
+	color: var(--secondary-foreground) !important;
 }
 
 .tmr-conv-sort-btn.tmr-conv-sort-btn-active {
-	color: var(--foreground) !important;
+	color: var(--secondary-foreground) !important;
 	font-weight: 600;
 }
 
@@ -2321,13 +2327,13 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 }
 
 .tmr-conv-filter-btn.tmr-conv-filter-btn-active {
-	background: #262626 !important;
-	border-color: #6ea793 !important;
-	color: #6ea793 !important;
+	background: var(--hover-popover) !important;
+	border-color: var(--hover-border) !important;
+	color: var(--primary) !important;
 }
 
 .tmr-conv-filter-btn:hover:not(.tmr-conv-filter-btn-active) {
-	color: var(--foreground) !important;
+	color: var(--secondary-foreground) !important;
 }
 
 /* ── Conversation card ───────────────────────────────────────────────────── */
@@ -2339,34 +2345,46 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	cursor: pointer;
 }
 
-/* The visible box (Annotation component from DLS) */
+/* The visible box (Annotation component from DLS): base surface + the mode
+   tint bleeding in from the left edge (Update2 gradient), 2px translucent
+   mode stroke on the left. The base colour rides --tmr-conv-card-bg so hover
+   can swap it without restating the gradient stack. */
 .tmr-conv-card-row {
 	display: flex;
 	align-items: flex-start;
-	background: var(--card);
+	background:
+		linear-gradient(to right,
+			color-mix(in srgb, var(--tmr-conv-grad, transparent) var(--tmr-conv-grad-a, 15%), transparent),
+			transparent 45%),
+		var(--tmr-conv-card-bg, var(--card));
 	border-radius: 0.5625rem;
 	border: 0 solid transparent;
-	border-left-width: 3px;
+	border-left-width: 2px;
 	padding: 0.5rem 0.5rem 0.625rem 0.875rem;
 	cursor: pointer;
-	transition: border-width 180ms ease, border-radius 180ms ease;
+	transition: background 120ms ease;
 }
 
 .tmr-conv-card:hover .tmr-conv-card-row {
-	background: var(--hover-popover);
+	--tmr-conv-card-bg: var(--hover-popover);
 }
 
-/* Per-mode border colors */
-.tmr-conv-card[data-gloss-mode="exclaim"] .tmr-conv-card-row { border-color: var(--tmr-c-exclaim); }
-.tmr-conv-card[data-gloss-mode="explain"] .tmr-conv-card-row { border-color: var(--tmr-c-explain); }
-.tmr-conv-card[data-gloss-mode="examine"] .tmr-conv-card-row { border-color: var(--tmr-c-examine); }
-.tmr-conv-card[data-gloss-mode="enquiry"] .tmr-conv-card-row { border-color: #a7a3a5; }
-
-/* Open: 3px left → 1px top+left+right, bottom stroke dropped, corners kept */
-.tmr-conv-card-expanded .tmr-conv-card-row {
-	border-width: 1px;
-	border-bottom-width: 0;
+/* Per-mode gradient colour — the same vars drive the chat screen's bottom
+   glow. Exclaim's tint runs at 27% (vs 15%): Oh Dear is far darker than the
+   other mode colours and needs the boost to read equally (DLS Update2). */
+.tmr-conv-card[data-gloss-mode="exclaim"] {
+	--tmr-conv-grad: var(--tmr-c-exclaim);
+	--tmr-conv-grad-a: 27%;
 }
+.tmr-conv-card[data-gloss-mode="explain"] { --tmr-conv-grad: var(--tmr-c-explain); }
+.tmr-conv-card[data-gloss-mode="examine"] { --tmr-conv-grad: var(--tmr-c-examine); }
+.tmr-conv-card[data-gloss-mode="enquiry"] { --tmr-conv-grad: #a7a3a5; }
+
+/* Per-mode stroke — Update2 translucent border tokens */
+.tmr-conv-card[data-gloss-mode="exclaim"] .tmr-conv-card-row { border-color: var(--tmr-border-exclaim); }
+.tmr-conv-card[data-gloss-mode="explain"] .tmr-conv-card-row { border-color: var(--tmr-border-explain); }
+.tmr-conv-card[data-gloss-mode="examine"] .tmr-conv-card-row { border-color: var(--tmr-border-examine); }
+.tmr-conv-card[data-gloss-mode="enquiry"] .tmr-conv-card-row { border-color: var(--tmr-border-enquiry); }
 
 .tmr-conv-card-body {
 	flex: 1 1 auto;
@@ -2381,6 +2399,7 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	font-size: 0.875rem;
 	font-weight: 500;
 	color: var(--foreground);
+	opacity: 0.9;
 	line-height: 1.35;
 	overflow: hidden;
 	display: -webkit-box;
@@ -2408,7 +2427,7 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 .tmr-conv-card-preview-pending { opacity: 0.7; }
 .tmr-conv-card-preview-error   { color: var(--destructive); font-style: normal; }
 
-/* Chevron: per-mode color, rotates 90° on expand */
+/* Chevron: per-mode color */
 .tmr-conv-card-chevron {
 	flex-shrink: 0;
 	align-self: flex-start;
@@ -2417,8 +2436,6 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	justify-content: center;
 	margin-left: 0.375rem;
 	padding-top: 0.1875rem;
-	transform-origin: center center;
-	transition: transform 220ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .tmr-conv-card[data-gloss-mode="exclaim"] .tmr-conv-card-chevron { color: var(--tmr-c-exclaim-icon); }
@@ -2431,40 +2448,132 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	height: 0.8125rem;
 }
 
-.tmr-conv-card-expanded .tmr-conv-card-chevron {
-	transform: rotate(90deg);
+/* ── Chat screen (open conversation) ─────────────────────────────────────── */
+
+/* Always-mounted overlay covering the list. Slides in from the right on open
+   and back out on close (220ms, the pane's standard easing) with a subtle
+   opacity ramp; the list stays mounted beneath, so its scroll position
+   survives the round-trip. Opaque base so the list never shows through
+   mid-slide. Visibility flips only after the exit transition, so the hidden
+   screen can't catch focus or pointer events. */
+.tmr-conv-screen {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	flex-direction: column;
+	padding: 0.375rem;
+	/* Base surface + mode glow — soft radial rising from behind the chat box
+	   (Update2). The vertical radius is FIXED so the glow crests exactly at
+	   the chat box's resting top edge instead of scaling with pane height:
+	   0.75rem pinned bottom offset + 4.5rem chatbox min-height = 5.25rem.
+	   (A grown textarea extends the box over the glow; that's fine — the
+	   crest is a resting-state measure.) */
+	background:
+		radial-gradient(ellipse 70% 5.25rem at 50% 100%,
+			color-mix(in srgb, var(--tmr-conv-grad, transparent) 33%, transparent),
+			transparent),
+		var(--surface-inset);
+	transform: translateX(100%);
+	opacity: 0.6;
+	visibility: hidden;
+	pointer-events: none;
+	transition:
+		transform 220ms cubic-bezier(0.4, 0, 0.2, 1),
+		opacity 220ms cubic-bezier(0.4, 0, 0.2, 1),
+		visibility 0s linear 220ms;
 }
 
-/* Expanded card fills the full list height */
-.tmr-conv-list-focused .tmr-conv-card-expanded {
-	flex: 1;
-	min-height: 0;
+.tmr-conversations-list.tmr-conv-chat-open .tmr-conv-screen {
+	transform: translateX(0);
+	opacity: 1;
+	visibility: visible;
+	pointer-events: auto;
+	transition:
+		transform 220ms cubic-bezier(0.4, 0, 0.2, 1),
+		opacity 220ms cubic-bezier(0.4, 0, 0.2, 1);
 }
+
+/* Reduced motion: no horizontal travel — a quick cross-fade only */
+@media (prefers-reduced-motion: reduce) {
+	.tmr-conv-screen {
+		transform: none;
+		opacity: 0;
+		transition: opacity 120ms ease, visibility 0s linear 120ms;
+	}
+	.tmr-conversations-list.tmr-conv-chat-open .tmr-conv-screen {
+		transition: opacity 120ms ease;
+	}
+}
+
+/* Mode glow colour — same var the card gradients ride */
+.tmr-conv-screen[data-gloss-mode="exclaim"] { --tmr-conv-grad: var(--tmr-c-exclaim); }
+.tmr-conv-screen[data-gloss-mode="explain"] { --tmr-conv-grad: var(--tmr-c-explain); }
+.tmr-conv-screen[data-gloss-mode="examine"] { --tmr-conv-grad: var(--tmr-c-examine); }
+.tmr-conv-screen[data-gloss-mode="enquiry"] { --tmr-conv-grad: #a7a3a5; }
+
+/* Back button — 33×33 tertiary icon button, mode-coloured chevron.
+   Floats over the log (like the chat box) so scrolled bubbles pass beneath
+   it instead of clipping at its row. */
+.tmr-conv-back {
+	position: absolute;
+	top: 0.375rem;
+	left: 0.375rem;
+	z-index: 2;
+	width: 2.0625rem;
+	height: 2.0625rem;
+	padding: 0 !important;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	background: var(--popover) !important;
+	border: 1px solid var(--border) !important;
+	border-radius: 0.75rem;
+	color: var(--muted-foreground);
+	cursor: pointer;
+	transition: border-color 120ms ease, background 120ms ease;
+	box-shadow: none !important;
+}
+
+.tmr-conv-back .svg-icon {
+	width: 1rem;
+	height: 1rem;
+}
+
+/* Idle: chevron in the conversation's mode colour */
+.tmr-conv-screen[data-gloss-mode="exclaim"] .tmr-conv-back { color: var(--tmr-c-exclaim-icon); }
+.tmr-conv-screen[data-gloss-mode="explain"] .tmr-conv-back { color: var(--tmr-c-explain); }
+.tmr-conv-screen[data-gloss-mode="examine"] .tmr-conv-back { color: var(--tmr-c-examine); }
+.tmr-conv-screen[data-gloss-mode="enquiry"] .tmr-conv-back { color: #a7a3a5; }
+
+/* Hover: Icon Button/Tertiary heuristics — the accent replaces the border
+   (DLS uses --primary; here the accent is the conversation's mode colour,
+   matching the chevron). !important because the idle border shorthand
+   carries it. */
+.tmr-conv-back:hover { background: var(--hover-popover) !important; }
+.tmr-conv-screen[data-gloss-mode="exclaim"] .tmr-conv-back:hover { border-color: var(--tmr-c-exclaim-icon) !important; }
+.tmr-conv-screen[data-gloss-mode="explain"] .tmr-conv-back:hover { border-color: var(--tmr-c-explain) !important; }
+.tmr-conv-screen[data-gloss-mode="examine"] .tmr-conv-back:hover { border-color: var(--tmr-c-examine) !important; }
+.tmr-conv-screen[data-gloss-mode="enquiry"] .tmr-conv-back:hover { border-color: #a7a3a5 !important; }
 
 /* ── Open conversation surface ───────────────────────────────────────────── */
 
+/* The log owns the surface's full height; the back button and chat box float
+   above it as overlays, so scrolling bubbles pass beneath both (the chat
+   box's 80% fill lets them ghost through) instead of clipping at hard edges.
+   Resting geometry is preserved via the log's own padding. */
 .tmr-conv-surface {
 	flex: 1;
 	min-height: 0;
 	display: flex;
 	flex-direction: column;
-	gap: 0.75rem;
-	padding: 0.625rem 0.375rem 0.375rem;
+	padding: 0;
 }
 
-/* Source quote — centred italic Labrada */
-.tmr-conv-quote {
-	font-family: var(--font-secondary);
-	font-size: 0.8125rem;
-	font-style: italic;
-	font-weight: 300;
-	color: var(--muted-foreground);
-	line-height: 1.55;
-	text-align: center;
-	padding: 0 0.5rem;
-}
-
-/* Chat log — grows to fill space, scrolls internally */
+/* Chat log — fills the screen, scrolls internally. Padding keeps resting
+   content clear of the overlays: top 3.0625rem ≈ back button row (0.375
+   offset + 2.0625 button + 0.375 gap + 0.625 old surface pad − 0.375 screen
+   pad); bottom 5.625rem = resting chatbox top (5.25 from panel bottom)
+   + 0.75 gap − 0.375 screen pad. */
 .tmr-conv-log {
 	flex: 1;
 	min-height: 0;
@@ -2472,10 +2581,22 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	display: flex;
 	flex-direction: column;
 	gap: 0.75rem;
-	padding-bottom: 0.25rem;
+	padding: 3.0625rem 0.375rem 5.625rem;
+	/* Progressive fades at both edges, pinned to the scroll viewport (not the
+	   content). Bottom: bubbles dissolve as they descend toward the chat box
+	   (band starts just above its resting top edge and completes mid-box) so
+	   the glow reads clean instead of being obscured. Top: a shorter band so
+	   bubbles melt out behind the back button row instead of hard-clipping
+	   at the log edge (the button itself is an overlay — unaffected). */
+	mask-image: linear-gradient(to bottom,
+		transparent 0,
+		black 2.75rem,
+		black calc(100% - 5.5rem),
+		transparent calc(100% - 2.5rem));
 }
 
-/* AI bubble: full-width, left accent stripe */
+/* AI bubble: full width (Update2 polish pass — the 2rem right inset from the
+   mocks cost too much line length in a ~340px pane; no stroke) */
 .tmr-conv-turn-ai-wrap {
 	display: flex;
 }
@@ -2485,17 +2606,16 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	min-width: 0;
 	background: var(--secondary);
 	border-radius: 0.5625rem 0.5625rem 0.5625rem 0.1875rem;
-	border-left: 3px solid var(--sidebar-border);
 	padding: 0.5rem 0.625rem;
 	font-family: var(--font-secondary);
 	font-size: 0.8125rem;
 	line-height: 1.5;
-	color: var(--foreground);
+	color: var(--secondary-foreground);
 	word-break: break-word;
 	/* Bridge Obsidian markdown renderer vars to the active DLS tokens so
 	   rendered markdown respects 3C light/dark instead of leaking the
 	   surrounding Obsidian theme. */
-	--text-normal: var(--foreground);
+	--text-normal: var(--secondary-foreground);
 	--text-muted: var(--muted-foreground);
 	--text-faint: var(--subtle-foreground);
 	--code-background: var(--surface-inset);
@@ -2507,6 +2627,18 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 /* Strip default spacing Obsidian's renderer adds to the first/last block */
 .tmr-conv-turn-ai-bubble > :first-child { margin-top: 0; }
 .tmr-conv-turn-ai-bubble > :last-child  { margin-bottom: 0; }
+
+/* Chat-scale markdown: the renderer emits document-scale headings and list
+   indents; in a ~300px bubble those eat the line length. Headings step down
+   to just-above-body, lists pull in. */
+.tmr-conv-turn-ai-bubble h1 { font-size: 1.0625rem; }
+.tmr-conv-turn-ai-bubble h2 { font-size: 1rem; }
+.tmr-conv-turn-ai-bubble h3,
+.tmr-conv-turn-ai-bubble h4,
+.tmr-conv-turn-ai-bubble h5,
+.tmr-conv-turn-ai-bubble h6 { font-size: 0.9375rem; }
+.tmr-conv-turn-ai-bubble ul,
+.tmr-conv-turn-ai-bubble ol { padding-inline-start: 1.375em; }
 
 /* 3C-mode emphasis lock. The AI bubble is the only surface we render through
    Obsidian's MarkdownRenderer, so the active theme's strong/em/heading colour
@@ -2527,13 +2659,17 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 .tmr-root.tmr-3c-mode .tmr-conv-turn-ai-bubble h5,
 .tmr-root.tmr-3c-mode .tmr-conv-turn-ai-bubble h6 { color: var(--foreground); }
 
-/* User bubble: full-width, right-anchored shape */
+/* User bubble: fit-content, right-anchored with a left inset (Update2).
+   Text sits dark-on-accent via --sidebar. The bubble hugs and anchors right
+   but the text inside stays left-aligned (messenger convention) — the mock's
+   right-aligned text was a Pencil artefact and wrapped raggedly in practice. */
 .tmr-conv-turn-user-wrap {
 	display: flex;
+	justify-content: flex-end;
+	padding-left: 2.25rem;
 }
 
 .tmr-conv-turn-user-bubble {
-	flex: 1;
 	min-width: 0;
 	background: var(--sidebar-accent);
 	border-radius: 0.5625rem 0.5625rem 0.1875rem 0.5625rem;
@@ -2541,7 +2677,7 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	font-family: var(--font-secondary);
 	font-size: 0.8125rem;
 	line-height: 1.5;
-	color: #f1eff0;
+	color: var(--sidebar);
 	white-space: pre-wrap;
 	word-break: break-word;
 }
@@ -2610,9 +2746,20 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 /* ── Chat box (DLS "Chat box" component) ─────────────────────────────────── */
 
 .tmr-conv-chatbox {
-	flex-shrink: 0;
-	background: var(--card);
-	border-radius: 0.5625rem;
+	/* Bottom overlay — pinned over the log so bubbles scroll beneath it.
+	   Offsets reproduce the old in-flow position (0.75rem from the panel's
+	   inner edges); a growing textarea extends the box upward from the
+	   pinned bottom, same as before. */
+	position: absolute;
+	left: 0.75rem;
+	right: 0.75rem;
+	bottom: 0.75rem;
+	z-index: 2;
+	/* 80%-opacity sidebar surface (Update2) — lets the mode glow and the
+	   bubbles passing underneath breathe through, frosted by the blur. */
+	background: color-mix(in srgb, var(--sidebar) 80%, transparent);
+	backdrop-filter: blur(9px);
+	border-radius: var(--radius-s);
 	border: 1px solid var(--sidebar-border);
 	padding: 0.5625rem 0.75rem;
 	display: flex;
@@ -2639,13 +2786,13 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	font-size: 0.8rem;
 	font-style: italic;
 	font-weight: 400;
-	color: var(--foreground);
+	color: var(--secondary-foreground);
 	line-height: 1.4;
 	padding: 0;
 	min-height: 1.25rem;
 	max-height: 5rem;
 	overflow-y: auto;
-	caret-color: var(--foreground);
+	caret-color: var(--secondary-foreground);
 }
 
 .tmr-conv-textarea::placeholder {
@@ -2653,23 +2800,28 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	font-style: italic;
 }
 
-/* Send button — Ghost small */
+/* Send button — 25×25 bordered tile (Update2, DLS `uUc0a`).
+   Chat-box chrome hierarchy (Rohan, 2026-07-11): idle = muted-foreground;
+   hover/active state = secondary-foreground; an already-active item (send
+   with content) brightens to foreground on hover. `!important` on colours
+   because theme `button` rules outrank a bare class selector — same reason
+   the filter/sort buttons carry it. */
 .tmr-conv-send {
 	flex-shrink: 0;
-	width: 2.0625rem;
-	height: 2.0625rem;
-	border-radius: 0.5625rem !important;
-	background: transparent !important;
-	border: 1px solid transparent !important;
+	width: 1.5625rem;
+	height: 1.5625rem;
+	border-radius: 0.375rem !important;
+	background: var(--sidebar) !important;
+	border: 1px solid var(--sidebar-border) !important;
 	box-shadow: none !important;
 	cursor: pointer;
 	display: flex;
 	align-items: center;
 	justify-content: center;
 	padding: 0 !important;
-	color: var(--muted-foreground);
+	color: var(--muted-foreground) !important;
 	transition: background 150ms ease, color 150ms ease;
-	--icon-size: 0.9375rem;
+	--icon-size: 0.875rem;
 }
 
 .tmr-conv-send:disabled {
@@ -2677,9 +2829,14 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	cursor: default;
 }
 
+/* Content present = active item */
+.tmr-conv-send:not(:disabled) {
+	color: var(--secondary-foreground) !important;
+}
+
 .tmr-conv-send:not(:disabled):hover {
 	background: var(--hover-popover) !important;
-	color: var(--foreground);
+	color: var(--foreground) !important;
 }
 
 .tmr-conv-chatbox-bottom {
@@ -2688,7 +2845,7 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	justify-content: space-between;
 }
 
-/* Model picker: chevron-down + model name */
+/* Model picker: chevron-down + user-given provider name */
 .tmr-conv-model-picker {
 	display: flex;
 	align-items: center;
@@ -2704,7 +2861,7 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 
 /* Clickable when a provider is resolved — brighten on hover to signal it. */
 .tmr-conv-model-picker-clickable:hover {
-	color: var(--foreground);
+	color: var(--secondary-foreground);
 }
 
 .tmr-conv-model-picker .svg-icon {
@@ -2719,7 +2876,7 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	white-space: nowrap;
 }
 
-/* Settings button — Ghost small */
+/* Settings button — Ghost small. !important on colour: see send button. */
 .tmr-conv-settings-btn {
 	width: 2.0625rem;
 	height: 2.0625rem;
@@ -2727,7 +2884,7 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	background: transparent !important;
 	border: 1px solid transparent !important;
 	box-shadow: none !important;
-	color: var(--muted-foreground);
+	color: var(--muted-foreground) !important;
 	cursor: pointer;
 	padding: 0 !important;
 	display: flex;
@@ -2739,7 +2896,7 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 
 .tmr-conv-settings-btn:hover {
 	background: var(--hover-popover) !important;
-	color: var(--foreground);
+	color: var(--secondary-foreground) !important;
 }
 
 .tmr-conv-settings-btn .svg-icon {

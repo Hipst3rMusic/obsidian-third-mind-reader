@@ -1,6 +1,6 @@
 {
   "name": "third-mind-reader",
-  "version": "0.5.5-beta",
+  "version": "0.5.6-beta",
   "description": "Third Mind Reader — Obsidian Plugin",
   "main": "main.js",
   "scripts": {

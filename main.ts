@@ -656,11 +656,27 @@ export class ReaderView extends ItemView {
 	private sectionColumnCounts: number[] = [];
 	private sectionStartSpreads: number[] = [];
 	private unitStartSpreads: number[] = [];
-	private spreadMeasureCache = new Map<string, number>();
+	// Keyed `sectionId@geometryBucket`; persists across resizes (values are only
+	// valid for their own bucket by construction). Cleared on book change.
+	private spreadMeasureCache = new Map<string, { spreads: number; columns: number }>();
+	// Exact position per committed geometry bucket, saved when a resize leaves
+	// it. Fractional spread⇄page count ratios (7 spreads ⇄ 15 pages) make the
+	// scaled remap drift by one on round-trips; returning to a known bucket
+	// restores the exact spot instead. Cleared on book change.
+	private lastPositionByBucket = new Map<string, { unitIndex: number; spread: number }>();
 
-	private unitDomCache = new Map<number, HTMLElement>();
-	private mountedUnitIndices = { prev: -1, next: -1 };
+	// Unit DOM is geometry-independent (pretext prepares offsets from font
+	// metrics; pagination is CSS columns re-applied at mount), so the cache is
+	// keyed by spine range and survives resize rebuilds — only book load clears it.
+	private unitDomCache = new Map<string, HTMLElement>();
+	private mountedUnitKeys = { prev: "", next: "" };
 	private renderToken = 0;
+	/** Monotonic id for queued layout passes; a pass whose id is stale by the
+	 *  time it reaches the front of the chain is skipped (a newer one follows). */
+	private layoutPassId = 0;
+	/** Serializes geometry passes (initial load + resize rebuilds) so they never
+	 *  interleave on the shared pagination model / measurement DOM (Case File 08). */
+	private layoutChain: Promise<void> = Promise.resolve();
 	private offsetMap = new OffsetMap();
 	private layoutMode: LayoutMode = "spread";
 
@@ -673,6 +689,12 @@ export class ReaderView extends ItemView {
 	private highlightsListEl: HTMLElement | null = null;
 	private conversationsListEl: HTMLElement | null = null;
 	private convCardsEl: HTMLElement | null = null;
+	/** Chat-screen container — sibling of the cards list + filter row inside
+	 *  the conversations panel. Holds the back button + conversation surface
+	 *  for the open conversation. Its `data-conversation-idx` is the source of
+	 *  truth for "which conversation is open": it survives list re-renders and
+	 *  pane toggles, so `renderConversationsList` restores from it. */
+	private convChatEl: HTMLElement | null = null;
 	private convFilterRowEl: HTMLElement | null = null;
 	private paneTabsEl: HTMLElement | null = null;
 	private paneTab: "annotations" | "conversations" = "annotations";
@@ -700,18 +722,18 @@ export class ReaderView extends ItemView {
 	private collapsedSections = new Set<string>();
 	private annotationPreviewEl: HTMLElement | null = null;
 	private hoveredHighlightIdx = -1;
-	/** Index into `savedHighlights` of the currently expanded conversation, or
+	/** Index into `savedHighlights` of the currently open conversation, or
 	 *  -1 when none is open. Drives the `tmr-saved-highlight-rect-active` class
 	 *  on overlay rects so the source passage stays visually pinned during the
-	 *  exchange. Cleared by `toggleConversationCard` when the card collapses. */
+	 *  exchange. Cleared by `closeConversation` when the chat screen closes. */
 	private activeConversationIdx = -1;
 	/** Live `.tmr-conv-log` element of the currently-open conversation surface, or
-	 *  null when no card is expanded. Lets the initial auto-fired AI exchange
-	 *  stream into the open card's DOM (it's started right after the card opens,
+	 *  null when no chat screen is open. Lets the initial auto-fired AI exchange
+	 *  stream into the open chat's DOM (it's started right after the chat opens,
 	 *  so there's no `log` argument to thread through). */
 	private activeConvLog: HTMLElement | null = null;
 	/** Abort controller for the in-flight streamed AI exchange, if any. Aborted
-	 *  when the hosting conversation card closes or the view unloads so a stream
+	 *  when the hosting chat screen closes or the view unloads so a stream
 	 *  never outlives its surface. Null when no exchange is running. */
 	private activeStreamAbort: AbortController | null = null;
 	/** Monotonic render token + per-log generation. `renderConversationLog` is
@@ -755,7 +777,7 @@ export class ReaderView extends ItemView {
 			if (this.resizeTimer !== null) window.clearTimeout(this.resizeTimer);
 			this.resizeTimer = window.setTimeout(() => {
 				this.resizeTimer = null;
-				void this.handleResize();
+				this.queueResize();
 			}, 250);
 		});
 
@@ -1099,6 +1121,10 @@ export class ReaderView extends ItemView {
 		this.convCardsEl = convListEl.createEl("div", { cls: "tmr-conv-cards" });
 		const filterRow = convListEl.createEl("div", { cls: "tmr-conv-filter-row" });
 		this.buildConvFilterRow(filterRow);
+		// Chat screen — hidden until a conversation opens; replaces the cards
+		// + filter row (via the container's tmr-conv-chat-open class) while
+		// the tabs and header above stay put.
+		this.convChatEl = convListEl.createEl("div", { cls: "tmr-conv-screen" });
 		this.highlightsPanelEl = hlPanel;
 		this.applyAiFeaturesState();
 
@@ -1114,7 +1140,12 @@ export class ReaderView extends ItemView {
 		this.nextHost = this.cacheHost.createEl("div");
 
 		this.resizeObserver?.disconnect();
-		if (this.spreadEl) this.resizeObserver?.observe(this.spreadEl);
+		// Observe the BORDER box, not the default content box. The spread's
+		// horizontal padding grows with pane width (gutters), which pins the
+		// content box at the line-width cap — a default observer is blind to
+		// the pane widening past that cap (Case File 09: sidebars closing
+		// never fired a resize, leaving the reader stuck in single-page mode).
+		if (this.spreadEl) this.resizeObserver?.observe(this.spreadEl, { box: "border-box" });
 
 		this.registerDomEvent(this.spreadEl, "mouseover", (e: MouseEvent) => {
 			const target = e.target as Element;
@@ -1737,23 +1768,12 @@ export class ReaderView extends ItemView {
 	/** Build the Conversations tab list. Filters `savedHighlights` to
 	 *  AI-bearing modes (Exclaim/Explain/Examine/Enquiry — Emphasise is
 	 *  permanently excluded), sorts by mode priority then doc order, and
-	 *  renders one card per entry.
-	 *
-	 *  Phase B: click-to-expand is a stub that toggles the chevron rotation
-	 *  and an `tmr-conv-card-expanded` class. The actual chat surface
-	 *  (pinned header + bubbles + chat box) lands in Phase C. */
+	 *  renders one card per entry. Clicking a card opens the chat screen
+	 *  (`openConversation`), which replaces the list content until the back
+	 *  button returns to it. */
 	private renderConversationsList(): void {
 		const list = this.convCardsEl;
 		if (!list) return;
-
-		// Preserve which conversation was open so tab-switch and data-refresh
-		// don't collapse it. `list.empty()` only removes children; the
-		// `tmr-conv-list-focused` class stays on `list` unless we remove it.
-		const expandedEl = list.querySelector<HTMLElement>(".tmr-conv-card-expanded");
-		const expandedIdx = expandedEl
-			? parseInt(expandedEl.dataset.conversationIdx ?? "-1", 10)
-			: -1;
-		list.removeClass("tmr-conv-list-focused");
 		list.empty();
 
 		const showBare = this.plugin.settings.showBareFlaggedConversations;
@@ -1766,6 +1786,9 @@ export class ReaderView extends ItemView {
 		if (this.convFilterRowEl) this.convFilterRowEl.toggleClass("tmr-hidden", !hasConversations);
 
 		if (!hasConversations) {
+			// A chat can't stay open with nothing to return to (e.g. the last
+			// conversation was just deleted) — fall back to the empty state.
+			if (this.convChatEl?.dataset.conversationIdx !== undefined) this.closeConversation();
 			list.createEl("div", {
 				cls: "tmr-highlights-empty",
 				text: "No conversations yet — use Explain, Examine, Exclaim or Enquiry on a selection to start one.",
@@ -1849,18 +1872,25 @@ export class ReaderView extends ItemView {
 			setIcon(chevron, "chevron-right");
 
 			this.registerDomEvent(row, "click", () => {
-				this.toggleConversationCard(card);
+				this.openConversation(idx);
 			});
 		}
 
-		// Restore any conversation that was open before the list was cleared
-		// (tab switch, data refresh, pane reopen). Restore without navigating —
-		// a persisted open card must not yank the reader back to its source.
-		if (expandedIdx >= 0) {
-			const cardToRestore = list.querySelector<HTMLElement>(
-				`[data-conversation-idx="${expandedIdx}"]`,
-			);
-			if (cardToRestore) this.toggleConversationCard(cardToRestore, false);
+		// Re-render any open chat screen against the fresh data (tab switch,
+		// data refresh, pane reopen). The screen's dataset survives the list
+		// rebuild — it lives outside `convCardsEl`. Restore without navigating:
+		// a persisted open chat must not yank the reader back to its source.
+		const openIdxStr = this.convChatEl?.dataset.conversationIdx;
+		if (openIdxStr !== undefined) {
+			const openIdx = parseInt(openIdxStr, 10);
+			const openSaved = this.savedHighlights[openIdx];
+			if (openSaved && GLOSS_AI_MODES.has(openSaved.mode)) {
+				this.openConversation(openIdx, false);
+			} else {
+				// The conversation is gone (deleted / book changed) — fall back
+				// to the list.
+				this.closeConversation();
+			}
 		}
 	}
 
@@ -1885,39 +1915,32 @@ export class ReaderView extends ItemView {
 			.trim();
 	}
 
-	/** Expand or collapse a conversation card. `jumpToSource` navigates the
-	 *  reader to the source paragraph on expand — true for explicit user opens,
-	 *  false when *restoring* a persisted open card (pane reopen / re-render), so
-	 *  a remembered conversation never yanks the reader away from where it is. */
-	private toggleConversationCard(card: HTMLElement, jumpToSource = true): void {
-		const list = this.convCardsEl;
-		const wasExpanded = card.hasClass("tmr-conv-card-expanded");
-
-		// Collapse any currently open card.
-		list?.querySelectorAll<HTMLElement>(".tmr-conv-card-expanded").forEach((c) => {
-			c.removeClass("tmr-conv-card-expanded");
-			c.querySelector(".tmr-conv-surface")?.remove();
-		});
-		list?.removeClass("tmr-conv-list-focused");
-
-		if (wasExpanded) {
-			// Closing — cancel any in-flight stream, drop active highlight
-			// styling, and we're done.
-			this.activeStreamAbort?.abort();
-			this.activeConversationIdx = -1;
-			this.activeConvLog = null;
-			this.renderSavedHighlights();
-			return;
-		}
-
-		card.addClass("tmr-conv-card-expanded");
-		list?.addClass("tmr-conv-list-focused");
-		const idxStr = card.dataset.conversationIdx;
-		if (idxStr === undefined) return;
-		const idx = parseInt(idxStr, 10);
+	/** Open the chat screen for `savedHighlights[idx]`. The screen replaces
+	 *  the list content (cards + filter row) inside the conversations panel —
+	 *  tabs and header stay put. `jumpToSource` navigates the reader to the
+	 *  source paragraph — true for explicit user opens, false when *restoring*
+	 *  a persisted open chat (pane reopen / data refresh), so a remembered
+	 *  conversation never yanks the reader away from where it is. */
+	private openConversation(idx: number, jumpToSource = true): void {
+		const screen = this.convChatEl;
 		const saved = this.savedHighlights[idx];
-		if (!saved) return;
-		this.renderConversationSurface(card, saved);
+		if (!screen || !saved) return;
+
+		screen.empty();
+		screen.dataset.conversationIdx = String(idx);
+		screen.dataset.glossMode = saved.mode;
+		this.conversationsListEl?.addClass("tmr-conv-chat-open");
+
+		// Back button — the only dismissal affordance (Esc stays global).
+		const back = screen.createEl("button", { cls: "tmr-conv-back" });
+		setIcon(back, "chevron-left");
+		setTooltip(back, "Back to conversations");
+		this.registerDomEvent(back, "click", (e: MouseEvent) => {
+			e.stopPropagation();
+			this.closeConversation();
+		});
+
+		this.renderConversationSurface(screen, saved);
 		// Pin the highlight in active styling for the duration of the open
 		// conversation. On an explicit open, also jump the reader to the source
 		// paragraph; on a restore, repaint styling without navigating so the
@@ -1930,8 +1953,32 @@ export class ReaderView extends ItemView {
 		}
 	}
 
-	private renderConversationSurface(card: HTMLElement, saved: SavedHighlight): void {
-		const surface = card.createEl("div", { cls: "tmr-conv-surface" });
+	/** Close the chat screen back to the conversations list. The list never
+	 *  unmounted, so its scroll position is preserved. Cancels any in-flight
+	 *  stream and drops the active-highlight styling. */
+	private closeConversation(): void {
+		this.activeStreamAbort?.abort();
+		this.activeConversationIdx = -1;
+		this.activeConvLog = null;
+		const screen = this.convChatEl;
+		this.conversationsListEl?.removeClass("tmr-conv-chat-open");
+		if (screen) {
+			// Clear the open-marker immediately (the list-restore logic keys
+			// off it) but keep the DOM + mode tint alive through the 220ms
+			// slide-out; tear down once the screen is off-stage. A conversation
+			// reopened mid-exit re-adds the class and owns the screen — skip.
+			delete screen.dataset.conversationIdx;
+			window.setTimeout(() => {
+				if (this.conversationsListEl?.hasClass("tmr-conv-chat-open")) return;
+				screen.empty();
+				delete screen.dataset.glossMode;
+			}, 250);
+		}
+		this.renderSavedHighlights();
+	}
+
+	private renderConversationSurface(host: HTMLElement, saved: SavedHighlight): void {
+		const surface = host.createEl("div", { cls: "tmr-conv-surface" });
 
 		// Chat log — scrollable middle section. Quote is prepended inside so it scrolls away.
 		const log = surface.createEl("div", { cls: "tmr-conv-log" });
@@ -1951,13 +1998,16 @@ export class ReaderView extends ItemView {
 		setIcon(sendBtn, "send-horizontal");
 		(sendBtn).disabled = true;
 
-		// Bottom: model picker + settings button.
+		// Bottom: model picker + settings button. The label surfaces the
+		// user-given provider name from settings (provider.id), not the raw
+		// model id — the picker dialog still lists raw model ids; the hover
+		// tooltip carries the currently resolved one.
 		const chatboxBottom = chatbox.createEl("div", { cls: "tmr-conv-chatbox-bottom" });
 		const provider = this.getActiveProvider();
-		const modelStr = provider?.defaultModel ?? "No model configured";
 		const modelPicker = chatboxBottom.createEl("div", { cls: "tmr-conv-model-picker" });
 		setIcon(modelPicker, "chevron-down");
-		const modelLabel = modelPicker.createEl("span", { text: modelStr });
+		modelPicker.createEl("span", { text: provider ? provider.id : "No model configured" });
+		if (provider?.defaultModel) setTooltip(modelPicker, provider.defaultModel);
 		// Clickable when a provider is resolved: opens the model browser for it
 		// and updates this provider's default model. No-op when unconfigured.
 		if (provider) {
@@ -1966,7 +2016,7 @@ export class ReaderView extends ItemView {
 				e.stopPropagation();
 				void pickModel(this.app, provider, (model) => {
 					provider.defaultModel = model;
-					modelLabel.textContent = model;
+					setTooltip(modelPicker, model);
 					void this.plugin.saveSettings();
 				});
 			});
@@ -1984,7 +2034,6 @@ export class ReaderView extends ItemView {
 			textarea.setCssProps({ height: Math.min(textarea.scrollHeight, 80) + "px" });
 			(sendBtn).disabled = textarea.value.trim().length === 0;
 		});
-		// Prevent input clicks from bubbling to the card-row toggle.
 		this.registerDomEvent(textarea, "click", (e: MouseEvent) => e.stopPropagation());
 		this.registerDomEvent(sendBtn, "click", (e: MouseEvent) => {
 			e.stopPropagation();
@@ -1993,7 +2042,7 @@ export class ReaderView extends ItemView {
 			textarea.value = "";
 			textarea.setCssProps({ height: "auto" });
 			(sendBtn).disabled = true;
-			this.submitConversationMessage(card, saved, log, text);
+			this.submitConversationMessage(saved, log, text);
 		});
 		this.registerDomEvent(chatbox, "click", (e: MouseEvent) => e.stopPropagation());
 		this.registerDomEvent(textarea, "keydown", (e: KeyboardEvent) => {
@@ -2025,9 +2074,6 @@ export class ReaderView extends ItemView {
 		const seq = ++this.convRenderSeq;
 		this.convLogSeq.set(log, seq);
 		log.empty();
-		if (saved.quote.trim()) {
-			log.createEl("div", { cls: "tmr-conv-quote", text: `"${saved.quote.trim()}"` });
-		}
 		for (const turn of saved.turns) {
 			if (turn.role === "user") {
 				const wrap = log.createEl("div", { cls: "tmr-conv-turn-user-wrap" });
@@ -2135,7 +2181,6 @@ export class ReaderView extends ItemView {
 	}
 
 	private submitConversationMessage(
-		_card: HTMLElement,
 		saved: SavedHighlight,
 		log: HTMLElement,
 		text: string,
@@ -2339,7 +2384,13 @@ export class ReaderView extends ItemView {
 		lines: string[],
 		saved: SavedHighlight,
 	): { startIdx: number; anchorIdx: number; endIdx: number } | null {
-		const charsToken = saved.startChar >= 0 ? `chars:${saved.startChar},${saved.endChar}` : null;
+		// Cross-para anchors store the `chars:S,-1` sentinel in the doc; the real
+		// end offset lives in `endChars:` (folded into saved.endChar on parse).
+		const charsToken = saved.startChar >= 0
+			? (saved.endParaIdHint
+				? `chars:${saved.startChar},-1`
+				: `chars:${saved.startChar},${saved.endChar}`)
+			: null;
 		let anchorIdx = -1;
 		for (let i = 0; i < lines.length; i++) {
 			const line = lines[i];
@@ -2436,15 +2487,6 @@ export class ReaderView extends ItemView {
 		else if (startIdx > 0 && lines[startIdx - 1] === "") startIdx--;
 		lines.splice(startIdx, endIdx - startIdx);
 		return lines.join("\n");
-	}
-
-	/** Expand the conversation card at `savedHighlights[idx]` in the list.
-	 *  No-op when the list is not yet rendered or the card is not found. */
-	private openConversationByIdx(idx: number): void {
-		const list = this.convCardsEl;
-		if (!list) return;
-		const card = list.querySelector<HTMLElement>(`[data-conversation-idx="${idx}"]`);
-		if (card) this.toggleConversationCard(card);
 	}
 
 	/** A bare-flagged conversation is an AI-mode callout with no user prompt
@@ -2593,16 +2635,22 @@ export class ReaderView extends ItemView {
 		this.unitStartSpreads = [];
 		this.spreadMeasureCache.clear();
 		this.unitDomCache.clear();
+		this.lastPositionByBucket.clear();
 		this.currentSpread = 0;
 		this.currentUnitIndex = 0;
 		this.totalSpreads = 1;
 		this.previousPosition = null;
 		this.measurementBucketKey = "";
-		this.mountedUnitIndices.prev = -1;
-		this.mountedUnitIndices.next = -1;
+		this.mountedUnitKeys.prev = "";
+		this.mountedUnitKeys.next = "";
 		this.offsetMap.clear();
 		this.savedHighlights = [];
 		this.collapsedSections.clear();
+		// Close any open chat screen — its dataset idx points into the old
+		// book's savedHighlights and must not survive into the next one.
+		if (this.activeConversationIdx !== -1 || this.convChatEl?.dataset.conversationIdx) {
+			this.closeConversation();
+		}
 		this.layoutMode = "spread";
 		this.linkPreviewCache.clear();
 		this.linkPreviewPending.clear();
@@ -2627,17 +2675,25 @@ export class ReaderView extends ItemView {
 			// (e.g. hover-peek sidebar plugins that open/close on hover mid-open).
 			// Measuring mid-animation yields bad section spread counts that get
 			// cached against the final width bucket and survive recovery.
-			await this.waitForStableGeometry();
-			this.layoutMode = this.resolveLayoutMode();
-			this.syncSpreadLayoutMode(this.spreadEl);
-			this.measurementBucketKey = this.getLayoutBucketKey();
-			this.buildSectionIndex();
-			await this.buildRenderUnits();
-			await this.loadSavedHighlights();
-			this.restorePaneTab();
-			const startUnit = Math.min(initialPos?.unitIndex ?? 0, Math.max(0, this.units.length - 1));
-			const startSpread = initialPos?.spread ?? 0;
-			await this.mountCurrentUnit(startUnit, startSpread);
+			// The initial build runs through the same serial chain as resize
+			// rebuilds, so a sidebar toggle during load queues behind it instead
+			// of interleaving with it (Case File 08's load-time variant).
+			await this.runLayoutPass(async () => {
+				await this.waitForStableGeometry();
+				this.layoutMode = this.resolveLayoutMode();
+				this.syncSpreadLayoutMode(this.spreadEl);
+				// Capture the bucket from the same geometry the measurements are
+				// about to use. If geometry shifts mid-build, the queued resize
+				// pass sees a different live bucket and rebuilds cleanly.
+				this.measurementBucketKey = this.getLayoutBucketKey();
+				this.buildSectionIndex();
+				await this.buildRenderUnits();
+				await this.loadSavedHighlights();
+				this.restorePaneTab();
+				const startUnit = Math.min(initialPos?.unitIndex ?? 0, Math.max(0, this.units.length - 1));
+				const startSpread = initialPos?.spread ?? 0;
+				await this.mountCurrentUnit(startUnit, startSpread);
+			});
 			this.renderToc();
 			this.buildProgressSegments();
 			this.updateProgress();
@@ -2706,16 +2762,22 @@ export class ReaderView extends ItemView {
 		});
 	}
 
-	// Geometry key encodes both width and height. Pagination depends on
-	// both (column count is height-driven via getColumnCountForContent),
-	// so a width-only cache key can't detect when only height changed —
-	// which happens when e.g. a header or footer expands.
+	// Geometry key encodes everything pagination actually depends on: the
+	// spread's CONTENT-box width/height (clientWidth minus the gutter padding —
+	// past the line-width cap extra pane width becomes padding and layout is
+	// genuinely unchanged, so above-cap resizes short-circuit instead of
+	// triggering a full rebuild), the layout mode, and the column gap (single
+	// mode derives its gap from the padding, which varies at equal content box).
 	private getLayoutBucketKey(): string {
 		if (!this.spreadEl) return "";
-		const w = this.spreadEl.clientWidth > 0 ? this.spreadEl.clientWidth : this.contentEl.clientWidth;
-		const h = this.spreadEl.clientHeight > 0 ? this.spreadEl.clientHeight : this.contentEl.clientHeight;
+		const cs = getComputedStyle(this.spreadEl);
+		const rawW = this.spreadEl.clientWidth > 0 ? this.spreadEl.clientWidth : this.contentEl.clientWidth;
+		const rawH = this.spreadEl.clientHeight > 0 ? this.spreadEl.clientHeight : this.contentEl.clientHeight;
+		const w = rawW - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+		const h = rawH - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0);
 		const mode = this.resolveLayoutMode();
-		return `${Math.max(0, Math.round(w))}x${Math.max(0, Math.round(h))}@${mode}`;
+		const gap = Math.round(this.getColumnGap(mode));
+		return `${Math.max(0, Math.round(w))}x${Math.max(0, Math.round(h))}@${mode}:${gap}`;
 	}
 
 	// Wait until the spread element's width and height remain unchanged for
@@ -2830,19 +2892,16 @@ export class ReaderView extends ItemView {
 		return Math.max(1, Math.ceil(content.scrollWidth / stride));
 	}
 
-	private async measureSection(sectionIdx: number): Promise<{ spreads: number; columns: number }> {
-		if (!this.book) return { spreads: 1, columns: 1 };
+	private async measureSection(sectionIdx: number): Promise<{ spreads: number; columns: number; fromCache: boolean }> {
+		if (!this.book) return { spreads: 1, columns: 1, fromCache: false };
 		const section = this.sections[sectionIdx];
 		const bucket = this.getLayoutBucketKey();
 		const key = `${section.id}@${bucket}`;
 		const cached = this.spreadMeasureCache.get(key);
-		if (cached !== undefined) {
-			const cachedColumns = this.sectionColumnCounts[sectionIdx] ?? cached;
-			return { spreads: cached, columns: cachedColumns };
-		}
+		if (cached) return { ...cached, fromCache: true };
 
 		this.ensureMeasurementNodes();
-		if (!this.measurementSpreadEl || !this.measurementContentEl) return { spreads: 1, columns: 1 };
+		if (!this.measurementSpreadEl || !this.measurementContentEl) return { spreads: 1, columns: 1, fromCache: false };
 
 		const width = this.spreadEl?.clientWidth || this.contentEl.clientWidth;
 		const height = this.spreadEl?.clientHeight || this.contentEl.clientHeight;
@@ -2854,14 +2913,21 @@ export class ReaderView extends ItemView {
 		this.syncSpreadLayoutMode(this.measurementSpreadEl);
 		const { innerWidth, colWidth, gap } = this.applyPagination(this.measurementSpreadEl, this.measurementContentEl);
 		const spreads = this.getSpreadCountForContent(this.measurementContentEl, innerWidth, gap);
-		const columns = this.getColumnCountForContent(this.measurementContentEl, colWidth, gap);
-		this.spreadMeasureCache.set(key, spreads);
-		this.sectionColumnCounts[sectionIdx] = columns;
+		// Column count only gates pairing/singlePage, which test `=== 1`; a
+		// multi-spread section can't be single-column, so skip its natural-height
+		// probe (the probe forces a second full reflow of the section's DOM).
+		const columns = spreads > 1 ? 2 : this.getColumnCountForContent(this.measurementContentEl, colWidth, gap);
+		// Cache only if geometry held still across the measurement. The cache
+		// persists across resizes now, so a value measured mid-animation must
+		// not survive keyed against a bucket it doesn't represent.
+		if (this.getLayoutBucketKey() === bucket) {
+			this.spreadMeasureCache.set(key, { spreads, columns });
+		}
 		this.measurementContentEl.empty();
-		return { spreads, columns };
+		return { spreads, columns, fromCache: false };
 	}
 
-	private async buildRenderUnits(): Promise<void> {
+	private async buildRenderUnits(isStale?: () => boolean): Promise<void> {
 		if (!this.book) return;
 		this.units = [];
 		this.unitIndexBySection.clear();
@@ -2872,10 +2938,15 @@ export class ReaderView extends ItemView {
 		this.totalSpreads = 0;
 
 		for (let i = 0; i < this.sections.length; i++) {
+			// Superseded by a newer queued pass: stop burning frames on a model
+			// that will be rebuilt immediately after. Caller handles the bail.
+			if (isStale?.()) return;
 			const measured = await this.measureSection(i);
 			this.sectionSpreadCounts[i] = measured.spreads;
 			this.sectionColumnCounts[i] = measured.columns;
-			await new Promise<void>((r) => requestAnimationFrame(() => r()));
+			// Yield a frame only when real measurement work happened — a cache-hit
+			// rebuild (returning to a known pane size) runs without pacing.
+			if (!measured.fromCache) await new Promise<void>((r) => requestAnimationFrame(() => r()));
 		}
 
 		for (let i = 0; i < this.sections.length; i++) {
@@ -2941,19 +3012,27 @@ export class ReaderView extends ItemView {
 		});
 	}
 
+	/** Cache key for a unit's rendered DOM. Spine range, not unit index: unit
+	 *  indices shift when pairing changes across rebuilds, but the same spine
+	 *  range always renders the same DOM. */
+	private unitDomKey(unit: RenderUnit): string {
+		return `${unit.startSpine}-${unit.endSpine}`;
+	}
+
 	private async getUnitDom(unitIdx: number): Promise<HTMLElement | null> {
 		if (!this.book) return null;
-		const existing = this.unitDomCache.get(unitIdx);
-		if (existing) return existing;
 		const unit = this.units[unitIdx];
 		if (!unit) return null;
+		const key = this.unitDomKey(unit);
+		const existing = this.unitDomCache.get(key);
+		if (existing) return existing;
 
 		const node = document.createElement("div");
 		node.className = "tmr-unit";
 		await renderSpineRange(this.book, unit.startSpine, unit.endSpine, node);
 		this.annotateItalicBlocks(node);
 		this.offsetMap.prepareUnit(node);
-		this.unitDomCache.set(unitIdx, node);
+		this.unitDomCache.set(key, node);
 		return node;
 	}
 
@@ -2987,35 +3066,43 @@ export class ReaderView extends ItemView {
 		const prevIdx = this.currentUnitIndex - 1;
 		const nextIdx = this.currentUnitIndex + 1;
 
+		const prevKey = this.units[prevIdx] ? this.unitDomKey(this.units[prevIdx]) : "";
+		const nextKey = this.units[nextIdx] ? this.unitDomKey(this.units[nextIdx]) : "";
+
 		if (prevIdx >= 0) {
 			const prevDom = await this.getUnitDom(prevIdx);
-			if (prevDom && this.mountedUnitIndices.prev !== prevIdx) {
+			if (prevDom && this.mountedUnitKeys.prev !== prevKey) {
 				this.prevHost.empty();
 				this.prevHost.appendChild(prevDom);
-				this.mountedUnitIndices.prev = prevIdx;
+				this.mountedUnitKeys.prev = prevKey;
 			}
-		} else if (this.mountedUnitIndices.prev !== -1) {
+		} else if (this.mountedUnitKeys.prev !== "") {
 			this.prevHost.empty();
-			this.mountedUnitIndices.prev = -1;
+			this.mountedUnitKeys.prev = "";
 		}
 
 		if (nextIdx < this.units.length) {
 			const nextDom = await this.getUnitDom(nextIdx);
-			if (nextDom && this.mountedUnitIndices.next !== nextIdx) {
+			if (nextDom && this.mountedUnitKeys.next !== nextKey) {
 				this.nextHost.empty();
 				this.nextHost.appendChild(nextDom);
-				this.mountedUnitIndices.next = nextIdx;
+				this.mountedUnitKeys.next = nextKey;
 			}
-		} else if (this.mountedUnitIndices.next !== -1) {
+		} else if (this.mountedUnitKeys.next !== "") {
 			this.nextHost.empty();
-			this.mountedUnitIndices.next = -1;
+			this.mountedUnitKeys.next = "";
 		}
 
-		const keep = new Set([this.currentUnitIndex, prevIdx, nextIdx]);
-		for (const [idx, node] of Array.from(this.unitDomCache.entries())) {
-			if (!keep.has(idx)) {
+		const currentUnit = this.units[this.currentUnitIndex];
+		const keep = new Set(
+			[currentUnit, this.units[prevIdx], this.units[nextIdx]]
+				.filter((u): u is RenderUnit => !!u)
+				.map((u) => this.unitDomKey(u)),
+		);
+		for (const [key, node] of Array.from(this.unitDomCache.entries())) {
+			if (!keep.has(key)) {
 				node.remove();
-				this.unitDomCache.delete(idx);
+				this.unitDomCache.delete(key);
 			}
 		}
 	}
@@ -3085,16 +3172,24 @@ export class ReaderView extends ItemView {
 		}
 	}
 
-	/** Tally reader-driven page-turns toward the Back-pill decay. Forward turns
-	 *  accumulate; once {@link BACK_PILL_COMMIT_TURNS} land with no backward turn
-	 *  in between, the pill is dismissed (the dot stays). A backward turn means
-	 *  the reader is heading back toward the origin — peeking, not committing —
-	 *  so the count resets and the pill stays put. No-op without a live anchor or
-	 *  once already dismissed. Seeks and jumps bypass this (they don't route
-	 *  through advance/retreat), which is intended — only linear reading commits. */
+	/** Tally reader-driven page-turns toward the Back-pill decay. Turns moving
+	 *  away from the return anchor accumulate; once {@link BACK_PILL_COMMIT_TURNS}
+	 *  land with no toward-turn in between, the pill is dismissed (the dot stays).
+	 *  A turn toward the anchor means the reader is heading back to the origin —
+	 *  peeking, not committing — so the count resets and the pill stays put.
+	 *  No-op without a live anchor or once already dismissed. Seeks and jumps
+	 *  bypass this (they don't route through advance/retreat), which is
+	 *  intended — only linear reading commits. */
 	private registerReadingTurn(dir: 1 | -1): void {
 		if (!this.previousPosition || this.backPillDismissed) return;
-		if (dir > 0) {
+		const anchor = (this.unitStartSpreads[this.previousPosition.unitIndex] ?? 0)
+			+ this.previousPosition.spread;
+		// Commit/peek is relative to the return anchor, not absolute direction:
+		// after a backward jump the anchor sits ahead, so paging backward is the
+		// reader committing to the new locale. Called post-navigation, so
+		// getGlobalSpread() is already the landing spread.
+		const movingAway = (this.getGlobalSpread() - anchor) * dir >= 0;
+		if (movingAway) {
 			this.backForwardTurns++;
 			if (this.backForwardTurns >= BACK_PILL_COMMIT_TURNS) this.backPillDismissed = true;
 		} else {
@@ -3149,7 +3244,30 @@ export class ReaderView extends ItemView {
 		}
 	}
 
-	private async handleResize(): Promise<void> {
+	/** Append a geometry pass to the serial chain. Passes never overlap — a
+	 *  rebuild in flight finishes before the next starts — which is the whole
+	 *  Case File 08 fix: concurrent passes interleaved on the shared section
+	 *  arrays, measurement caches, and measurement DOM node. */
+	private runLayoutPass(fn: () => Promise<void>): Promise<void> {
+		const run = this.layoutChain.then(fn).catch((err) => {
+			console.error("[ThirdMindReader] layout pass failed", err);
+		});
+		this.layoutChain = run;
+		return run;
+	}
+
+	/** Debounced ResizeObserver entry point. Coalesces: only the newest queued
+	 *  pass runs; a pass superseded while waiting in the chain is skipped, and
+	 *  one superseded mid-rebuild bails early via the staleness probe. */
+	private queueResize(): void {
+		const id = ++this.layoutPassId;
+		void this.runLayoutPass(async () => {
+			if (id !== this.layoutPassId) return;
+			await this.handleResize(() => id !== this.layoutPassId);
+		});
+	}
+
+	private async handleResize(isStale?: () => boolean): Promise<void> {
 		if (!this.book || !this.spreadEl) {
 			this.paginateVisibleContent();
 			this.goToSpread(this.currentSpread);
@@ -3182,6 +3300,7 @@ export class ReaderView extends ItemView {
 
 		const oldSectionIdx = this.getCurrentSectionIndex();
 		const oldSectionSpreadOffset = this.currentSpread - this.getSpreadOffsetWithinUnit(oldSectionIdx);
+		const oldSectionCount = Math.max(1, this.sectionSpreadCounts[oldSectionIdx] ?? 1);
 		const bucket = this.getLayoutBucketKey();
 		if (bucket === this.measurementBucketKey) {
 			const unit = this.getCurrentUnit();
@@ -3191,10 +3310,27 @@ export class ReaderView extends ItemView {
 			return;
 		}
 
+		// Remember exactly where we are in the bucket we're leaving, so a
+		// round-trip back restores this spot instead of re-deriving it.
+		if (this.measurementBucketKey) {
+			this.lastPositionByBucket.set(this.measurementBucketKey, {
+				unitIndex: this.currentUnitIndex,
+				spread: this.currentSpread,
+			});
+		}
+
+		// Caches are NOT cleared here: measurement entries are keyed by geometry
+		// bucket and unit DOM is geometry-independent, so both stay valid across
+		// resizes. Returning to a previously-seen pane size is all cache hits.
+		await this.buildRenderUnits(isStale);
+		if (isStale?.()) {
+			// Superseded mid-build: the model is part-built for a bucket we never
+			// committed. Blank the key so the successor pass can't short-circuit
+			// against it, and let that pass rebuild + remount cleanly.
+			this.measurementBucketKey = "";
+			return;
+		}
 		this.measurementBucketKey = bucket;
-		this.spreadMeasureCache.clear();
-		this.unitDomCache.clear();
-		await this.buildRenderUnits();
 
 		const section = this.sections[oldSectionIdx];
 		if (!section) {
@@ -3205,7 +3341,28 @@ export class ReaderView extends ItemView {
 		const targetUnitIdx = this.unitIndexBySection.get(section.id) ?? 0;
 		const targetOffset = this.getSpreadOffsetInUnitBySectionId(this.units[targetUnitIdx], section.id);
 		const sectionCount = this.sectionSpreadCounts[oldSectionIdx] ?? 1;
-		const targetSpread = targetOffset + Math.max(0, Math.min(oldSectionSpreadOffset, sectionCount - 1));
+		// Scale the in-section offset by the count ratio so a mode flip lands on
+		// the equivalent position: spread→single hits the LEFT page of the old
+		// spread (s → 2s), single→spread the spread containing the old page
+		// (p → ⌊p/2⌋). Same-mode rebuilds scale 1:1 and behave as before.
+		const scaledOffset = Math.floor((oldSectionSpreadOffset * sectionCount) / oldSectionCount);
+		const targetSpread = targetOffset + Math.max(0, Math.min(scaledOffset, sectionCount - 1));
+
+		// Round-trip restore: units are deterministic per bucket (measurements
+		// come from the bucket-keyed cache), so a memo from the last visit to
+		// this bucket is exact. Trust it only when the scaled estimate lands on
+		// or one spread below it — that window is precisely the floor()'s drift,
+		// so real navigation while away (≥1 spread the other way) wins instead.
+		const memo = this.lastPositionByBucket.get(bucket);
+		if (memo && memo.unitIndex < this.units.length) {
+			const memoGlobal = (this.unitStartSpreads[memo.unitIndex] ?? 0) + memo.spread;
+			const targetGlobal = (this.unitStartSpreads[targetUnitIdx] ?? 0) + targetSpread;
+			const drift = memoGlobal - targetGlobal;
+			if (drift >= 0 && drift <= 1) {
+				await this.mountCurrentUnit(memo.unitIndex, memo.spread);
+				return;
+			}
+		}
 		await this.mountCurrentUnit(targetUnitIdx, targetSpread);
 	}
 
@@ -4003,13 +4160,13 @@ export class ReaderView extends ItemView {
 		}
 		// All AI modes open the Conversations tab immediately on submit so
 		// the user lands in the chat surface without manual navigation, then the
-		// initial AI call is fired into the now-open card's live log so the first
+		// initial AI call is fired into the now-open chat's live log so the first
 		// turn streams token-by-token like every follow-up.
 		if (GLOSS_AI_MODES.has(mode)) {
 			if (!this.highlightsOpen) this.toggleHighlightsPanel();
 			this.setPaneTab("conversations");
 			const idx = this.savedHighlights.length - 1;
-			this.openConversationByIdx(idx);
+			this.openConversation(idx);
 			const saved = this.savedHighlights[idx];
 			if (saved) {
 				void this.doAiExchange(saved, this.activeConvLog).catch((err) =>
@@ -4229,7 +4386,7 @@ export class ReaderView extends ItemView {
 
 		if (!this.highlightsOpen) this.toggleHighlightsPanel();
 		this.setPaneTab("conversations");
-		this.openConversationByIdx(matchedIdx);
+		this.openConversation(matchedIdx);
 		return true;
 	}
 
