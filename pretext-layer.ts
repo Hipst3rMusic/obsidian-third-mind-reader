@@ -10,6 +10,11 @@ const BODY_FONT = "15px Labrada, serif";
 const MIN_OPENER_CHARS = 200;
 const LEADING_WRAPPER_SELECTOR =
 	'[class*="dropcap" i], [class*="drop-cap" i], [class*="initial" i], [class*="versal" i]';
+/** Broader than LEADING_WRAPPER_SELECTOR (bare "drop" catches e.g. Sounds True's
+ *  `<span class="drop">B</span>`) — safe only because hasExplicitDropCap also
+ *  requires the wrapper to be leading and ≤2 chars. */
+const EXPLICIT_DROP_SELECTOR =
+	'[class*="drop" i], [class*="initial" i], [class*="versal" i]';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -45,10 +50,11 @@ export class OffsetMap {
 		const spineItems = Array.from(unitEl.querySelectorAll<HTMLElement>(".tmr-spine-item"));
 		for (const spineItem of spineItems) {
 			const spineIndex = parseInt(spineItem.dataset.spineIndex ?? "0", 10);
-			// Body prose + list items are both annotatable. Lists stay DOM-rendered
-			// (no pretext display layout), but registering them lets a selection
-			// inside an <li> resolve to a CursorRange, so the GlossBar fires there.
-			const blocks = Array.from(spineItem.querySelectorAll<HTMLElement>("p, li"));
+			// Body prose, list items, and leaf blockquotes are all annotatable.
+			// Lists/blockquotes stay DOM-rendered (no pretext display layout), but
+			// registering them lets a selection inside resolve to a CursorRange,
+			// so the GlossBar fires there — and the search index can see them.
+			const blocks = Array.from(spineItem.querySelectorAll<HTMLElement>(REGISTERABLE_BLOCK_SELECTOR));
 			const chapterOpenerIdx = findChapterOpenerIndex(spineItem);
 
 			let paraCount = 0;
@@ -62,10 +68,14 @@ export class OffsetMap {
 				// Only genuine prose <p> gets a drop cap (never an <li>). ToC entries,
 				// dedications, epigraphs, and chapter-number-only pages all pass
 				// findChapterOpenerIndex (heading → first <p>) but are too short to
-				// warrant decoration.
+				// warrant decoration. A source paragraph carrying its own explicit
+				// drop-cap markup counts as an opener even when heading detection
+				// fails — some books (e.g. Out of Your Mind) style every "heading"
+				// as a classed <p>, leaving no h1–h3 for the heuristic to anchor on.
+				const explicitDrop = el.tagName === "P" && hasExplicitDropCap(el);
 				const isChapterOpener =
 					el.tagName === "P" &&
-					paraCount === chapterOpenerIdx &&
+					(paraCount === chapterOpenerIdx || explicitDrop) &&
 					text.trim().length >= MIN_OPENER_CHARS;
 
 				if (isChapterOpener) {
@@ -74,6 +84,11 @@ export class OffsetMap {
 					// Flatten the leading wrapper before styling.
 					normalizeLeadingWrapper(el);
 					el.classList.add("tmr-drop-cap");
+				} else if (explicitDrop) {
+					// Too short for our treatment, but still flatten: the wrapper's
+					// surviving inline float/negative margins would otherwise render
+					// the glyph as a broken mini-float (the "superscript" bug).
+					normalizeLeadingWrapper(el);
 				}
 
 				const prepared = prepareWithSegments(text, font);
@@ -321,17 +336,46 @@ function normalizeLeadingWrapper(p: HTMLElement): void {
 }
 
 /**
+ * True when the paragraph opens with the source epub's own drop-cap markup:
+ * a leading inline wrapper (no text before it) whose class says drop-cap-ish
+ * and whose content is a single grapheme or two. The class match is the
+ * load-bearing part — a bare `<i>I</i> think…` opener must NOT count, so the
+ * shape-only fallback normalizeLeadingWrapper uses stays gated behind
+ * heading-based opener detection.
+ */
+function hasExplicitDropCap(p: HTMLElement): boolean {
+	const first = p.firstElementChild as HTMLElement | null;
+	if (!first || p.firstChild !== first) return false;
+	return (
+		first.matches(EXPLICIT_DROP_SELECTOR) &&
+		(first.textContent ?? "").trim().length <= 2
+	);
+}
+
+/**
  * Find the index (among non-empty <p> elements) of the first paragraph
  * that follows a heading in this spine item. Returns -1 if no heading exists
  * (title pages, copyright pages, dedications don't get drop caps).
  */
+/** The blocks prepareUnit registers as paragraphs. Every walk that predicts
+ *  paraIds (prepareUnit, findChapterOpenerIndex, the book-search index) must
+ *  query this same selector or the counts drift. */
+export const REGISTERABLE_BLOCK_SELECTOR = "p, li, blockquote";
+
 /** A block is annotatable if it holds inline prose: any non-empty <p>, or a
- *  leaf <li> (no nested paragraph or sub-list). Container <li>s are skipped so
- *  their inner <p>/<li> register individually instead of double-counting. */
-function isRegisterableBlock(el: HTMLElement): boolean {
+ *  leaf <li>/<blockquote> (no nested block element). Containers are skipped so
+ *  their inner blocks register individually instead of double-counting.
+ *  Blockquotes matter more than they sound: Calibre-converted epubs exist
+ *  whose entire body prose is nested blockquotes with barely a <p> in sight
+ *  (e.g. The Treasury of Knowledge) — without this branch that text gets no
+ *  paraIds, so no search hits and no highlights.
+ *  Exported: the book-search index walks raw spine XHTML with this same
+ *  filter so its predicted paraIds match what prepareUnit stamps at mount. */
+export function isRegisterableBlock(el: HTMLElement): boolean {
 	if (!(el.textContent ?? "").trim()) return false;
 	if (el.tagName === "P") return true;
 	if (el.tagName === "LI") return !el.querySelector("p, ul, ol, li");
+	if (el.tagName === "BLOCKQUOTE") return !el.querySelector("p, ul, ol, li, blockquote, div");
 	return false;
 }
 
@@ -349,7 +393,7 @@ function findChapterOpenerIndex(spineItem: HTMLElement): number {
 		if (nextP) {
 			// Count the opener's index among the same blocks prepareUnit registers,
 			// so it matches paraCount even when a list precedes it.
-			const blocks = Array.from(spineItem.querySelectorAll<HTMLElement>("p, li"));
+			const blocks = Array.from(spineItem.querySelectorAll<HTMLElement>(REGISTERABLE_BLOCK_SELECTOR));
 			let nonEmptyIdx = 0;
 			for (const el of blocks) {
 				if (!isRegisterableBlock(el)) continue;

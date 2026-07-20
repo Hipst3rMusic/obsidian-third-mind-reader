@@ -248,8 +248,11 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	position: relative;
 	min-height: 0;
 	/* Horizontal padding grows on wide displays so neither column exceeds
-	   --tmr-line-width. Extra space becomes outer gutters, not dead zones. */
-	padding: 1.5rem max(3rem, calc((100% - var(--tmr-line-width) * 2 - var(--tmr-gap)) / 2)) 1rem;
+	   --tmr-line-width. Extra space becomes outer gutters, not dead zones.
+	   Top gutter matches the corner-button height (2.0625rem) so the open
+	   search bar clears the first line's highlight box instead of floating
+	   over it. */
+	padding: 2.0625rem max(3rem, calc((100% - var(--tmr-line-width) * 2 - var(--tmr-gap)) / 2)) 1rem;
 	width: 100%;
 	box-sizing: border-box;
 }
@@ -257,7 +260,7 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 /* True narrow-layout mode: center one readable-width page in the viewport
    rather than insisting on a two-page spread with implausibly skinny columns. */
 .tmr-spread.tmr-layout-single {
-	padding: 1.5rem max(3rem, calc((100% - var(--tmr-line-width)) / 2)) 1rem;
+	padding: 2.0625rem max(3rem, calc((100% - var(--tmr-line-width)) / 2)) 1rem;
 }
 
 /* Content fills the spread height exactly, then overflows RIGHT into more columns.
@@ -650,6 +653,36 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	background: color-mix(in srgb, var(--tmr-c-explain) 16%, transparent);
 	border-radius: 2px;
 	pointer-events: none;
+}
+
+/* Search match flash — painted after a result click-jump, then fades so the
+   eye can land on the exact phrase. Same tint family as the active-selection
+   rect, held stronger before the fade. */
+.tmr-search-flash-overlay {
+	position: absolute;
+	inset: 0;
+	pointer-events: none;
+	z-index: 1;
+}
+
+.tmr-search-flash-rect {
+	position: absolute;
+	background: color-mix(in srgb, var(--tmr-c-explain) 30%, transparent);
+	border-radius: 2px;
+	pointer-events: none;
+	animation: tmr-search-flash-fade 4.5s ease-out forwards;
+}
+
+/* Hold at full strength while the eye lands, then dissolve. */
+@keyframes tmr-search-flash-fade {
+	0%, 40% { opacity: 1; }
+	100% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+	/* Static flash — still cleared by the removal timeout — and no bar morph. */
+	.tmr-search-flash-rect { animation: none; }
+	.tmr-search-bar { transition: none; }
 }
 
 /* 3C dark mode: warning token is already alpha'd (#ac9c5d29) — use as-is. */
@@ -1389,7 +1422,10 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	top: 0;
 	left: 0;
 	bottom: 0;
-	width: 340px;
+	/* Drag-resizable: makePaneResizable() writes --tmr-pane-w onto the panel's
+	   inline style. Session-scoped by construction — the inline var dies with
+	   the shell DOM when a new book loads (loadFile → renderShell). */
+	width: var(--tmr-pane-w, 340px);
 	max-width: calc(100% - 60px);
 	z-index: 20;
 	background: var(--sidebar);
@@ -1404,6 +1440,50 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 
 .tmr-toc.tmr-toc-open {
 	transform: translateX(0);
+}
+
+/* Invisible resize affordance on both slide-in panes — OS-window idiom: no
+   painted handle, just the cursor flipping to ew-resize along the pane's
+   inner border. The strip sits fully inside the panel (overflow: hidden
+   would clip anything straddling the border) and rides its translateX, so
+   it's off-canvas whenever the pane is closed. */
+.tmr-pane-resize-edge {
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	width: 6px;
+	cursor: ew-resize;
+	z-index: 30;
+}
+
+.tmr-pane-resize-edge-left {
+	left: 0;
+}
+
+.tmr-pane-resize-edge-right {
+	right: 0;
+}
+
+/* The ToC's grip shares its right edge with the list scrollbar — narrower
+   strip so the scrollbar thumb stays grabbable. */
+.tmr-toc .tmr-pane-resize-edge {
+	width: 4px;
+}
+
+/* While a drag is live, hold the resize cursor everywhere — pointer capture
+   keeps the events flowing but does not pin the cursor on fast movement. */
+body.tmr-pane-resizing,
+body.tmr-pane-resizing * {
+	cursor: ew-resize !important;
+	user-select: none !important;
+}
+
+/* Suspend the chatbox blur while resizing — Chromium re-samples the backdrop
+   through the composited panel on every width change, which smears ghost
+   copies of the panel across the reader at large widths. Blur returns on
+   drop; the 80%-opacity surface alone covers the drag. */
+body.tmr-pane-resizing .tmr-conv-chatbox {
+	backdrop-filter: none;
 }
 
 .tmr-toc-header {
@@ -1483,9 +1563,10 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	align-items: center;
 	cursor: pointer;
 	transition: color 150ms ease, background 150ms ease;
+	/* Long titles wrap to the next line — no nowrap/ellipsis (the old
+	   ellipsis never rendered anyway: text-overflow doesn't apply to a
+	   flex container's anonymous text item, so titles hard-clipped). */
 	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
 	border-left: 2px solid transparent;
 }
 
@@ -1834,12 +1915,266 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	color: inherit !important;
 }
 
+/* ── Book search (Phase 5) — morphing bar + anchored results card. One
+   element is both the ghost icon button and the expanded field (library
+   search pattern, BookSearchButton components): right-anchored, so the
+   width transition expands leftward. ─────────────────────────────────── */
+
+/* Collapsed: ghost toggle seated one button-width left of the Highlights
+   toggle (0.5rem edge + 2.0625rem button + 0.5rem gap). Fixed left padding
+   keeps the icon put while the width animates (library-search trick). */
+.tmr-search-bar {
+	position: absolute;
+	top: 0.5rem;
+	right: 3.0625rem;
+	z-index: 25;
+	display: flex;
+	align-items: center;
+	gap: 0.375rem;
+	width: 2.0625rem;
+	height: 2.0625rem;
+	box-sizing: border-box;
+	padding: 0 0.5rem;
+	border-radius: 0.5625rem;
+	background: transparent;
+	border: 1px solid transparent;
+	color: var(--foreground);
+	cursor: pointer;
+	opacity: 0;
+	overflow: hidden;
+	transition: width 240ms cubic-bezier(0.4, 0, 0.2, 1), opacity 200ms ease,
+		background 150ms ease, color 150ms ease, border-color 150ms ease,
+		border-radius 150ms ease;
+	--icon-size: 1rem;
+}
+
+.tmr-root:hover .tmr-search-bar,
+.tmr-search-bar:focus-within {
+	opacity: 1;
+}
+
+.tmr-search-bar.tmr-search-bar-hidden {
+	opacity: 0 !important;
+	pointer-events: none;
+}
+
+.tmr-search-bar:hover:not(.tmr-search-bar-open) {
+	background: var(--hover-popover);
+	color: var(--muted-foreground);
+}
+
+/* Expanded (BookSearchButton/Active): hover-popover fill, sidebar-border
+   stroke, 12px radius, muted chrome. */
+.tmr-search-bar.tmr-search-bar-open {
+	opacity: 1;
+	width: 21.25rem;
+	max-width: calc(100% - 4rem);
+	background: var(--hover-popover);
+	border-color: var(--sidebar-border);
+	border-radius: 0.75rem;
+	color: var(--muted-foreground);
+	cursor: default;
+}
+
+.tmr-search-bar-icon {
+	display: flex;
+	flex-shrink: 0;
+	color: inherit;
+}
+
+.tmr-search-bar .svg-icon {
+	color: inherit !important;
+}
+
+/* Results card (4izeN Dropdown tokens), anchored beneath the bar and
+   sharing its right edge/width so the pair reads as one assembly. Hides
+   itself whenever there's nothing to show (pre-query state). */
+.tmr-book-search {
+	position: absolute;
+	top: 2.875rem;
+	right: 3.0625rem;
+	z-index: 24;
+	width: 21.25rem;
+	max-width: calc(100% - 4rem);
+	background: var(--popover);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-m);
+	box-shadow: 0 2px 3.5px -1px rgba(0, 0, 0, 0.06);
+	overflow-y: auto;
+	max-height: 60vh;
+}
+
+.tmr-book-search:empty {
+	display: none;
+}
+
+/* Obsidian's stock input styling (background, border, fixed height, font)
+   is pinned away — same leak family as the stock-button rules. Collapsed
+   to zero width until the bar opens so nothing peeks from the ghost
+   button state. */
+.tmr-book-search-input {
+	flex: 0 1 0;
+	width: 0;
+	min-width: 0;
+	opacity: 0;
+	background: transparent !important;
+	border: none !important;
+	box-shadow: none !important;
+	height: auto !important;
+	padding: 0 !important;
+	font-family: var(--font-secondary) !important;
+	font-size: 14px !important;
+	color: var(--secondary-foreground);
+	transition: opacity 160ms ease;
+}
+
+.tmr-search-bar-open .tmr-book-search-input {
+	flex: 1 1 auto;
+	opacity: 1;
+}
+
+.tmr-book-search-input::placeholder {
+	color: var(--muted-foreground);
+}
+
+.tmr-book-search-clear {
+	width: 0;
+	flex-shrink: 0;
+	height: 1.25rem !important;
+	border-radius: 0.375rem !important;
+	background: transparent !important;
+	border: none !important;
+	box-shadow: none !important;
+	padding: 0 !important;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	cursor: pointer;
+	color: var(--muted-foreground) !important;
+	opacity: 0;
+	overflow: hidden;
+	transition: opacity 160ms ease;
+	--icon-size: 0.8125rem;
+}
+
+.tmr-search-bar-open .tmr-book-search-clear {
+	width: 1.25rem;
+	opacity: 1;
+}
+
+.tmr-book-search-clear:hover {
+	color: var(--secondary-foreground) !important;
+	background: var(--hover-popover) !important;
+}
+
+.tmr-book-search-clear .svg-icon {
+	color: inherit !important;
+}
+
+/* Result row — annotation-card layout: chapter eyebrow over a two-line
+   clamped snippet with the match emphasized. Hits inside a saved highlight
+   re-add the card's accent bar + mode icon (via [data-gloss-mode]); plain
+   hits keep both slots empty. */
+.tmr-book-search-row {
+	display: flex;
+	gap: 0.6rem;
+	align-items: flex-start;
+	padding: 0.55rem 1rem;
+	border-left: 2px solid transparent;
+	cursor: pointer;
+	transition: background 150ms ease;
+}
+
+.tmr-book-search-row:hover,
+.tmr-book-search-row-active {
+	background: var(--hover-popover);
+}
+
+.tmr-book-search-row + .tmr-book-search-row {
+	border-top: 1px solid var(--border);
+}
+
+.tmr-book-search-row-body {
+	flex: 1;
+	min-width: 0;
+}
+
+.tmr-book-search-row-icon {
+	flex-shrink: 0;
+	width: 16px;
+	height: 16px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	margin-top: 2px;
+}
+
+.tmr-book-search-row-icon .svg-icon {
+	width: 14px;
+	height: 14px;
+}
+
+.tmr-book-search-row[data-gloss-mode="exclaim"]   { border-left-color: var(--tmr-c-exclaim); }
+.tmr-book-search-row[data-gloss-mode="explain"]   { border-left-color: var(--tmr-c-explain); }
+.tmr-book-search-row[data-gloss-mode="examine"]   { border-left-color: var(--tmr-c-examine); }
+.tmr-book-search-row[data-gloss-mode="emphasise"] { border-left-color: var(--tmr-c-emphasise); }
+.tmr-book-search-row[data-gloss-mode="enquiry"]   { border-left-color: var(--tmr-c-enquiry); }
+
+.tmr-book-search-row[data-gloss-mode="exclaim"]   .tmr-book-search-row-icon { color: var(--tmr-c-exclaim-icon); }
+.tmr-book-search-row[data-gloss-mode="explain"]   .tmr-book-search-row-icon { color: var(--tmr-c-explain); }
+.tmr-book-search-row[data-gloss-mode="examine"]   .tmr-book-search-row-icon { color: var(--tmr-c-examine); }
+.tmr-book-search-row[data-gloss-mode="emphasise"] .tmr-book-search-row-icon { color: var(--tmr-c-emphasise); }
+.tmr-book-search-row[data-gloss-mode="enquiry"]   .tmr-book-search-row-icon { color: var(--tmr-c-enquiry); }
+
+.tmr-book-search-row-section {
+	font-family: var(--font-primary-alt);
+	font-size: 9px;
+	font-weight: 700;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	color: var(--muted-foreground);
+	margin-bottom: 0.1875rem;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.tmr-book-search-row-snippet {
+	font-family: var(--font-secondary);
+	font-size: 12px;
+	line-height: 1.45;
+	color: var(--muted-foreground);
+	display: -webkit-box;
+	-webkit-line-clamp: 2;
+	line-clamp: 2;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
+}
+
+.tmr-book-search-row-snippet strong {
+	font-weight: 700;
+	color: var(--foreground);
+}
+
+.tmr-book-search-empty,
+.tmr-book-search-more {
+	padding: 0.625rem 1rem;
+	font-family: var(--font-secondary);
+	font-size: 12px;
+	font-style: italic;
+	color: var(--muted-foreground);
+}
+
+.tmr-book-search-more {
+	border-top: 1px solid var(--border);
+}
+
 .tmr-highlights-panel {
 	position: absolute;
 	top: 0;
 	right: 0;
 	bottom: 0;
-	width: 340px;
+	width: var(--tmr-pane-w, 340px); /* see .tmr-toc — same resize mechanism */
 	max-width: calc(100% - 60px);
 	z-index: 20;
 	background: var(--sidebar);

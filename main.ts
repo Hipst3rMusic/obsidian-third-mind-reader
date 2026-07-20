@@ -13,6 +13,7 @@ import {
 	MarkdownRenderer,
 	Menu,
 	setIcon,
+	addIcon,
 	setTooltip,
 	Notice,
 	SecretComponent,
@@ -21,6 +22,7 @@ import {
 	Modal,
 	SuggestModal,
 	Platform,
+	Scope,
 	apiVersion,
 } from "obsidian";
 import * as nodePath from "path";
@@ -38,7 +40,7 @@ import {
 	EpubTocItem,
 	type EpubLinkPreview,
 } from "./epub";
-import { OffsetMap, type CursorRange } from "./pretext-layer";
+import { OffsetMap, type CursorRange, isRegisterableBlock, REGISTERABLE_BLOCK_SELECTOR } from "./pretext-layer";
 import { chat, probeProvider, probeModelLoaded, type AiProvider, type ChatMessage, type ProviderKind, type LocalRuntime } from "./ai-client";
 import { LibraryView, LIBRARY_VIEW_TYPE } from "./library-view";
 import { type LibraryOverride, invalidateMetaCache, LIBRARY_ROOT, companionDocPath, sanitizeFileName } from "./library-scan";
@@ -52,6 +54,12 @@ import LabradaItalic from "./fonts/Labrada-Italic-VariableFont_wght.ttf";
 import KodeMono from "./fonts/KodeMono-VariableFont_wght.ttf";
 
 export const READER_VIEW_TYPE = "third-mind-reader";
+
+// Book search: shortest queryable string, total hits collected before bailing,
+// and how many rows actually render (the rest collapse into a "more" footer).
+const SEARCH_MIN_CHARS = 2;
+const SEARCH_MAX_HITS = 500;
+const SEARCH_RENDER_CAP = 100;
 
 interface ImportEntry {
 	folderPath: string;
@@ -427,6 +435,22 @@ interface ReaderSection {
 	endSpine: number;
 }
 
+/** One registerable block of the book-search index. `paraId` is predicted to
+ *  match what prepareUnit stamps at mount (same walk, same filter), so a hit
+ *  can ride the saved-highlight jump path. */
+interface BookSearchEntry {
+	paraId: string;
+	sectionIdx: number;
+	text: string;
+	textLower: string;
+}
+
+interface BookSearchHit {
+	entry: BookSearchEntry;
+	start: number;
+	end: number;
+}
+
 interface RenderUnit {
 	id: string;
 	sectionIds: string[];
@@ -516,6 +540,7 @@ const HELP_GROUPS: { heading: string; rows: HelpRow[] }[] = [
 			{ key: "← / →", desc: "Previous / Next Page" },
 			{ key: "t", desc: "Table Of Contents" },
 			{ key: "h", desc: "Highlights & Annotations" },
+			{ key: "s", desc: "Search in book" },
 			{ key: "Esc", desc: "Close a panel or dismiss the Gloss toolbar" },
 		],
 	},
@@ -606,6 +631,21 @@ export class ReaderView extends ItemView {
 	private currentSpread = 0;
 	private currentUnitIndex = 0;
 	private totalSpreads = 1;
+	/** True once a unit has actually mounted for the current book. Guards the
+	 *  onClose position flush: a view closed mid-load (plugin reload/update
+	 *  tears views down while the async load is in flight) still sits at the
+	 *  0/0 reset values, and flushing those would overwrite the real stored
+	 *  position with {unitIndex: 0, spread: 0, pct: 1} — the "sent back to
+	 *  the start" poison. */
+	private hasMountedUnit = false;
+	/** Durable "where the user is" anchor — section index + in-section spread
+	 *  offset + that section's spread count — captured on every goToSpread,
+	 *  when the unit model is guaranteed valid. handleResize re-seeks from
+	 *  this instead of re-deriving from live model state: a resize pass can
+	 *  run while another pass holds this.units mid-rebuild (transiently
+	 *  empty), and deriving the section from an empty model fabricated
+	 *  "section 0" — the post-reload yank back to the cover. */
+	private posAnchor: { sectionIdx: number; offset: number; count: number } | null = null;
 	private tocAnchorPageMap: Array<{ spreadOffset: number; href: string }> = [];
 
 	private tocOpen = false;
@@ -701,6 +741,23 @@ export class ReaderView extends ItemView {
 	private convFilterOpen = false;
 	private convSort: "priority" | "recent" | "chapter" = "priority";
 	private highlightsOpen = false;
+	// Book search (see In-Book Search feature spec). The index promise is the
+	// lazy cache: built on first use per book, dropped in resetViewState.
+	private searchOpen = false;
+	private searchBarEl: HTMLElement | null = null;
+	private searchInputEl: HTMLInputElement | null = null;
+	private searchResultsEl: HTMLElement | null = null;
+	private searchQuery = "";
+	private searchDebounce: number | null = null;
+	private searchIndexPromise: Promise<BookSearchEntry[]> | null = null;
+	private searchHits: BookSearchHit[] = [];
+	/** Keyboard-focused result row (combobox pattern — DOM focus stays in the
+	 *  input; ↑/↓ move this index, Enter jumps). −1 = nothing focused. */
+	private searchActiveIdx = -1;
+	// Esc interception — a keymap Scope pushed while this reader is the active
+	// leaf, so layer dismissal preempts app/plugin hotkeys (see onOpen).
+	private escScope: Scope | null = null;
+	private escScopePushed = false;
 	private activeHighlight: CursorRange | null = null;
 	private activeSelectionText: string | null = null;
 	private activeSelectionRect: DOMRect | null = null;
@@ -801,20 +858,40 @@ export class ReaderView extends ItemView {
 			this.isDraggingProgress = false;
 		});
 
-		// Reader bare-key shortcuts (t / h / 1–5 / ← / →) are handled HERE, scoped
-		// to this view: the handler no-ops unless this reader is the active leaf,
-		// so the keys never interfere with typing in a note or any other view.
+		// Escape must beat app/plugin hotkeys (quick-peek-sidebar binds bare Esc;
+		// unbound, the app still refocuses the editor). A DOM listener can never
+		// win that race — Obsidian's keymap listens on `window` in the CAPTURE
+		// phase, registered at boot — so we go through the keymap itself: a
+		// Scope pushed while this reader is the active leaf. The handler is a
+		// CATCH-ALL (null key) on purpose: a specific-key registration would
+		// terminate the scope chain even when it declines, swallowing Esc for
+		// the whole app while reading; a catch-all that returns undefined lets
+		// the event fall through to the root scope's hotkeys untouched.
+		// Dismissal runs in transience order, one layer per press, and fires
+		// even while a panel input has focus (scope follows the active leaf,
+		// not DOM focus).
+		this.escScope = new Scope(this.app.scope);
+		this.escScope.register(null, null, (_evt, ctx) => {
+			if (ctx.key !== "Escape") return;
+			if (this.isGlossActive()) this.dismissGloss();
+			else if (this.searchOpen) this.toggleBookSearch(false);
+			else if (this.tocOpen) this.toggleToc();
+			else if (this.highlightsOpen) this.toggleHighlightsPanel();
+			else return;
+			return false; // consumed — keymap preventDefaults and stops here
+		});
+		this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.syncEscScope()));
+		this.syncEscScope();
+
+		// Reader bare-key shortcuts (t / h / s / 1–5 / ← / →) are handled HERE,
+		// scoped to this view: the handler no-ops unless this reader is the active
+		// leaf, so the keys never interfere with typing in a note or any other view.
 		// They are deliberately NOT Obsidian command hotkeys — command hotkeys are
 		// global and a bare key (especially the arrows) steals the keystroke from
 		// the editor app-wide. Only modifier combos are safe as commands, so just
-		// those live in `addReaderCommands`. Escape is also handled here (universal
-		// cancel; fires even while a panel input has focus).
+		// those live in `addReaderCommands`.
 		this.registerDomEvent(document, "keydown", (e: KeyboardEvent) => {
 			if (this.app.workspace.getActiveViewOfType(ReaderView) !== this) return;
-			if (e.key === "Escape" && this.isGlossActive()) {
-				this.dismissGloss();
-				return;
-			}
 			// While a text field (gloss input, note editor, chat box, search…) has
 			// focus, keystrokes belong to it: navigation and shortcuts yield.
 			const typing = this.isTextInputFocused();
@@ -834,15 +911,26 @@ export class ReaderView extends ItemView {
 			}
 			if (!typing && e.key === "ArrowRight") void this.advance();
 			if (!typing && e.key === "ArrowLeft") void this.retreat();
-			if (e.key === "Escape" && this.tocOpen) this.toggleToc();
-			if (e.key === "Escape" && this.highlightsOpen) this.toggleHighlightsPanel();
-			if (!typing && (e.key === "t" || e.key === "h") && !e.ctrlKey && !e.metaKey && !e.altKey) {
+			if (!typing && (e.key === "t" || e.key === "h" || e.key === "s") && !e.ctrlKey && !e.metaKey && !e.altKey) {
+				// preventDefault matters for `s`: the toggle focuses the search
+				// input, and without it this same keystroke's default action
+				// types an "s" into the field it just opened.
+				e.preventDefault();
 				if (e.key === "t") this.toggleToc();
-				else this.toggleHighlightsPanel();
+				else if (e.key === "h") this.toggleHighlightsPanel();
+				else this.toggleBookSearch();
 			}
 		});
 
 		this.registerDomEvent(document, "mousedown", (e: MouseEvent) => {
+			// Book search: a click outside the bar and the results card
+			// collapses both.
+			if (this.searchOpen) {
+				const t = e.target as Node;
+				if (!this.searchBarEl?.contains(t) && !this.searchResultsEl?.contains(t)) {
+					this.toggleBookSearch(false);
+				}
+			}
 			// The end-click of an extend is resolved on mouseup — never dismiss it.
 			if (this.isExtending) return;
 			// Shift-click extends the live selection (browser handles the range
@@ -856,7 +944,23 @@ export class ReaderView extends ItemView {
 		});
 	}
 
+	/** Push/pop the Esc scope so it's active exactly while this reader is the
+	 *  active leaf. `popScope` tolerates out-of-order removal (drops the scope
+	 *  from the stack even when it isn't on top), so overlapping reader tabs
+	 *  can't corrupt the keymap stack. */
+	private syncEscScope(): void {
+		if (!this.escScope) return;
+		const active = this.app.workspace.getActiveViewOfType(ReaderView) === this;
+		if (active === this.escScopePushed) return;
+		this.escScopePushed = active;
+		if (active) this.app.keymap.pushScope(this.escScope);
+		else this.app.keymap.popScope(this.escScope);
+	}
+
 	async onClose(): Promise<void> {
+		if (this.escScopePushed && this.escScope) this.app.keymap.popScope(this.escScope);
+		this.escScopePushed = false;
+		this.escScope = null;
 		this.activeStreamAbort?.abort();
 		this.activeStreamAbort = null;
 		this.activeConvLog = null;
@@ -892,7 +996,9 @@ export class ReaderView extends ItemView {
 			this.positionSaveTimer = null;
 		}
 		const closePath = this.currentFile?.path ?? this.currentFolder?.path;
-		if (closePath && this.book) {
+		// hasMountedUnit: never flush the 0/0 reset values of a view that got
+		// closed before its load finished — see the field doc.
+		if (closePath && this.book && this.hasMountedUnit) {
 			this.writeBookPosition(closePath);
 			void this.plugin.persistSettings();
 		}
@@ -906,8 +1012,15 @@ export class ReaderView extends ItemView {
 			const incomingUnit = s.state?.unitIndex ?? s.unitIndex;
 			const incomingSpread = s.state?.spread ?? s.spread;
 			const storedPos = this.plugin.settings.bookPositions[filePath];
-			const savedUnitIndex: number = incomingUnit ?? storedPos?.unitIndex ?? 0;
-			const savedSpread: number = incomingSpread ?? storedPos?.spread ?? 0;
+			// bookPositions outranks the leaf's serialized position. The workspace
+			// snapshot goes stale the moment a page turns (page turns never
+			// requestSaveLayout), and on plugin reload/update Obsidian rebuilds the
+			// leaf from that snapshot — trusting its defined-but-stale zeros sent
+			// readers back to the cover on every update. bookPositions is flushed
+			// within 800ms of every turn and again on close, so it is always at
+			// least as fresh as anything the layout can hand us.
+			const savedUnitIndex: number = storedPos?.unitIndex ?? incomingUnit ?? 0;
+			const savedSpread: number = storedPos?.spread ?? incomingSpread ?? 0;
 
 			// Tab-restore: this view already has the same epub loaded.
 			// Just seek to the saved position — no reload, no new-tab redirect.
@@ -1049,6 +1162,12 @@ export class ReaderView extends ItemView {
 		this.registerDomEvent(nextPage, "click", () => void this.advance());
 
 		const tocPanel = root.createEl("div", { cls: "tmr-toc" });
+		// Closed slide-in panels are translated off-canvas but stay rendered
+		// and focusable; inert keeps Tab out of them. Without it, focusing a
+		// hidden control makes the browser scroll .view-content sideways to
+		// reveal it, shoving the whole reader (overflow:hidden doesn't stop
+		// focus-scroll). Synced in toggleToc / toggleHighlightsPanel.
+		tocPanel.inert = true;
 		const tocHeader = tocPanel.createEl("div", { cls: "tmr-toc-header" });
 		this.tocTitleEl = tocHeader.createEl("span", { cls: "tmr-toc-title", text: "Contents" });
 		const tocClose = tocHeader.createEl("button", { cls: "tmr-pane-hdr-btn tmr-toc-close" });
@@ -1067,8 +1186,83 @@ export class ReaderView extends ItemView {
 			await this.plugin.saveSettings();
 		});
 
+		this.makePaneResizable(tocPanel, "right");
+
 		const tocBackdrop = root.createEl("div", { cls: "tmr-toc-backdrop" });
 		this.registerDomEvent(tocBackdrop, "click", () => this.toggleToc());
+
+		// Book search — one morphing element (the library-search pattern): a
+		// ghost icon button beside the Highlights toggle that expands leftward
+		// into the field on open (right-anchored, so width growth IS leftward
+		// expansion). Results drop into a separate card beneath it. See the
+		// In-Book Search spec + BookSearchButton components.
+		const searchBar = root.createEl("div", { cls: "tmr-search-bar" });
+		searchBar.ariaLabel = "Search in book";
+		const searchIcon = searchBar.createEl("span", { cls: "tmr-search-bar-icon" });
+		setIcon(searchIcon, "tmr-icon-book-search");
+		this.searchInputEl = searchBar.createEl("input", {
+			cls: "tmr-book-search-input",
+			attr: { type: "text", placeholder: "Reveal a passage…", spellcheck: "false" },
+		});
+		// Collapsed to width 0 but still in the DOM — keep it out of the tab
+		// order until the bar opens (same focus-leak family as the blur() on
+		// close). Synced in toggleBookSearch.
+		this.searchInputEl.tabIndex = -1;
+		const searchClear = searchBar.createEl("button", { cls: "tmr-book-search-clear" });
+		setIcon(searchClear, "x");
+		searchClear.ariaLabel = "Clear search";
+		this.searchResultsEl = root.createEl("div", { cls: "tmr-book-search tmr-hidden" });
+		this.searchBarEl = searchBar;
+		this.searchOpen = false;
+		this.searchQuery = "";
+		this.searchHits = [];
+		this.registerDomEvent(searchBar, "click", () => {
+			if (!this.searchOpen) this.toggleBookSearch(true);
+		});
+		this.registerDomEvent(this.searchInputEl, "input", () => {
+			const value = this.searchInputEl?.value ?? "";
+			if (this.searchDebounce !== null) window.clearTimeout(this.searchDebounce);
+			this.searchDebounce = window.setTimeout(() => {
+				this.searchDebounce = null;
+				this.searchQuery = value;
+				void this.renderSearchResults();
+			}, 200);
+		});
+		// Result-list keyboard navigation, combobox-style: focus never leaves
+		// the field; ↑/↓ move a virtual active row, Enter jumps to it (first
+		// result when nothing is focused yet). preventDefault keeps the arrows
+		// from moving the text caret.
+		this.registerDomEvent(this.searchInputEl, "keydown", (e: KeyboardEvent) => {
+			if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+				e.preventDefault();
+				this.moveSearchActive(e.key === "ArrowDown" ? 1 : -1);
+			} else if (e.key === "Enter") {
+				e.preventDefault();
+				const hit = this.searchHits[Math.max(0, this.searchActiveIdx)];
+				if (hit) void this.jumpToSearchHit(hit);
+			}
+		});
+		// The × clears a non-empty query; on an empty one it collapses the bar
+		// (the mock's × is the expanded bar's only affordance).
+		this.registerDomEvent(searchClear, "click", (e: MouseEvent) => {
+			e.stopPropagation();
+			if (this.searchInputEl?.value) {
+				this.searchInputEl.value = "";
+				this.searchQuery = "";
+				void this.renderSearchResults();
+				this.searchInputEl.focus();
+			} else {
+				this.toggleBookSearch(false);
+			}
+		});
+		// Delegated row clicks — rows re-render per keystroke, so a single
+		// listener on the host instead of one per row.
+		this.registerDomEvent(this.searchResultsEl, "click", (e: MouseEvent) => {
+			const row = (e.target as Element).closest<HTMLElement>(".tmr-book-search-row");
+			const idx = row ? parseInt(row.dataset.hitIdx ?? "", 10) : NaN;
+			const hit = Number.isNaN(idx) ? undefined : this.searchHits[idx];
+			if (hit) void this.jumpToSearchHit(hit);
+		});
 
 		// Highlights navigation panel — mirrors the TOC shell but slides in from
 		// the right. Populated from `savedHighlights` on every open, grouped by
@@ -1080,6 +1274,7 @@ export class ReaderView extends ItemView {
 		this.registerDomEvent(hlToggle, "click", () => this.toggleHighlightsPanel());
 
 		const hlPanel = root.createEl("div", { cls: "tmr-highlights-panel" });
+		hlPanel.inert = true; // Tab-proof while closed — see tocPanel above.
 		const hlHeader = hlPanel.createEl("div", { cls: "tmr-highlights-header" });
 		hlHeader.createEl("span", { cls: "tmr-highlights-title", text: "Highlights" });
 		// Note button — opens the companion annotation doc. Lives in the header
@@ -1126,6 +1321,7 @@ export class ReaderView extends ItemView {
 		// the tabs and header above stay put.
 		this.convChatEl = convListEl.createEl("div", { cls: "tmr-conv-screen" });
 		this.highlightsPanelEl = hlPanel;
+		this.makePaneResizable(hlPanel, "left");
 		this.applyAiFeaturesState();
 
 		const hlBackdrop = root.createEl("div", { cls: "tmr-highlights-backdrop" });
@@ -1292,14 +1488,62 @@ export class ReaderView extends ItemView {
 		this.applyThemeClasses();
 	}
 
+	// Drag-to-resize for the slide-in panes. No painted handle — an invisible
+	// strip along the pane's inner border flips the cursor to ew-resize (OS
+	// window idiom). Width is written as an inline --tmr-pane-w on the panel,
+	// so it's session-scoped for free: the shell DOM (and the var with it) is
+	// rebuilt on every book load. `edge` is where the strip sits on the panel.
+	private makePaneResizable(panel: HTMLElement, edge: "left" | "right"): void {
+		const grip = panel.createEl("div", { cls: `tmr-pane-resize-edge tmr-pane-resize-edge-${edge}` });
+		this.registerDomEvent(grip, "pointerdown", (e: PointerEvent) => {
+			if (e.button !== 0) return;
+			e.preventDefault();
+			const startX = e.clientX;
+			const startW = panel.getBoundingClientRect().width;
+			// Mirror the CSS clamp (max-width: calc(100% - 60px)) so the stored
+			// width never exceeds what the panel can actually render.
+			const maxW = this.contentEl.clientWidth - 60;
+			grip.setPointerCapture(e.pointerId);
+			document.body.addClass("tmr-pane-resizing");
+			// Width writes are rAF-throttled: pointermove outpaces the frame
+			// rate, and unthrottled style writes smear repaints in Electron.
+			let pendingX: number | null = null;
+			let raf = 0;
+			const onMove = (ev: PointerEvent) => {
+				pendingX = ev.clientX;
+				if (raf) return;
+				raf = requestAnimationFrame(() => {
+					raf = 0;
+					if (pendingX === null) return;
+					const delta = edge === "left" ? startX - pendingX : pendingX - startX;
+					// Floor = the CSS default width, so dragging to the smallest
+					// size doubles as reset-to-default.
+					const w = Math.max(340, Math.min(maxW, startW + delta));
+					panel.style.setProperty("--tmr-pane-w", `${w}px`);
+				});
+			};
+			const onUp = () => {
+				if (raf) cancelAnimationFrame(raf);
+				grip.removeEventListener("pointermove", onMove);
+				grip.removeEventListener("pointerup", onUp);
+				grip.removeEventListener("pointercancel", onUp);
+				document.body.removeClass("tmr-pane-resizing");
+			};
+			grip.addEventListener("pointermove", onMove);
+			grip.addEventListener("pointerup", onUp);
+			grip.addEventListener("pointercancel", onUp);
+		});
+	}
+
 	toggleToc(): void {
 		this.tocOpen = !this.tocOpen;
-		const toc = this.contentEl.querySelector(".tmr-toc");
+		const toc = this.contentEl.querySelector<HTMLElement>(".tmr-toc");
 		const backdrop = this.contentEl.querySelector(".tmr-toc-backdrop");
 		const toggle = this.contentEl.querySelector(".tmr-toc-toggle");
 		// The help button shares the ToC toggle's corner; hide it the same way
 		// while the ToC pane is open so it doesn't float over the panel.
 		const helpToggle = this.contentEl.querySelector(".tmr-help-toggle");
+		if (toc) toc.inert = !this.tocOpen;
 		if (this.tocOpen) {
 			toc?.addClass("tmr-toc-open");
 			backdrop?.addClass("tmr-toc-backdrop-visible");
@@ -1344,6 +1588,7 @@ export class ReaderView extends ItemView {
 		const panel = this.highlightsPanelEl;
 		const backdrop = this.contentEl.querySelector(".tmr-highlights-backdrop");
 		const toggle = this.contentEl.querySelector(".tmr-highlights-toggle");
+		if (panel) panel.inert = !this.highlightsOpen;
 		if (this.highlightsOpen) {
 			this.applyPaneTabUI();
 			this.renderActivePane();
@@ -1351,16 +1596,299 @@ export class ReaderView extends ItemView {
 			panel?.addClass("tmr-highlights-open");
 			backdrop?.addClass("tmr-highlights-backdrop-visible");
 			toggle?.addClass("tmr-highlights-toggle-hidden");
+			// The panel slides over the search corner — hide the bar the same
+			// way and fold the results card away with it.
+			this.searchBarEl?.addClass("tmr-search-bar-hidden");
+			if (this.searchOpen) this.toggleBookSearch(false);
 		} else {
 			panel?.removeClass("tmr-highlights-open");
 			backdrop?.removeClass("tmr-highlights-backdrop-visible");
 			toggle?.removeClass("tmr-highlights-toggle-hidden");
+			this.searchBarEl?.removeClass("tmr-search-bar-hidden");
 			// Clear active-highlight styling when the panel is dismissed.
 			if (this.activeConversationIdx !== -1) {
 				this.activeConversationIdx = -1;
 				this.renderSavedHighlights();
 			}
 		}
+	}
+
+	// ─── Book search (Phase 5 — see In-Book Search feature spec) ─────────────
+
+	toggleBookSearch(force?: boolean): void {
+		const open = force ?? !this.searchOpen;
+		if (open === this.searchOpen) return;
+		this.searchOpen = open;
+		this.searchBarEl?.toggleClass("tmr-search-bar-open", open);
+		this.searchResultsEl?.toggleClass("tmr-hidden", !open);
+		if (this.searchInputEl) this.searchInputEl.tabIndex = open ? 0 : -1;
+		if (open) {
+			// One transient layer at a time: opening search over a live gloss
+			// bar/input dismisses it (mirrors the Escape ordering).
+			if (this.isGlossActive()) this.dismissGloss();
+			// Kick the lazy index and repaint (instant on later opens — the
+			// promise is cached per book; last query persists for the session).
+			void this.renderSearchResults();
+			this.searchInputEl?.focus();
+		} else {
+			// A collapsed bar must not keep keyboard focus: the typing guard
+			// would swallow the reader hotkeys (s to reopen, t/h, arrows) while
+			// every keystroke kept typing into the hidden field.
+			this.searchInputEl?.blur();
+		}
+	}
+
+	private getSearchIndex(): Promise<BookSearchEntry[]> {
+		this.searchIndexPromise ??= this.buildSearchIndex();
+		return this.searchIndexPromise;
+	}
+
+	/** Build the full-book text index from the raw spine XHTML — the same
+	 *  source renderSpineRange reads, parsed with DOMParser (nothing rendered
+	 *  or mounted). The walk mirrors prepareUnit (same block selector, same
+	 *  isRegisterableBlock filter, paraCount reset per spine item) so the
+	 *  predicted paraIds line up with the mounted DOM. */
+	private async buildSearchIndex(): Promise<BookSearchEntry[]> {
+		const book = this.book;
+		if (!book) return [];
+		const index: BookSearchEntry[] = [];
+		const parser = new DOMParser();
+		for (let sectionIdx = 0; sectionIdx < this.sections.length; sectionIdx++) {
+			const section = this.sections[sectionIdx];
+			for (let spine = section.startSpine; spine <= section.endSpine; spine++) {
+				const item = book.spine[spine];
+				if (!item) continue;
+				let raw: string;
+				try {
+					const filePath = book.opfDir + item.href;
+					if (book.zip) raw = await book.zip.file(filePath)!.async("string");
+					else if (book.dirPath) raw = await fs.promises.readFile(nodePath.join(book.dirPath, filePath), "utf8");
+					else continue;
+				} catch { continue; }
+				const body = parser.parseFromString(raw, "text/html").querySelector("body");
+				if (!body) continue;
+				// Mirror renderSpineRange's strip — style/script text must not
+				// leak into textContent or offsets drift from the rendered DOM.
+				body.querySelectorAll("style, script").forEach((el) => el.remove());
+				let paraCount = 0;
+				for (const el of Array.from(body.querySelectorAll<HTMLElement>(REGISTERABLE_BLOCK_SELECTOR))) {
+					if (!isRegisterableBlock(el)) continue;
+					const text = el.textContent ?? "";
+					index.push({
+						paraId: `s${spine}-p${paraCount}`,
+						sectionIdx,
+						text,
+						textLower: text.toLocaleLowerCase(),
+					});
+					paraCount++;
+				}
+			}
+		}
+		return index;
+	}
+
+	private runBookSearch(index: BookSearchEntry[], query: string): BookSearchHit[] {
+		const q = query.trim().toLocaleLowerCase();
+		if (q.length < SEARCH_MIN_CHARS) return [];
+		const hits: BookSearchHit[] = [];
+		for (const entry of index) {
+			let from = 0;
+			let at: number;
+			while ((at = entry.textLower.indexOf(q, from)) !== -1) {
+				hits.push({ entry, start: at, end: at + q.length });
+				from = at + q.length;
+				if (hits.length >= SEARCH_MAX_HITS) return hits;
+			}
+		}
+		return hits;
+	}
+
+	private async renderSearchResults(): Promise<void> {
+		const host = this.searchResultsEl;
+		if (!host) return;
+		const query = this.searchQuery;
+		const index = await this.getSearchIndex();
+		// Stale-render guard: query changed or shell rebuilt while indexing.
+		if (this.searchResultsEl !== host || this.searchQuery !== query) return;
+		host.empty();
+		this.searchHits = [];
+		this.searchActiveIdx = -1;
+		if (query.trim().length < SEARCH_MIN_CHARS) return;
+		const hits = this.runBookSearch(index, query);
+		this.searchHits = hits;
+		if (hits.length === 0) {
+			host.createEl("div", { cls: "tmr-book-search-empty", text: "No matches" });
+			return;
+		}
+		const hlRanges = this.savedHighlights.length > 0
+			? this.buildSearchHighlightRanges(index)
+			: null;
+		hits.slice(0, SEARCH_RENDER_CAP).forEach((hit, i) => {
+			const row = host.createEl("div", { cls: "tmr-book-search-row" });
+			row.dataset.hitIdx = String(i);
+			// Hits inside a saved highlight re-add the annotation card's accent
+			// bar + mode icon slots; plain hits stay bare.
+			const overlap = hlRanges?.get(hit.entry.paraId)
+				?.find((r) => hit.start < r.end && hit.end > r.start);
+			if (overlap) {
+				row.dataset.glossMode = overlap.mode;
+				const iconEl = row.createEl("span", { cls: "tmr-book-search-row-icon" });
+				const modeMeta = GLOSS_MODES.find((m) => m.id === overlap.mode);
+				if (modeMeta) setIcon(iconEl, modeMeta.icon);
+			}
+			const rowBody = row.createEl("div", { cls: "tmr-book-search-row-body" });
+			rowBody.createEl("div", {
+				cls: "tmr-book-search-row-section",
+				text: this.sections[hit.entry.sectionIdx]?.label ?? "—",
+			});
+			const snippet = rowBody.createEl("div", { cls: "tmr-book-search-row-snippet" });
+			const parts = this.searchSnippet(hit);
+			snippet.appendText(parts.before);
+			snippet.createEl("strong", { text: parts.match });
+			snippet.appendText(parts.after);
+		});
+		if (hits.length > SEARCH_RENDER_CAP) {
+			const capped = hits.length >= SEARCH_MAX_HITS;
+			host.createEl("div", {
+				cls: "tmr-book-search-more",
+				text: `${hits.length - SEARCH_RENDER_CAP}${capped ? "+" : ""} more — refine your search`,
+			});
+		}
+	}
+
+	/** Move the keyboard-focused result row by `delta`, clamped to the rendered
+	 *  rows (searchHits can exceed SEARCH_RENDER_CAP; navigation stays within
+	 *  what's on screen). Row order matches searchHits order, so the index is
+	 *  valid for both styling and the Enter-to-jump lookup. */
+	private moveSearchActive(delta: number): void {
+		const rows = this.searchResultsEl?.querySelectorAll<HTMLElement>(".tmr-book-search-row");
+		if (!rows || rows.length === 0) return;
+		const next = Math.max(0, Math.min(rows.length - 1, this.searchActiveIdx + delta));
+		if (next === this.searchActiveIdx) return;
+		this.searchActiveIdx = next;
+		rows.forEach((row, i) => row.toggleClass("tmr-book-search-row-active", i === next));
+		rows[next].scrollIntoView({ block: "nearest" });
+	}
+
+	/** ±~50 chars of context around the match, snapped to word boundaries. */
+	private searchSnippet(hit: BookSearchHit): { before: string; match: string; after: string } {
+		const text = hit.entry.text;
+		let s = Math.max(0, hit.start - 50);
+		let e = Math.min(text.length, hit.end + 50);
+		if (s > 0) {
+			const sp = text.indexOf(" ", s);
+			if (sp !== -1 && sp < hit.start) s = sp + 1;
+		}
+		if (e < text.length) {
+			const sp = text.lastIndexOf(" ", e);
+			if (sp > hit.end) e = sp;
+		}
+		return {
+			before: (s > 0 ? "…" : "") + text.slice(s, hit.start),
+			match: text.slice(hit.start, hit.end),
+			after: text.slice(hit.end, e) + (e < text.length ? "…" : ""),
+		};
+	}
+
+	/** Char-range highlight coverage per index paragraph, resolved against the
+	 *  live savedHighlights[] at render time (they can change mid-session).
+	 *  Start paragraphs resolve the way the overlay painter does: paraId hint
+	 *  verified against the stored prefix, full scan as fallback; end paragraphs
+	 *  are taken from the hint verbatim (same as renderSavedHighlights).
+	 *  Cross-paragraph highlights fully cover the paragraphs between their
+	 *  boundaries. */
+	private buildSearchHighlightRanges(
+		index: BookSearchEntry[],
+	): Map<string, { mode: string; start: number; end: number }[]> {
+		const norm = (s: string) => s.replace(/\s+/g, " ").trim();
+		const byId = new Map(index.map((e) => [e.paraId, e] as const));
+		const ranges = new Map<string, { mode: string; start: number; end: number }[]>();
+		const add = (paraId: string, mode: string, start: number, end: number) => {
+			let list = ranges.get(paraId);
+			if (!list) ranges.set(paraId, (list = []));
+			list.push({ mode, start, end });
+		};
+		for (const saved of this.savedHighlights) {
+			let startEntry = byId.get(saved.paraIdHint) ?? null;
+			const needle = norm(saved.prefix);
+			if (needle && (!startEntry || !norm(startEntry.text).startsWith(needle))) {
+				startEntry = index.find((e) => norm(e.text).startsWith(needle)) ?? startEntry;
+			}
+			if (!startEntry) continue;
+			const endId = saved.endParaIdHint;
+			if (!endId || endId === startEntry.paraId) {
+				add(startEntry.paraId, saved.mode, saved.startChar, saved.endChar);
+				continue;
+			}
+			add(startEntry.paraId, saved.mode, saved.startChar, startEntry.text.length);
+			add(endId, saved.mode, 0, saved.endChar);
+			const s = /^s(\d+)-p(\d+)$/.exec(startEntry.paraId);
+			const e = /^s(\d+)-p(\d+)$/.exec(endId);
+			if (s && e && s[1] === e[1]) {
+				for (let p = parseInt(s[2], 10) + 1; p < parseInt(e[2], 10); p++) {
+					const mid = byId.get(`s${s[1]}-p${p}`);
+					if (mid) add(mid.paraId, saved.mode, 0, mid.text.length);
+				}
+			}
+		}
+		return ranges;
+	}
+
+	/** Mirror of jumpToHighlight for a search hit — mount the section's unit,
+	 *  resolve the paragraph (prefix match with the predicted paraId as hint),
+	 *  scroll it into the visible spread. The popover stays open by design. */
+	private async jumpToSearchHit(hit: BookSearchHit): Promise<void> {
+		const match = /^s(\d+)-p(\d+)$/.exec(hit.entry.paraId);
+		if (!match) return;
+		const spineIdx = parseInt(match[1], 10);
+		const sectionIdx = this.sectionIndexBySpine[spineIdx] ?? -1;
+		const section = this.sections[sectionIdx];
+		if (!section) return;
+		this.savePosition();
+		const targetUnitIdx = this.unitIndexBySection.get(section.id) ?? 0;
+		const spreadOffset = this.getSpreadOffsetInUnitBySectionId(this.units[targetUnitIdx], section.id);
+		await this.mountCurrentUnit(targetUnitIdx, spreadOffset);
+		const prefix = hit.entry.text.slice(0, 48);
+		const resolvedId = this.offsetMap.findParaIdByPrefix(prefix, hit.entry.paraId) ?? hit.entry.paraId;
+		const entry = this.offsetMap.get(resolvedId);
+		if (entry?.element) this.scrollToTarget(entry.element);
+		// Flash on the next frame so the rects measure against settled layout
+		// (same reason renderSavedHighlights paints in rAF after a mount).
+		requestAnimationFrame(() => this.flashSearchMatch(resolvedId, hit));
+		// Keep the walk-every-mention flow: focus returns to the field so the
+		// next keystroke refines the query instead of firing a reader hotkey.
+		this.searchInputEl?.focus();
+	}
+
+	/** Temporary overlay over the jumped-to match (spec: match flash) — without
+	 *  it, landing on a dense spread means visually grepping the page. Rides
+	 *  the selection-overlay pipeline: char offsets → CursorRange → client
+	 *  rects inside .tmr-content. CSS fades the rects; the overlay node is
+	 *  removed after the animation (or, under reduced motion, the same timeout
+	 *  ends a static flash). */
+	private flashSearchMatch(paraId: string, hit: BookSearchHit): void {
+		if (!this.contentNode) return;
+		this.contentNode.querySelectorAll(".tmr-search-flash-overlay").forEach((n) => n.remove());
+		const cursorRange = this.offsetMap.charRangeToCursorRange(paraId, hit.start, hit.end);
+		if (!cursorRange) return;
+		const overlay = document.createElement("div");
+		overlay.className = "tmr-search-flash-overlay";
+		const contentRect = this.contentNode.getBoundingClientRect();
+		for (const range of this.offsetMap.cursorsToRanges(cursorRange)) {
+			for (const r of Array.from(range.getClientRects())) {
+				if (r.width === 0 || r.height === 0) continue;
+				const rectEl = document.createElement("div");
+				rectEl.className = "tmr-search-flash-rect";
+				rectEl.style.left = `${r.left - contentRect.left}px`;
+				rectEl.style.top = `${r.top - contentRect.top}px`;
+				rectEl.style.width = `${r.width}px`;
+				rectEl.style.height = `${r.height}px`;
+				overlay.appendChild(rectEl);
+			}
+		}
+		if (overlay.childElementCount === 0) return;
+		this.contentNode.appendChild(overlay);
+		window.setTimeout(() => overlay.remove(), 4600);
 	}
 
 	/** Switch the active right-rail tab. Persists to settings so re-opening
@@ -2639,6 +3167,8 @@ export class ReaderView extends ItemView {
 		this.currentSpread = 0;
 		this.currentUnitIndex = 0;
 		this.totalSpreads = 1;
+		this.hasMountedUnit = false;
+		this.posAnchor = null;
 		this.previousPosition = null;
 		this.measurementBucketKey = "";
 		this.mountedUnitKeys.prev = "";
@@ -2656,6 +3186,11 @@ export class ReaderView extends ItemView {
 		this.linkPreviewPending.clear();
 		this.hoveredLinkPreviewKey = null;
 		this.paneTab = "annotations";
+		// Book search: index and query are per-book; the popover DOM itself is
+		// rebuilt by renderShell right after this.
+		this.searchIndexPromise = null;
+		this.searchQuery = "";
+		this.searchHits = [];
 	}
 
 	private async loadEpub(parse: () => Promise<EpubBook>, initialPos?: { unitIndex: number; spread: number }): Promise<void> {
@@ -2680,6 +3215,10 @@ export class ReaderView extends ItemView {
 			// of interleaving with it (Case File 08's load-time variant).
 			await this.runLayoutPass(async () => {
 				await this.waitForStableGeometry();
+				// The pass can resume long after it started (rAF suspends while
+				// the window is occluded) — the view may have been torn down in
+				// the meantime. Building against a dead DOM yields NaN geometry.
+				if (!this.spreadEl?.isConnected) return;
 				this.layoutMode = this.resolveLayoutMode();
 				this.syncSpreadLayoutMode(this.spreadEl);
 				// Capture the bucket from the same geometry the measurements are
@@ -2690,6 +3229,7 @@ export class ReaderView extends ItemView {
 				await this.buildRenderUnits();
 				await this.loadSavedHighlights();
 				this.restorePaneTab();
+				if (!this.spreadEl?.isConnected) return; // torn down mid-build
 				const startUnit = Math.min(initialPos?.unitIndex ?? 0, Math.max(0, this.units.length - 1));
 				const startSpread = initialPos?.spread ?? 0;
 				await this.mountCurrentUnit(startUnit, startSpread);
@@ -2855,41 +3395,26 @@ export class ReaderView extends ItemView {
 		return Math.max(1, Math.ceil(content.scrollWidth / stride));
 	}
 
-	private getColumnCountForContent(content: HTMLElement, colWidth: number, gap: number): number {
-		// Compare against the height the columns are *actually* constrained to —
-		// the `.tmr-content` box, which is `height:100%` of the spread's content
-		// area. The spread's own clientHeight (the old basis) is taller by its
-		// 1.5rem/1rem vertical padding, so a section whose single-column height
-		// lands in that padding band was mis-counted as one column, then flagged
-		// `singlePage` and overflowed into a clipped, unreachable extra column at
-		// render time. Fall back to the padded parent only before first layout.
-		const columnHeight = content.clientHeight > 0
-			? content.clientHeight
-			: (content.parentElement?.clientHeight ?? 0);
-		if (columnHeight <= 0) return 1;
-
-		// Temporarily remove column layout and constrain to a single column
-		// width so we can measure the content's natural (single-column) height.
-		const savedColWidth = content.style.columnWidth;
-		const savedColGap = content.style.columnGap;
-		const savedWidth = content.style.width;
-		content.style.removeProperty("column-width");
-		content.style.removeProperty("column-gap");
-		content.setCssProps({ width: `${colWidth}px` });
-
-		const naturalHeight = content.scrollHeight;
-
-		// Restore column layout
-		content.style.columnWidth = savedColWidth;
-		content.style.columnGap = savedColGap;
-		content.style.width = savedWidth;
-
-		if (naturalHeight <= columnHeight) return 1;
-
-		// For multi-column content, count via scrollWidth
-		const stride = colWidth + gap;
-		if (stride <= 0) return 1;
-		return Math.max(1, Math.ceil(content.scrollWidth / stride));
+	private getColumnCountForContent(content: HTMLElement, colWidth: number): number {
+		// Ink-extent probe, read from the REAL multicol layout. The old probe
+		// compared the content's natural height (reflowed as one flat 700px
+		// block) against the column height — but fragmentation makes real
+		// column consumption exceed flat height: a `break-inside: avoid-column`
+		// block that would straddle the column boundary is pushed whole into
+		// column 2 even though the flat total fits column 1. Marginal sections
+		// (Myth of Sisyphus ToC) mis-classified as one column, pairing trusted
+		// it, and the pair's partner rendered in a clipped, unreachable third
+		// column. `.tmr-content` fills sequentially (`column-fill: auto`), so
+		// ink past the first column's right edge means content truly fragments
+		// there — no height heuristic, no extra reflow.
+		const range = document.createRange();
+		range.selectNodeContents(content);
+		const ink = range.getBoundingClientRect();
+		if (ink.width <= 0) return 1;
+		const left = content.getBoundingClientRect().left;
+		// +1px sub-pixel slack (fractional zoom); the 48px column gap keeps the
+		// two outcomes unambiguous.
+		return ink.right - left <= colWidth + 1 ? 1 : 2;
 	}
 
 	private async measureSection(sectionIdx: number): Promise<{ spreads: number; columns: number; fromCache: boolean }> {
@@ -2914,9 +3439,8 @@ export class ReaderView extends ItemView {
 		const { innerWidth, colWidth, gap } = this.applyPagination(this.measurementSpreadEl, this.measurementContentEl);
 		const spreads = this.getSpreadCountForContent(this.measurementContentEl, innerWidth, gap);
 		// Column count only gates pairing/singlePage, which test `=== 1`; a
-		// multi-spread section can't be single-column, so skip its natural-height
-		// probe (the probe forces a second full reflow of the section's DOM).
-		const columns = spreads > 1 ? 2 : this.getColumnCountForContent(this.measurementContentEl, colWidth, gap);
+		// multi-spread section can't be single-column, so skip its ink probe.
+		const columns = spreads > 1 ? 2 : this.getColumnCountForContent(this.measurementContentEl, colWidth);
 		// Cache only if geometry held still across the measurement. The cache
 		// persists across resizes now, so a value measured mid-animation must
 		// not survive keyed against a bucket it doesn't represent.
@@ -3058,6 +3582,7 @@ export class ReaderView extends ItemView {
 		await this.mountAdjacentUnits();
 		this.updateProgress();
 		this.updateTocActive();
+		this.hasMountedUnit = true;
 		this.schedulePositionSave();
 	}
 
@@ -3204,9 +3729,29 @@ export class ReaderView extends ItemView {
 		const clamped = Math.max(0, Math.min(n, unit.spreadCount - 1));
 		const stride = this.getNavigationStride();
 		this.currentSpread = clamped;
-		this.contentNode.style.transform = `translateX(-${clamped * stride}px)`;
+		// Far jumps snap instead of sliding. Animating thousands of px in
+		// 250ms reads as a blur at best — and on translucent themes the
+		// compositor leaves every intermediate frame as a trail over the
+		// transparent backdrop (the conversation-jump "smear"). Only
+		// adjacent page turns keep the transition.
+		const targetX = clamped * stride;
+		const liveTransform = getComputedStyle(this.contentNode).transform;
+		const liveX = liveTransform === "none" ? 0 : -new DOMMatrixReadOnly(liveTransform).m41;
+		if (Math.abs(liveX - targetX) > stride * 1.5) {
+			this.contentNode.style.transition = "none";
+			this.contentNode.style.transform = `translateX(-${targetX}px)`;
+			void this.contentNode.offsetWidth; // commit without transition
+			this.contentNode.style.removeProperty("transition");
+		} else {
+			this.contentNode.style.transform = `translateX(-${targetX}px)`;
+		}
 		const sectionIdx = this.getCurrentSectionIndex();
 		this.spineIndex = this.sections[sectionIdx]?.startSpine ?? 0;
+		this.posAnchor = {
+			sectionIdx,
+			offset: clamped - this.getSpreadOffsetWithinUnit(sectionIdx),
+			count: Math.max(1, this.sectionSpreadCounts[sectionIdx] ?? 1),
+		};
 		this.updateProgress();
 		this.updateTocActive();
 	}
@@ -3298,9 +3843,12 @@ export class ReaderView extends ItemView {
 		this.layoutMode = this.resolveLayoutMode();
 		this.syncSpreadLayoutMode(this.spreadEl);
 
-		const oldSectionIdx = this.getCurrentSectionIndex();
-		const oldSectionSpreadOffset = this.currentSpread - this.getSpreadOffsetWithinUnit(oldSectionIdx);
-		const oldSectionCount = Math.max(1, this.sectionSpreadCounts[oldSectionIdx] ?? 1);
+		// Re-seek from the durable anchor, not from live model state — this
+		// pass may run while another has this.units mid-rebuild (see posAnchor).
+		const anchor = this.posAnchor;
+		const oldSectionIdx = anchor?.sectionIdx ?? this.getCurrentSectionIndex();
+		const oldSectionSpreadOffset = anchor?.offset ?? (this.currentSpread - this.getSpreadOffsetWithinUnit(oldSectionIdx));
+		const oldSectionCount = anchor?.count ?? Math.max(1, this.sectionSpreadCounts[oldSectionIdx] ?? 1);
 		const bucket = this.getLayoutBucketKey();
 		if (bucket === this.measurementBucketKey) {
 			const unit = this.getCurrentUnit();
@@ -3334,7 +3882,9 @@ export class ReaderView extends ItemView {
 
 		const section = this.sections[oldSectionIdx];
 		if (!section) {
-			await this.mountCurrentUnit(0, 0);
+			// Can't resolve the section — clamp to the nearest valid unit
+			// instead of teleporting to the cover.
+			await this.mountCurrentUnit(Math.min(this.currentUnitIndex, this.units.length - 1), 0);
 			return;
 		}
 
@@ -4312,6 +4862,15 @@ export class ReaderView extends ItemView {
 	 *  Tracks `hoveredHighlightIdx` so we don't thrash the DOM as the pointer
 	 *  moves across rects belonging to the same highlight. */
 	private handleAnnotationHover(e: MouseEvent): void {
+		// Footnote refs, citations and links summon their own floater via the
+		// spread's mouseover handler — give that one priority instead of
+		// stacking the annotation preview beneath it (both fire when the ref
+		// sits inside a saved highlight's rect).
+		const hoverEl = e.target instanceof Element ? e.target : null;
+		if (hoverEl?.closest(".tmr-citation, a[href], [data-rid]")) {
+			if (this.hoveredHighlightIdx !== -1) this.hideAnnotationPreview();
+			return;
+		}
 		if (!this.contentNode || this.savedHighlights.length === 0) {
 			if (this.hoveredHighlightIdx !== -1) this.hideAnnotationPreview();
 			return;
@@ -4873,8 +5432,16 @@ export class ReaderView extends ItemView {
 	 *  entry so sibling fields (the right-rail `pane` choice) survive — the old
 	 *  bare-object assignment silently dropped them. Caches `pct` for the Library. */
 	private writeBookPosition(path: string): void {
+		// A pass racing a rebuild (or a view torn down mid-load) can hold
+		// transient garbage — never persist it.
+		if (!Number.isFinite(this.currentUnitIndex) || !Number.isFinite(this.currentSpread)) return;
 		const existing = this.plugin.settings.bookPositions[path] ?? {};
-		const pct = this.getProgressFraction();
+		// totalSpreads <= 1 means the pagination model isn't live yet (mid-load
+		// or mid-rebuild): getProgressFraction() would report 1 ("finished").
+		// Keep the previous pct; genuine one-spread books still get 1 on their
+		// first save because existing.pct starts undefined.
+		const livePct = this.getProgressFraction();
+		const pct = this.totalSpreads > 1 ? livePct : (existing.pct ?? livePct);
 		this.plugin.settings.bookPositions[path] = {
 			...existing,
 			unitIndex: this.currentUnitIndex,
@@ -4990,6 +5557,14 @@ export default class ThirdMindReader extends Plugin {
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
+		// Obsidian's bundled Lucide set predates `book-search` — register the
+		// glyph ourselves (Lucide 24-grid paths scaled onto Obsidian's 100-grid).
+		// setIcon stamps this id as a class on the svg, so it must not collide
+		// with any element class (`.tmr-book-search` is the results card).
+		addIcon(
+			"tmr-icon-book-search",
+			'<g transform="scale(4.1667)" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H19a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H6.5a1 1 0 0 1 0-5H20"/><circle cx="10.5" cy="8" r="2.5"/><path d="m13.3 10.8 1.7 1.7"/></g>',
+		);
 		this.injectFonts();
 		this.registerView(READER_VIEW_TYPE, (leaf) => new ReaderView(leaf, this));
 		this.registerView(LIBRARY_VIEW_TYPE, (leaf) => new LibraryView(leaf, this));
@@ -5145,6 +5720,20 @@ export default class ThirdMindReader extends Plugin {
 				const v = this.activeReaderView();
 				if (!v) return false;
 				if (!checking) void v.openCompanionDoc();
+				return true;
+			},
+		});
+		this.addCommand({
+			// No default hotkey: `s` toggles it from inside the reader (see the
+			// view-scoped keydown listener); the command exists so users can
+			// bind their own combo — including Cmd+F, which we deliberately
+			// don't claim by default (it would shadow Obsidian's own search).
+			id: "search-in-book",
+			name: "Search in book",
+			checkCallback: (checking) => {
+				const v = this.activeReaderView();
+				if (!v) return false;
+				if (!checking) v.toggleBookSearch();
 				return true;
 			},
 		});
