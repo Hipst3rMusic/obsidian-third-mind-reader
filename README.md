@@ -6,6 +6,9 @@ An opinionated EPUB reader for Obsidian. It renders EPUBs with a character-preci
 reading layout, a highlighting and annotation layer ("Gloss"), per-book companion
 notes that live in your vault, and an optional inline AI librarian.
 
+> **How this was built:** the code here is largely AI-generated and directed by me —
+> [see below](#how-this-was-built).
+
 ## Features
 
 - Two-page spread and single-page reading with chapter / table-of-contents navigation.
@@ -20,6 +23,32 @@ notes that live in your vault, and an optional inline AI librarian.
 2. In BRAT, run **"Add a beta plugin for testing"** and enter this repository's path.
 3. Enable **Third Mind Reader** in Community Plugins.
 4. Open any `.epub` file in your vault to start reading.
+
+## How this was built
+
+The code in this repository is largely AI-generated. I directed it; architecture,
+specs, review, and a lot of fine tuning. I wrote very little of the TypeScript by hand.
+
+What I authored is the part I'm actually qualified for: the product and system design,
+the interactions, the reading experience, and the design language underneath it.
+Most features here started as a written spec before any code existed for them, and the
+visual system predates the plugin entirely. While the implementation
+is generated, the decisions are mine; as is the responsibility
+
+I'm saying this up front because you should know it before installing something, and
+in the spirit of FOSS, you should know how it was made.
+
+What that means in practice:
+
+- **I'm still learning** I understand how the codebase fits together,
+  and that understanding has already fixed real bugs. I won't be as fast as a
+  maintainer who wrote every line, but I intend to have the code get better as I go along.
+- **Bug reports are genuinely useful.** I'd much rather hear about a problem than not.
+- **Fork it.** It's AGPL-3.0. If you'd do this better, please do.
+
+Building this plugin has given me a new appreciation for how professionals write software, and I'm
+still working out what doing this properly looks like.
+
 
 ## Requirements & disclosures
 
