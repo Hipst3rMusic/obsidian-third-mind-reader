@@ -1,7 +1,8 @@
 # Third Mind Reader
 
 > **Status:** beta (pre-1.0), distributed for testing via BRAT.
-> **How this was built:** the code here is largely AI-generated and directed by me —
+>
+>**How this was built:** the code here is largely AI-generated and directed by me —
 > [see below](#how-this-was-built).
 
 An opinionated EPUB reader for Obsidian. It renders EPUBs with a character-precise
