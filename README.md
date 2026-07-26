@@ -46,5 +46,7 @@ notes that live in your vault, and an optional inline AI librarian.
 
 ## Contributing
 
-Not looking for external contributions at the moment, but I encourage you to **fork and release your own version** if you'd like to really make the reader yours.
-Suggestions and bug reports are welcome via issues and the feedback button in the plugin settings.
+Not looking for external contributions at the moment, but I encourage you to **fork and make your own version** if you'd like to really make the reader yours.
+Suggestions and bug reports are welcome via issues and the feedback button in the plugin settings. If you're feeling really generous, you can buy me a cup of tea here: 
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/M7I223W2ID)
