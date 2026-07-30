@@ -6,8 +6,13 @@
    point at the user's Obsidian theme vars, so the plugin inherits whatever
    theme the user has set. The opt-in 3C mode (added in a later step) will
    override these same names under `.tmr-root.tmr-3c-mode` with DLS primitives,
-   making the swap a single class toggle. */
-.tmr-root {
+   making the swap a single class toggle.
+
+   `.tmr-pdf-pane-host` is Obsidian's own PDF `.view-content`, which the PDF
+   Gloss controller tags so the Highlights pane it mounts there inherits the
+   same token layer (and a positioning context — see below). */
+.tmr-root,
+.tmr-pdf-pane-host {
 	/* surfaces */
 	--background: var(--bg1);
 	--card: var(--bg2, var(--background-primary));
@@ -83,7 +88,9 @@
    attribute. */
 
 .tmr-root.tmr-3c-mode,
-.tmr-root.tmr-3c-mode[data-tmr-theme="dark"] {
+.tmr-root.tmr-3c-mode[data-tmr-theme="dark"],
+.tmr-pdf-pane-host.tmr-3c-mode,
+.tmr-pdf-pane-host.tmr-3c-mode[data-tmr-theme="dark"] {
 	/* surfaces */
 	--background: #1f1f1f;           /* Shadow-900 */
 	--card: #222222;                 /* Shadow-800 */
@@ -146,7 +153,8 @@
 	--font-mono: "Kode Mono", var(--font-monospace, monospace);
 }
 
-.tmr-root.tmr-3c-mode[data-tmr-theme="light"] {
+.tmr-root.tmr-3c-mode[data-tmr-theme="light"],
+.tmr-pdf-pane-host.tmr-3c-mode[data-tmr-theme="light"] {
 	/* surfaces */
 	--background: #f1eff0;           /* Empire-500 */
 	--card: #e1dee0;                 /* Empire-600 */
@@ -220,6 +228,12 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	/* Mirror Obsidian's Readable Line Length setting; fall back to 680px. */
 	--tmr-line-width: var(--file-line-width, 680px);
 	--tmr-gap: 48px;
+	/* Horizontal inset of the reading column(s) inside the pane. Shared by the
+	   spread and the footer so the progress bar spans exactly the page, not the
+	   pane. Percentages resolve against the using element's containing block —
+	   spread and footer are both full-width children of .tmr-root, so both
+	   compute the same value. Overridden below for single-page layout. */
+	--tmr-side-pad: max(4.5rem, calc((100% - var(--tmr-line-width) * 2 - var(--tmr-gap)) / 2));
 	display: flex;
 	flex-direction: column;
 	height: 100%;
@@ -252,15 +266,17 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	   Top gutter matches the corner-button height (2.0625rem) so the open
 	   search bar clears the first line's highlight box instead of floating
 	   over it. */
-	padding: 2.0625rem max(3rem, calc((100% - var(--tmr-line-width) * 2 - var(--tmr-gap)) / 2)) 1rem;
+	padding: 2.0625rem var(--tmr-side-pad) 1rem;
 	width: 100%;
 	box-sizing: border-box;
 }
 
 /* True narrow-layout mode: center one readable-width page in the viewport
-   rather than insisting on a two-page spread with implausibly skinny columns. */
-.tmr-spread.tmr-layout-single {
-	padding: 2.0625rem max(3rem, calc((100% - var(--tmr-line-width)) / 2)) 1rem;
+   rather than insisting on a two-page spread with implausibly skinny columns.
+   The class is mirrored onto .tmr-root (see syncSpreadLayoutMode) so the footer
+   tracks the same inset — the token is declared there, not here. */
+.tmr-root.tmr-layout-single {
+	--tmr-side-pad: max(4.5rem, calc((100% - var(--tmr-line-width)) / 2));
 }
 
 /* Content fills the spread height exactly, then overflows RIGHT into more columns.
@@ -277,6 +293,13 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	user-select: text;
 	-webkit-user-select: text;
 	cursor: text;
+}
+
+/* Far jumps snap instead of sliding — see `goToSpread`. Toggled around the
+   transform write for exactly one reflow. Two classes beats `.tmr-content`'s
+   own transition on specificity, so no `!important` is needed. */
+.tmr-content.tmr-no-transition {
+	transition: none;
 }
 
 .tmr-spread.tmr-layout-single .tmr-content {
@@ -718,11 +741,15 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 
 /* Body-scoped elements are direct children of <body>, which inherits --color-*
    from Obsidian. Define base tokens here so theme colours are picked up.
-   (:root cannot see body-level custom properties — inheritance is downward only.) */
+   (:root cannot see body-level custom properties — inheritance is downward only.)
+   The PDF overlay is in the same boat for a different reason: it's painted
+   inside Obsidian's native PDF view, which is outside `.tmr-root` and so sees
+   none of the reader's tokens. */
 .tmr-gloss-bar,
 .tmr-gloss-input,
 .tmr-annotation-preview,
-.tmr-gloss-tooltip {
+.tmr-gloss-tooltip,
+.tmr-pdf-overlay {
 	--tmr-c-exclaim:      var(--color-red, #7d2e2e);
 	--tmr-c-exclaim-icon: var(--color-red, #af4d4d);
 	--tmr-c-explain:      var(--color-yellow, #ac9c5d);
@@ -738,7 +765,8 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 .tmr-gloss-bar.tmr-3c-mode,
 .tmr-gloss-input.tmr-3c-mode,
 .tmr-annotation-preview.tmr-3c-mode,
-.tmr-gloss-tooltip.tmr-3c-mode {
+.tmr-gloss-tooltip.tmr-3c-mode,
+.tmr-pdf-overlay.tmr-3c-mode {
 	--tmr-c-exclaim:      #7d2e2e;
 	--tmr-c-exclaim-icon: #af4d4d;
 	--tmr-c-explain:      #ac9c5d;
@@ -747,6 +775,26 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	--tmr-c-enquiry:      #8c8787;
 	--font-primary:  "Rosarivo", var(--font-interface, sans-serif);
 	--font-secondary: "Labrada", var(--font-text, serif);
+}
+
+/* ── PDF Gloss: Highlights pane inside the native viewer ──────────────────── */
+
+/* The pane's panel and backdrop are absolutely positioned; Obsidian's PDF
+   `.view-content` is static, so it has to become the containing block. No
+   offsets are set, so this is visually inert for the native viewer — and the
+   class comes off again when the controller unloads.
+   The off-screen `translateX(100%)` state would otherwise extend scrollWidth
+   and let the viewer scroll it into view (the same bug `.tmr-root` guards
+   against), so pin `overflow` too rather than trust the theme's. */
+.tmr-pdf-pane-host {
+	position: relative;
+	overflow: hidden;
+}
+
+/* Toolbar toggle: a native `clickable-icon` in the PDF toolbar's right strip,
+   so it reads as part of the viewer rather than a plugin graft. */
+.tmr-pdf-pane-toggle {
+	--icon-size: 1rem;
 }
 
 .tmr-gloss-tile {
@@ -808,6 +856,25 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 .tmr-gloss-bar.tmr-gloss-lite .tmr-gloss-sep:not(.tmr-gloss-sep-extend),
 .tmr-gloss-bar.tmr-gloss-lite .tmr-gloss-tile:not([data-gloss-mode="emphasise"]):not(.tmr-gloss-tile-extend) {
 	display: none;
+}
+
+/* A tile the host offers but can't fulfil yet — greyed and inert, with its own
+   tooltip explaining why (PDF Gloss Phase A does this to the AI tiles, the same
+   treatment Enquiry got before the Conversations pane existed). Distinct from
+   Lite mode, which removes those tiles from the bar entirely. The `!important`
+   beats the per-mode fill/colour rules above, which are themselves !important. */
+.tmr-gloss-tile-disabled,
+.tmr-gloss-bar.tmr-3c-mode .tmr-gloss-tile-disabled,
+.tmr-gloss-bar:not(.tmr-3c-mode) .tmr-gloss-tile-disabled {
+	background: transparent !important;
+	color: var(--text-faint, #6b6b6b) !important;
+	opacity: 0.4;
+	cursor: default;
+}
+.tmr-gloss-bar .tmr-gloss-tile-disabled:hover {
+	background: transparent !important;
+	filter: none;
+	transform: none;
 }
 
 /* Extend control is hidden by default and only surfaces when the selection
@@ -978,10 +1045,16 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 
 /* ── Footer / Progress bar ─────────────────────────────────────────────────── */
 
+/* Inset to the reading column so the bar reads as the page's own footer rule.
+   The page counters sit in the outer gutters (absolute, below) rather than in
+   flow, so the bar's ends land exactly on the column edges. */
 .tmr-footer {
 	flex-shrink: 0;
 	display: flex;
 	align-items: center;
+	position: relative;
+	padding: 0 var(--tmr-side-pad);
+	box-sizing: border-box;
 }
 
 .tmr-progress-bar {
@@ -994,15 +1067,29 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	user-select: none;
 }
 
+/* Marginal counters: parked in the gutters flanking the bar, held off the pane
+   edge and growing inward. The --tmr-side-pad floor (4.5rem) is sized to clear
+   the widest realistic count ("123 of 456" ≈ 60px + the 0.75rem inset), so a
+   long count never reaches the segments. */
 .tmr-global-page,
 .tmr-page-info {
 	font-family: var(--font-mono);
 	font-size: 10px;
 	color: var(--subtle-foreground);
-	padding: 0 0.75rem;
 	white-space: nowrap;
 	opacity: 0;
 	transition: opacity 200ms ease, color 150ms ease;
+	position: absolute;
+	top: 50%;
+	transform: translateY(-50%);
+}
+
+.tmr-page-info {
+	left: 0.75rem;
+}
+
+.tmr-global-page {
+	right: 0.75rem;
 }
 
 .tmr-root:hover .tmr-global-page,
@@ -1024,9 +1111,13 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	color: var(--tmr-c-examine);
 }
 
+/* `flex: 1 1 0` with a hairline floor: segments must always *fit* the column.
+   A 12px floor let section-rich books (45+ sections in a narrow pane) overflow
+   the footer — the counters got squashed to nothing and the dash run spilled
+   past the page into the pane edge. */
 .tmr-progress-segment {
-	flex: 1;
-	min-width: 12px;
+	flex: 1 1 0;
+	min-width: 2px;
 	height: 4px;
 	background: var(--border);
 	position: relative;

@@ -124,6 +124,51 @@ export async function readEpubMeta(data: ArrayBuffer): Promise<EpubMeta> {
 	return { title, author };
 }
 
+// ─── DRM detection ────────────────────────────────────────────────────────────
+
+/** Thrown when an epub's content documents are encrypted. Distinguished from a
+ *  generic parse failure so the reader can explain the limitation instead of
+ *  reporting a bug. */
+export class EpubDrmError extends Error {
+	constructor(public scheme: string) {
+		super(`This epub is protected by ${scheme} and can't be opened. Third Mind Reader only reads DRM-free epubs.`);
+		this.name = "EpubDrmError";
+	}
+}
+
+/** `encryption.xml` algorithms that are NOT DRM: both are font obfuscation
+ *  schemes, which plenty of DRM-free epubs (notably InDesign exports) carry.
+ *  Treating their presence as DRM would reject readable books. */
+const FONT_OBFUSCATION_ALGORITHMS = new Set([
+	"http://www.idpf.org/2008/embedding",  // IDPF/EPUB font obfuscation
+	"http://ns.adobe.com/pdf/enc#RC",      // Adobe font obfuscation
+]);
+
+/** Detect content encryption before parsing. Returns the scheme name, or null
+ *  when the book is readable. Deliberately does not treat `encryption.xml`
+ *  alone as proof of DRM — see FONT_OBFUSCATION_ALGORITHMS. */
+async function detectDrm(fs: EpubFS): Promise<string | null> {
+	// License files are unambiguous, and name the scheme precisely.
+	if (await fs.exists("META-INF/license.lcpl")) return "Readium LCP DRM";
+	if (await fs.exists("META-INF/rights.xml")) return "Adobe DRM";
+	if (!await fs.exists("META-INF/encryption.xml")) return null;
+
+	let xml: string;
+	try {
+		xml = await fs.readString("META-INF/encryption.xml");
+	} catch {
+		return null;  // unreadable manifest — let the normal parse path fail
+	}
+	// Namespace prefixes vary across producers (`EncryptionMethod`,
+	// `enc:EncryptionMethod`), so match on localName rather than tag name.
+	const doc = new DOMParser().parseFromString(xml, "application/xml");
+	const encrypted = Array.from(doc.getElementsByTagName("*"))
+		.filter((el) => el.localName === "EncryptionMethod")
+		.map((el) => el.getAttribute("Algorithm") ?? "")
+		.filter((algorithm) => algorithm && !FONT_OBFUSCATION_ALGORITHMS.has(algorithm));
+	return encrypted.length > 0 ? "DRM" : null;
+}
+
 // ─── Shared parse logic ───────────────────────────────────────────────────────
 
 interface EpubFS {
@@ -133,6 +178,12 @@ interface EpubFS {
 }
 
 async function parseWithFS(fs: EpubFS): Promise<EpubBook> {
+	// 0. Bail out on encrypted content before the parse produces a book of
+	// ciphertext-as-text pages (DOMParser in HTML mode never throws, so an
+	// LCP/ADEPT epub would otherwise "open" as garbage).
+	const drmScheme = await detectDrm(fs);
+	if (drmScheme) throw new EpubDrmError(drmScheme);
+
 	// 1. container.xml → OPF path
 	const containerXml = await fs.readString("META-INF/container.xml");
 	const opfPath = parseContainerXml(containerXml);

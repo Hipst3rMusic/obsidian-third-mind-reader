@@ -10,20 +10,17 @@ import {
 	type ViewState,
 	TFile,
 	TFolder,
-	MarkdownRenderer,
-	Menu,
 	setIcon,
 	addIcon,
-	setTooltip,
 	Notice,
 	SecretComponent,
 	TextAreaComponent,
 	TextComponent,
 	Modal,
-	SuggestModal,
 	Platform,
 	Scope,
 	apiVersion,
+	getLinkpath,
 } from "obsidian";
 import * as nodePath from "path";
 import * as fs from "fs";
@@ -37,13 +34,45 @@ import {
 	resolveEpubHref,
 	resolveRelativePath,
 	EpubBook,
+	EpubDrmError,
 	EpubTocItem,
 	type EpubLinkPreview,
 } from "./epub";
 import { OffsetMap, type CursorRange, isRegisterableBlock, REGISTERABLE_BLOCK_SELECTOR } from "./pretext-layer";
-import { chat, probeProvider, probeModelLoaded, type AiProvider, type ChatMessage, type ProviderKind, type LocalRuntime } from "./ai-client";
+import { probeProvider, type AiProvider, type ProviderKind, type LocalRuntime } from "./ai-client";
 import { LibraryView, LIBRARY_VIEW_TYPE } from "./library-view";
 import { type LibraryOverride, invalidateMetaCache, LIBRARY_ROOT, companionDocPath, sanitizeFileName } from "./library-scan";
+// Shared Gloss grammar — the annotation surface, saved-highlight model, and
+// companion-doc writers that the EPUB reader and the PDF controller both drive.
+import {
+	ANCHOR_PREFIX_LEN,
+	AnnotationPreview,
+	GLOSS_AI_MODES,
+	GLOSS_MODES,
+	GlossSurface,
+	appendCallout,
+	applyGlossTheme,
+	buildCallout,
+	calloutHeader,
+	ensureCompanionDoc,
+	hitTestHighlightRects,
+	isTextInputFocused,
+	parseSavedHighlights,
+	type SavedHighlight,
+} from "./gloss";
+// The right-rail Highlights pane (Annotations / Conversations / AI chat). Owns
+// its own DOM and the whole AI-exchange path; ReaderView is its first host.
+import {
+	DEFAULT_SYSTEM_PROMPTS,
+	HighlightsPane,
+	buildGlossSystemPrompt,
+	makePaneResizable,
+	pickModel,
+	type AiPromptMode,
+	type HighlightsPaneHost,
+	type PaneTab,
+} from "./highlights-pane";
+import { PdfGlossManager } from "./pdf-gloss";
 // Bundled 3C typefaces (OFL/Apache). Imported as base64 data URLs (see
 // esbuild.config.mjs `dataurl` loader) so they ship inside main.js and render
 // for BRAT testers, whose vaults never receive the loose fonts/ folder.
@@ -116,35 +145,6 @@ interface ThirdMindReaderSettings {
 	helpShown: boolean;
 }
 
-/** Gloss modes that issue an AI request. Emphasise is excluded — it never
- *  calls the model. */
-type AiPromptMode = "explain" | "examine" | "exclaim" | "enquiry";
-
-const DEFAULT_SYSTEM_PROMPTS: Record<AiPromptMode, string> = {
-	explain:
-		`You are a concise reading assistant for "{book}". `
-		+ `Answer the reader's question using your training knowledge only. `
-		+ `Be precise and brief, and reply in plain conversational prose — `
-		+ `no headings, tables, or diagrams.`,
-	examine:
-		`You are a thorough research assistant for "{book}". `
-		+ `Explore the reader's question in depth. Check the web and Cite sources with numbered `
-		+ `footnotes like [1], [2] and append each as "[^N]: Title — URL". `
-		+ `Write your findings as flowing conversational prose; the only structure `
-		+ `should be those footnotes — no headings, tables, or diagrams.`,
-	exclaim:
-		`You are an empathetic reading companion for "{book}". `
-		+ `The reader has had a reaction to the passage. Respond warmly and `
-		+ `connect it to themes, context, or broader ideas. `
-		+ `Talk like a person rather than a document: natural prose, `
-		+ `no headings, tables, or diagrams.`,
-	enquiry:
-		`You are a knowledgeable reading companion for "{book}". `
-		+ `Have a thoughtful, open-ended conversation about the reader's question. `
-		+ `Keep it substantive but conversational — natural prose, `
-		+ `no headings, tables, or diagrams.`,
-};
-
 const DEFAULT_SETTINGS: ThirdMindReaderSettings = {
 	tmrMode: "obsidian",
 	tmrTheme: "dark",
@@ -161,264 +161,11 @@ const DEFAULT_SETTINGS: ThirdMindReaderSettings = {
 	helpShown: false,
 };
 
-/** Gloss annotation modes. Per-mode button fill + icon fill colours are
- *  DLS primitive hex values (Oh Dear, Look, Learn, All Good, Shadow-500 /
- *  Look, Prince-900, Dawn-800, Empire-600, Empire-800W) — semantic and
- *  theme-independent. See Feature Docs/Gloss - Feature Spec.md. */
-const GLOSS_MODES = [
-	{ id: "emphasise", label: "Emphasise", icon: "highlighter" },
-	{ id: "exclaim",   label: "Exclaim",   icon: "circle-alert" },
-	{ id: "explain",   label: "Explain",   icon: "help-circle" },
-	{ id: "examine",   label: "Examine",   icon: "search" },
-	{ id: "enquiry",   label: "Enquiry",   icon: "message-circle-more" },
-] as const;
-
-/** Placeholder copy per gloss mode; exact phrasing from Feature Spec §Phase 2. */
-const GLOSS_PLACEHOLDERS: Record<string, string> = {
-	emphasise: "your thought...",
-	exclaim:   "what just happened...",
-	explain:   "what's unclear...",
-	examine:   "what do you want to explore...",
-	enquiry:   "your question...",
-};
-
-/** Modes that get a `<!-- ai response pending -->` slot at submit time and
- *  that auto-fire an AI call immediately after the callout is written.
- *  Emphasise is never AI-bearing. */
-const GLOSS_AI_MODES = new Set(["exclaim", "explain", "examine", "enquiry"]);
-
-/** User-facing label for a pre-token live-exchange phase (the animated dots are
- *  appended separately). "streaming" never reaches here — it renders text. */
-function pendingLabel(phase: "connecting" | "loading" | "thinking"): string {
-	return phase === "connecting" ? "Connecting"
-		: phase === "loading" ? "Loading model"
-		: "Thinking";
-}
-
-/** Sort priority for the Conversations list: Exclaim → Explain → Examine
- *  → Enquiry, matching the GlossBar tile order. Spec §"Sort order". */
-const CONV_MODE_PRIORITY: Record<string, number> = {
-	exclaim: 0,
-	explain: 1,
-	examine: 2,
-	enquiry: 3,
-};
-
-/** A single conversation turn parsed out of a callout body. Multi-line
- *  turns are reconstructed by appending continuation lines (lines without
- *  a `User:` / `AI:` prefix that follow a turn header) to `content`. */
-interface ConversationTurn {
-	role: "user" | "assistant";
-	content: string;
-}
-
-/** A saved highlight as parsed from the companion doc. We keep raw char offsets
- *  and the text prefix rather than resolving to a CursorRange here — resolution
- *  happens at paint time against the live OffsetMap so highlights can recover
- *  from paragraph-index drift (paraId hint stale but prefix still matches). */
-interface SavedHighlight {
-	mode: string;
-	paraIdHint: string;
-	/** For cross-paragraph highlights: the paraId of the paragraph where the
-	 *  selection ends. Absent for single-paragraph highlights. */
-	endParaIdHint?: string;
-	startChar: number;
-	endChar: number;
-	prefix: string;
-	/** User's annotation text (lines inside the callout after the anchor,
-	 *  excluding the source quote and any `<!-- ... -->` pending markers).
-	 *  Shown in the hover preview. */
-	userText: string;
-	/** Source text quoted inside the callout (`> > ...` lines). Shown in the
-	 *  hover preview as context under the annotation. */
-	quote: string;
-	/** Alternating user/assistant turns parsed from `User:` / `AI:` line
-	 *  prefixes within the callout body. Phase 2 callouts (no prefixes)
-	 *  produce an empty array and surface their content via `userText`. */
-	turns: ConversationTurn[];
-	/** State of the most recent AI exchange:
-	 *  - "complete" — no pending marker, no error marker (Phase 2 default)
-	 *  - "pending"  — `<!-- ai response pending -->` marker present
-	 *  - "error"    — `<!-- ai error: ... -->` marker present (`aiError` set) */
-	aiState: "complete" | "pending" | "error";
-	/** Error text extracted from the `<!-- ai error: ... -->` marker, if any. */
-	aiError?: string;
-	/** Transient (never parsed or persisted) live-exchange phase, set only while
-	 *  `aiState === "pending"` during an in-flight request. Drives the
-	 *  conversation bubble: "connecting" (probing whether the model is resident) →
-	 *  "loading" (local server cold-loading the model) → "thinking" (generating,
-	 *  pre-first-token) → "streaming" (tokens arriving). Undefined on load and
-	 *  once the exchange settles. */
-	livePhase?: "connecting" | "loading" | "thinking" | "streaming";
-	/** Transient accumulated text during `livePhase === "streaming"`. Rendered as
-	 *  plain text live; replaced by the formatted markdown bubble on completion. */
-	streamingText?: string;
-}
-
-const ANCHOR_PREFIX_LEN = 48;
-
 /** Consecutive forward page-turns (with no backward turn) after a large jump
  *  before the "Back" pill decays. The return-point dot on the bar persists; the
  *  pill is the obtrusive part, so it recedes once the reader has committed to
  *  the destination. A backward turn = peeking, and resets the count. */
 const BACK_PILL_COMMIT_TURNS = 3;
-
-interface AssistantCitation {
-	title: string;
-	url: string;
-}
-
-/** Strip Markdown footnote definition lines (`[^N]: Title — URL`) from the
- *  end of an assistant turn and return the cleaned body alongside a numbered
- *  citation map. Used to render Examine responses with inline `[N]` pills
- *  that hover/click their source. Both em-dash and ASCII hyphen separators
- *  are accepted; lines without a URL are ignored. */
-function parseAssistantCitations(content: string): {
-	body: string;
-	citations: Map<number, AssistantCitation>;
-} {
-	const citations = new Map<number, AssistantCitation>();
-	const footnoteRe = /^\s*\[\^(\d+)\]:\s*(.+?)\s+[—–-]\s+(https?:\/\/\S+?)\s*$/;
-	const lines = content.split(/\r?\n/);
-	const bodyLines: string[] = [];
-	for (const line of lines) {
-		const m = footnoteRe.exec(line);
-		if (m) {
-			const num = parseInt(m[1], 10);
-			citations.set(num, { title: m[2].trim(), url: m[3].trim() });
-		} else {
-			bodyLines.push(line);
-		}
-	}
-	return { body: bodyLines.join("\n").trimEnd(), citations };
-}
-
-/** Parse `<!-- tmr-anchor ... -->` comments out of a companion-doc markdown
- *  string, pairing each with the mode declared on the preceding callout line.
- *  Accepts both the new `chars:S,E prefix:"..."` format and the legacy
- *  `start:s,g end:s,g` format so existing annotation files keep rendering. */
-function parseSavedHighlights(md: string): SavedHighlight[] {
-	const result: SavedHighlight[] = [];
-	const modeRe = /^>\s*\[!(exclaim|explain|examine|emphasise|enquiry)\]/;
-	const anchorRe = /<!--\s*tmr-anchor\s+([^>]*?)-->/;
-	const fieldRe = /(spine|para|chars|prefix|endPara|endChars):(?:"((?:[^"\\]|\\.)*)"|(\S+))/g;
-	const lines = md.split(/\r?\n/);
-
-	let pendingMode: string | null = null;
-	let i = 0;
-	while (i < lines.length) {
-		const line = lines[i];
-		const m = modeRe.exec(line);
-		if (m) { pendingMode = m[1]; i++; continue; }
-
-		const a = anchorRe.exec(line);
-		if (!a || !pendingMode) { i++; continue; }
-
-		const fields: Record<string, string> = {};
-		for (const f of a[1].matchAll(fieldRe)) {
-			fields[f[1]] = f[2] !== undefined ? f[2].replace(/\\"/g, '"') : f[3];
-		}
-		const paraIdHint = fields.para ?? "";
-		if (!paraIdHint) { pendingMode = null; i++; continue; }
-
-		const endParaIdHint = fields.endPara ?? undefined;
-
-		let startChar = -1, endChar = -1;
-		if (fields.chars) {
-			const [s, e] = fields.chars.split(",").map((n) => parseInt(n, 10));
-			if (Number.isFinite(s) && Number.isFinite(e)) { startChar = s; endChar = e; }
-		}
-		// Multi-para anchor: endChars holds the real end offset within endParaIdHint
-		if (endParaIdHint && fields.endChars) {
-			const e = parseInt(fields.endChars, 10);
-			if (Number.isFinite(e)) endChar = e;
-		}
-
-		const prefix = fields.prefix ? decodeURIComponent(fields.prefix) : "";
-
-		// Walk forward through the callout body (all subsequent `>`-prefixed
-		// lines) and split into:
-		//   - source quote   (`> > ...` lines)
-		//   - turns          (`> User: ...` / `> AI: ...` line-prefix scheme)
-		//   - legacyUserText (bare `> <text>` lines without a turn prefix —
-		//                     Phase 2 callouts, before multi-turn was a thing)
-		// HTML comments are scanned for AI state markers. Continuation lines
-		// for a turn (lines following `User:` / `AI:` that don't start with
-		// either prefix and aren't a comment) are appended to that turn.
-		const quoteLines: string[] = [];
-		const legacyUserLines: string[] = [];
-		const turns: ConversationTurn[] = [];
-		let aiState: SavedHighlight["aiState"] = "complete";
-		let aiError: string | undefined;
-		let currentTurn: ConversationTurn | null = null;
-		const turnHeaderRe = /^(User|AI):\s*(.*)$/;
-		const aiPendingRe = /<!--\s*ai response pending\s*-->/i;
-		const aiErrorRe = /<!--\s*ai error:\s*(.*?)\s*-->/i;
-		let j = i + 1;
-		while (j < lines.length) {
-			const bodyLine = lines[j];
-			if (!/^>/.test(bodyLine)) break;
-			// Bail if we hit the next callout's header line
-			if (modeRe.test(bodyLine)) break;
-
-			const stripped = bodyLine.replace(/^>\s?/, "");
-			if (/^>/.test(stripped)) {
-				quoteLines.push(stripped.replace(/^>\s?/, ""));
-				currentTurn = null;
-			} else if (/^<!--.*-->\s*$/.test(stripped.trim())) {
-				if (aiPendingRe.test(stripped)) aiState = "pending";
-				const errMatch = aiErrorRe.exec(stripped);
-				if (errMatch) { aiState = "error"; aiError = errMatch[1]; }
-				currentTurn = null;
-			} else if (stripped.trim().length === 0) {
-				// Blank line inside a callout. If we're mid-turn, treat as a
-				// paragraph break rather than resetting — multi-paragraph AI
-				// responses write `> ` blank lines that must not orphan the
-				// continuation lines that follow.
-				if (currentTurn) currentTurn.content += "\n\n";
-			} else {
-				const turnMatch = turnHeaderRe.exec(stripped);
-				if (turnMatch) {
-					currentTurn = {
-						role: turnMatch[1] === "User" ? "user" : "assistant",
-						content: turnMatch[2],
-					};
-					turns.push(currentTurn);
-				} else if (currentTurn) {
-					// Continuation of the previous turn (multi-line user/AI text).
-					currentTurn.content += "\n" + stripped;
-				} else {
-					// Phase 2 legacy: bare user text with no `User:` prefix.
-					legacyUserLines.push(stripped);
-				}
-			}
-			j++;
-		}
-
-		// Prefer the first explicit user turn for `userText` (the field that
-		// powers hover previews and the conversations-card title); fall back
-		// to the legacy bucket for Phase 2 callouts.
-		const firstUserTurn = turns.find((t) => t.role === "user");
-		const userText = firstUserTurn?.content.trim() ?? legacyUserLines.join("\n").trim();
-
-		result.push({
-			mode: pendingMode,
-			paraIdHint,
-			endParaIdHint,
-			startChar,
-			endChar,
-			prefix,
-			userText,
-			quote: quoteLines.join("\n").trim(),
-			turns,
-			aiState,
-			aiError,
-		});
-		pendingMode = null;
-		i = j;
-	}
-	return result;
-}
 
 /** Inline SVG for the 3C logo (from Hipst3r-DLS/3CLibrary.pen, node 0goli).
  *  Exported so the Library's 3C-mode toggle reuses the exact same mark. */
@@ -489,40 +236,6 @@ interface ReaderViewState extends Record<string, unknown> {
 	unitIndex?: number;
 	spread?: number;
 	state?: ReaderViewState;
-}
-
-/** Render inline markdown (bold, italic, code) into `el` synchronously.
- *  HTML-escapes the text first so this is safe for untrusted content.
- *  Handles: **bold**, *italic*, ***bold-italic***, `code`. */
-function setInlineMarkdown(el: HTMLElement, text: string): void {
-	const esc = text
-		.replace(/&/g, "&amp;").replace(/</g, "&lt;")
-		.replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-	// eslint-disable-next-line no-unsanitized/property -- Safe: the text is fully HTML-escaped above, so the only markup that can reach the DOM is the tags these replaces emit.
-	el.innerHTML = esc
-		.replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>")
-		.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-		.replace(/\*(.+?)\*/g, "<em>$1</em>")
-		.replace(/`([^`]+)`/g, "<code>$1</code>");
-}
-
-/** Searchable list of a provider's available models. Shared by the settings
- *  "Browse" button and the in-chat model picker. */
-class ModelPickerModal extends SuggestModal<string> {
-	constructor(app: App, private models: string[], private onPick: (model: string) => void) {
-		super(app);
-		this.setPlaceholder("Search models…");
-	}
-	getSuggestions(query: string): string[] {
-		const q = query.toLowerCase();
-		return this.models.filter((m) => m.toLowerCase().includes(q));
-	}
-	renderSuggestion(model: string, el: HTMLElement): void {
-		el.createSpan({ text: model });
-	}
-	onChooseSuggestion(model: string): void {
-		this.onPick(model);
-	}
 }
 
 /** A cheat-sheet row: a keycap, an optional colour-flagged mode label, and a
@@ -599,26 +312,6 @@ class HelpModal extends Modal {
 	onClose(): void {
 		this.contentEl.empty();
 	}
-}
-
-/** Probe a provider's `/v1/models`, then open {@link ModelPickerModal}. Surfaces
- *  a Notice on an unreachable provider or an empty list instead of opening an
- *  empty modal. Works for any provider kind probeProvider enumerates. */
-async function pickModel(
-	app: App,
-	provider: AiProvider,
-	onPick: (model: string) => void,
-): Promise<void> {
-	const result = await probeProvider(provider);
-	if (!result.available) {
-		new Notice(`✗ ${provider.id}: ${result.error ?? "unreachable"}`);
-		return;
-	}
-	if (result.models.length === 0) {
-		new Notice(`${provider.id}: server returned no models`);
-		return;
-	}
-	new ModelPickerModal(app, [...result.models].sort(), onPick).open();
 }
 
 // ─── REGION: ReaderView — Fields ────────────────────────────────────────────
@@ -720,27 +413,15 @@ export class ReaderView extends ItemView {
 	private offsetMap = new OffsetMap();
 	private layoutMode: LayoutMode = "spread";
 
-	private glossBarEl: HTMLElement | null = null;
-	private glossInputEl: HTMLElement | null = null;
-	private glossTileTooltipEl: HTMLElement | null = null;
+	/** The shared GlossBar / input / tooltip floaters. Constructed in `onOpen`
+	 *  and added as a child component, so its DOM and listeners die with the
+	 *  view. The PDF controller drives an identical instance. */
+	private glossSurface!: GlossSurface;
+	/** The right-rail Annotations / Conversations pane. Constructed in the
+	 *  constructor and added as a child component, so its DOM, listeners and
+	 *  in-flight AI stream die with the view. */
+	private pane!: HighlightsPane;
 	private highlightOverlayEl: HTMLElement | null = null;
-	private highlightsPanelEl: HTMLElement | null = null;
-	private hlNoteBtnEl: HTMLElement | null = null;
-	private highlightsListEl: HTMLElement | null = null;
-	private conversationsListEl: HTMLElement | null = null;
-	private convCardsEl: HTMLElement | null = null;
-	/** Chat-screen container — sibling of the cards list + filter row inside
-	 *  the conversations panel. Holds the back button + conversation surface
-	 *  for the open conversation. Its `data-conversation-idx` is the source of
-	 *  truth for "which conversation is open": it survives list re-renders and
-	 *  pane toggles, so `renderConversationsList` restores from it. */
-	private convChatEl: HTMLElement | null = null;
-	private convFilterRowEl: HTMLElement | null = null;
-	private paneTabsEl: HTMLElement | null = null;
-	private paneTab: "annotations" | "conversations" = "annotations";
-	private convFilterOpen = false;
-	private convSort: "priority" | "recent" | "chapter" = "priority";
-	private highlightsOpen = false;
 	// Book search (see In-Book Search feature spec). The index promise is the
 	// lazy cache: built on first use per book, dropped in resetViewState.
 	private searchOpen = false;
@@ -761,7 +442,6 @@ export class ReaderView extends ItemView {
 	private activeHighlight: CursorRange | null = null;
 	private activeSelectionText: string | null = null;
 	private activeSelectionRect: DOMRect | null = null;
-	private activeGlossMode: string | null = null;
 	/** Anchored cross-page selection. While `isExtending`, the start boundary is
 	 *  frozen in `extendAnchor` (a live DOM point — valid as long as the unit's
 	 *  DOM persists, i.e. within-unit page turns), the selection survives
@@ -770,35 +450,9 @@ export class ReaderView extends ItemView {
 	private extendAnchor: { node: Node; offset: number } | null = null;
 	private extendHintEl: HTMLElement | null = null;
 	private savedHighlights: SavedHighlight[] = [];
-	/** Index into `savedHighlights` whose note is currently being edited inline
-	 *  in the Annotations pane; null when no editor is open. Render-state, so the
-	 *  editor survives the full re-renders triggered elsewhere. */
-	private editingNoteIdx: number | null = null;
-	/** Section IDs whose Annotations-pane chapter group is collapsed. In-memory
-	 *  only — resets to all-expanded when a book opens (cleared on book reset). */
-	private collapsedSections = new Set<string>();
-	private annotationPreviewEl: HTMLElement | null = null;
-	private hoveredHighlightIdx = -1;
-	/** Index into `savedHighlights` of the currently open conversation, or
-	 *  -1 when none is open. Drives the `tmr-saved-highlight-rect-active` class
-	 *  on overlay rects so the source passage stays visually pinned during the
-	 *  exchange. Cleared by `closeConversation` when the chat screen closes. */
-	private activeConversationIdx = -1;
-	/** Live `.tmr-conv-log` element of the currently-open conversation surface, or
-	 *  null when no chat screen is open. Lets the initial auto-fired AI exchange
-	 *  stream into the open chat's DOM (it's started right after the chat opens,
-	 *  so there's no `log` argument to thread through). */
-	private activeConvLog: HTMLElement | null = null;
-	/** Abort controller for the in-flight streamed AI exchange, if any. Aborted
-	 *  when the hosting chat screen closes or the view unloads so a stream
-	 *  never outlives its surface. Null when no exchange is running. */
-	private activeStreamAbort: AbortController | null = null;
-	/** Monotonic render token + per-log generation. `renderConversationLog` is
-	 *  async (awaits MarkdownRenderer per turn); concurrent calls on the same log
-	 *  would interleave into one tree. A render checks its generation after each
-	 *  await and bails if a newer render has superseded it. */
-	private convRenderSeq = 0;
-	private convLogSeq = new WeakMap<HTMLElement, number>();
+	/** Shared hover-preview floater for saved highlights. Child component, so
+	 *  its DOM dies with the view; the PDF controller drives its own instance. */
+	private annotationPreview!: AnnotationPreview;
 
 	private positionSaveTimer: number | null = null;
 
@@ -815,6 +469,58 @@ export class ReaderView extends ItemView {
 	// ─── REGION: Lifecycle ───────────────────────────────────────────────────
 	constructor(leaf: WorkspaceLeaf, private plugin: ThirdMindReader) {
 		super(leaf);
+		// Built here rather than in onOpen so `applyAiFeaturesState` (which
+		// `saveSettings` fans out to every open view) can never race ahead of it.
+		this.glossSurface = new GlossSurface({
+			app: this.app,
+			settings: () => this.plugin.settings,
+			sourcePath: () => this.getCompanionDocPath() ?? "",
+			onExtend: () => this.beginExtend(),
+			onSubmit: (mode, text) => this.onGlossSubmit(mode, text),
+			onDismiss: () => this.dismissGloss(),
+		});
+		this.addChild(this.glossSurface);
+		this.annotationPreview = new AnnotationPreview(() => this.plugin.settings);
+		this.addChild(this.annotationPreview);
+		this.pane = new HighlightsPane(this.paneHost());
+		this.addChild(this.pane);
+	}
+
+	/** The book-shaped seam the Highlights pane reads the reader through: the
+	 *  saved-highlight list, spine-section grouping, navigation, and where the
+	 *  companion doc lives. A PDF host supplies the same shape with pages. */
+	private paneHost(): HighlightsPaneHost {
+		return {
+			app: this.app,
+			settings: () => this.plugin.settings,
+			saveSettings: () => this.plugin.saveSettings(),
+			savedHighlights: () => this.savedHighlights,
+			companionDocPath: () => this.getCompanionDocPath(),
+			sectionOf: (saved) => {
+				const match = /^s(\d+)-p(\d+)$/.exec(saved.paraIdHint);
+				const spineIdx = match ? parseInt(match[1], 10) : 0;
+				const paraIdx = match ? parseInt(match[2], 10) : 0;
+				const section = this.sections[this.sectionIndexBySpine[spineIdx] ?? 0];
+				return { id: section?.id ?? "", label: section?.label ?? "—", spineIdx, paraIdx };
+			},
+			repaintHighlights: () => this.renderSavedHighlights(),
+			jumpToSource: (idx, closePanel) => void this.jumpToHighlight(idx, closePanel),
+			buildAiSystemPrompt: (saved) => this.buildAiSystemPrompt(saved),
+			persistTab: (tab) => this.persistPaneTab(tab),
+			restoreTab: () => {
+				const path = this.currentFile?.path ?? this.currentFolder?.path;
+				return path ? this.plugin.settings.bookPositions[path]?.pane : undefined;
+			},
+			showCitationTooltip: (text, e) => this.renderTooltip({ kind: "text", text }, e),
+			hideCitationTooltip: () => this.hideTooltip(),
+			onPanelToggle: (open) => {
+				// The panel slides over the search corner — hide the bar the same
+				// way and fold the results card away with it.
+				this.searchBarEl?.toggleClass("tmr-search-bar-hidden", open);
+				if (open && this.searchOpen) this.toggleBookSearch(false);
+			},
+			makeResizable: (panel, edge) => this.makePaneResizable(panel, edge),
+		};
 	}
 
 	getViewType(): string {
@@ -876,7 +582,7 @@ export class ReaderView extends ItemView {
 			if (this.isGlossActive()) this.dismissGloss();
 			else if (this.searchOpen) this.toggleBookSearch(false);
 			else if (this.tocOpen) this.toggleToc();
-			else if (this.highlightsOpen) this.toggleHighlightsPanel();
+			else if (this.pane.isOpen) this.pane.toggle();
 			else return;
 			return false; // consumed — keymap preventDefaults and stops here
 		});
@@ -894,7 +600,7 @@ export class ReaderView extends ItemView {
 			if (this.app.workspace.getActiveViewOfType(ReaderView) !== this) return;
 			// While a text field (gloss input, note editor, chat box, search…) has
 			// focus, keystrokes belong to it: navigation and shortcuts yield.
-			const typing = this.isTextInputFocused();
+			const typing = isTextInputFocused();
 			// GlossBar numeric shortcuts (1–5): only over a live selection.
 			if (
 				!typing &&
@@ -917,7 +623,7 @@ export class ReaderView extends ItemView {
 				// types an "s" into the field it just opened.
 				e.preventDefault();
 				if (e.key === "t") this.toggleToc();
-				else if (e.key === "h") this.toggleHighlightsPanel();
+				else if (e.key === "h") this.pane.toggle();
 				else this.toggleBookSearch();
 			}
 		});
@@ -938,8 +644,15 @@ export class ReaderView extends ItemView {
 			if (e.shiftKey) return;
 			if (!this.isGlossActive()) return;
 			const target = e.target as Node;
-			if (this.glossBarEl?.contains(target)) return;
-			if (this.glossInputEl?.contains(target)) return;
+			if (this.glossSurface.containsNode(target)) return;
+			// The wikilink popover lives on document.body, outside the panel —
+			// a click there is a suggestion pick, not an outside click.
+			if (
+				this.glossSurface.suggestOpen &&
+				target instanceof Element &&
+				target.closest(".suggestion-container")
+			)
+				return;
 			this.dismissGloss();
 		});
 	}
@@ -961,9 +674,7 @@ export class ReaderView extends ItemView {
 		if (this.escScopePushed && this.escScope) this.app.keymap.popScope(this.escScope);
 		this.escScopePushed = false;
 		this.escScope = null;
-		this.activeStreamAbort?.abort();
-		this.activeStreamAbort = null;
-		this.activeConvLog = null;
+		this.pane.abortActiveStream();
 		this.resizeObserver?.disconnect();
 		this.resizeObserver = null;
 		this.statusBarObserver?.disconnect();
@@ -974,19 +685,11 @@ export class ReaderView extends ItemView {
 		this.linkPreviewPending.clear();
 		this.hoveredLinkPreviewKey = null;
 		this.tooltipEl?.remove();
-		this.glossBarEl?.remove();
-		this.glossBarEl = null;
-		this.glossInputEl?.remove();
-		this.glossInputEl = null;
-		this.glossTileTooltipEl?.remove();
-		this.glossTileTooltipEl = null;
 		this.extendHintEl?.remove();
 		this.extendHintEl = null;
 		this.isExtending = false;
 		this.extendAnchor = null;
-		this.annotationPreviewEl?.remove();
-		this.annotationPreviewEl = null;
-		this.hoveredHighlightIdx = -1;
+		this.annotationPreview.hide();
 		this.clearHighlightOverlay();
 		if (this.progressTooltipRaf !== null) cancelAnimationFrame(this.progressTooltipRaf);
 		this.progressTooltipRaf = null;
@@ -1091,28 +794,15 @@ export class ReaderView extends ItemView {
 	applyThemeClasses(): void {
 		const root = this.contentEl;
 		if (!root.classList.contains("tmr-root")) return;
-		const { tmrMode, tmrTheme } = this.plugin.settings;
-		if (tmrMode === "3c") {
-			root.addClass("tmr-3c-mode");
-			root.setAttribute("data-tmr-theme", tmrTheme);
-		} else {
-			root.removeClass("tmr-3c-mode");
-			root.removeAttribute("data-tmr-theme");
-		}
-		if (this.tooltipEl) {
-			if (tmrMode === "3c") {
-				this.tooltipEl.addClass("tmr-3c-mode");
-				this.tooltipEl.setAttribute("data-tmr-theme", tmrTheme);
-			} else {
-				this.tooltipEl.removeClass("tmr-3c-mode");
-				this.tooltipEl.removeAttribute("data-tmr-theme");
-			}
-		}
-		this.syncGlossBarTheme();
-		this.syncGlossInputTheme();
-		this.syncGlossTileTooltipTheme();
-		this.syncAnnotationPreviewTheme();
-		this.syncHighlightsPanelTheme();
+		applyGlossTheme(root, this.plugin.settings);
+		// Body-scoped floaters stamped once at creation also need to track later
+		// mode/theme flips — the extend hint in particular is created lazily and
+		// then cached for the life of the view.
+		applyGlossTheme(this.tooltipEl, this.plugin.settings);
+		applyGlossTheme(this.extendHintEl, this.plugin.settings);
+		this.glossSurface.syncTheme();
+		this.annotationPreview.syncTheme();
+		this.pane.syncTheme();
 		this.updateTocFooter();
 		requestAnimationFrame(() => this.renderSavedHighlights());
 	}
@@ -1264,68 +954,10 @@ export class ReaderView extends ItemView {
 			if (hit) void this.jumpToSearchHit(hit);
 		});
 
-		// Highlights navigation panel — mirrors the TOC shell but slides in from
-		// the right. Populated from `savedHighlights` on every open, grouped by
-		// section. Click-to-jump mounts the hosting unit and scrolls the
-		// paragraph into view.
-		const hlToggle = root.createEl("button", { cls: "tmr-highlights-toggle" });
-		setIcon(hlToggle, "pencil-line");
-		hlToggle.ariaLabel = "Highlights";
-		this.registerDomEvent(hlToggle, "click", () => this.toggleHighlightsPanel());
-
-		const hlPanel = root.createEl("div", { cls: "tmr-highlights-panel" });
-		hlPanel.inert = true; // Tab-proof while closed — see tocPanel above.
-		const hlHeader = hlPanel.createEl("div", { cls: "tmr-highlights-header" });
-		hlHeader.createEl("span", { cls: "tmr-highlights-title", text: "Highlights" });
-		// Note button — opens the companion annotation doc. Lives in the header
-		// (above the tab bar) so it's reachable from both tabs, and so readers
-		// who only Emphasise (no conversations) can still get to their notes.
-		const hlNote = hlHeader.createEl("button", { cls: "tmr-pane-hdr-btn tmr-highlights-note" });
-		setIcon(hlNote, "file-pen");
-		setTooltip(hlNote, "Open annotation notes");
-		this.registerDomEvent(hlNote, "click", () => this.openCompanionDoc());
-		this.hlNoteBtnEl = hlNote;
-		this.updateCompanionDocButton();
-		const hlClose = hlHeader.createEl("button", { cls: "tmr-pane-hdr-btn tmr-highlights-close" });
-		setIcon(hlClose, "x");
-		this.registerDomEvent(hlClose, "click", () => this.toggleHighlightsPanel());
-
-		// Tab bar (Annotations / Conversations) lives between the header and
-		// the content. Two segmented buttons; click swaps which list is
-		// visible. Active tab persists per-book via savePosition().
-		const tabsWrap = hlPanel.createEl("div", { cls: "tmr-pane-tabs-wrap" });
-		const tabs = tabsWrap.createEl("div", { cls: "tmr-pane-tabs" });
-		tabs.dataset.active = "annotations";
-		const annTab = tabs.createEl("button", {
-			cls: "tmr-pane-tab",
-			text: "Annotations",
-		});
-		annTab.dataset.paneTab = "annotations";
-		const convTab = tabs.createEl("button", {
-			cls: "tmr-pane-tab",
-			text: "Conversations",
-		});
-		convTab.dataset.paneTab = "conversations";
-		this.registerDomEvent(annTab, "click", () => this.setPaneTab("annotations"));
-		this.registerDomEvent(convTab, "click", () => this.setPaneTab("conversations"));
-		this.paneTabsEl = tabs;
-
-		this.highlightsListEl = hlPanel.createEl("div", { cls: "tmr-highlights-list" });
-		const convListEl = hlPanel.createEl("div", { cls: "tmr-conversations-list tmr-hidden" });
-		this.conversationsListEl = convListEl;
-		this.convCardsEl = convListEl.createEl("div", { cls: "tmr-conv-cards" });
-		const filterRow = convListEl.createEl("div", { cls: "tmr-conv-filter-row" });
-		this.buildConvFilterRow(filterRow);
-		// Chat screen — hidden until a conversation opens; replaces the cards
-		// + filter row (via the container's tmr-conv-chat-open class) while
-		// the tabs and header above stay put.
-		this.convChatEl = convListEl.createEl("div", { cls: "tmr-conv-screen" });
-		this.highlightsPanelEl = hlPanel;
-		this.makePaneResizable(hlPanel, "left");
+		// Highlights navigation panel — the pane builds its own toggle, panel and
+		// backdrop into the shell root, in that order.
+		this.pane.mount(root);
 		this.applyAiFeaturesState();
-
-		const hlBackdrop = root.createEl("div", { cls: "tmr-highlights-backdrop" });
-		this.registerDomEvent(hlBackdrop, "click", () => this.toggleHighlightsPanel());
 
 		this.spreadEl = root.createEl("div", { cls: "tmr-spread tmr-hidden" });
 		this.contentNode = this.spreadEl.createEl("div", { cls: "tmr-content" });
@@ -1488,51 +1120,10 @@ export class ReaderView extends ItemView {
 		this.applyThemeClasses();
 	}
 
-	// Drag-to-resize for the slide-in panes. No painted handle — an invisible
-	// strip along the pane's inner border flips the cursor to ew-resize (OS
-	// window idiom). Width is written as an inline --tmr-pane-w on the panel,
-	// so it's session-scoped for free: the shell DOM (and the var with it) is
-	// rebuilt on every book load. `edge` is where the strip sits on the panel.
+	/** Drag-to-resize for this view's slide-in panes (TOC and Highlights).
+	 *  The reader's `contentEl` is the bound the pane must stay inside. */
 	private makePaneResizable(panel: HTMLElement, edge: "left" | "right"): void {
-		const grip = panel.createEl("div", { cls: `tmr-pane-resize-edge tmr-pane-resize-edge-${edge}` });
-		this.registerDomEvent(grip, "pointerdown", (e: PointerEvent) => {
-			if (e.button !== 0) return;
-			e.preventDefault();
-			const startX = e.clientX;
-			const startW = panel.getBoundingClientRect().width;
-			// Mirror the CSS clamp (max-width: calc(100% - 60px)) so the stored
-			// width never exceeds what the panel can actually render.
-			const maxW = this.contentEl.clientWidth - 60;
-			grip.setPointerCapture(e.pointerId);
-			document.body.addClass("tmr-pane-resizing");
-			// Width writes are rAF-throttled: pointermove outpaces the frame
-			// rate, and unthrottled style writes smear repaints in Electron.
-			let pendingX: number | null = null;
-			let raf = 0;
-			const onMove = (ev: PointerEvent) => {
-				pendingX = ev.clientX;
-				if (raf) return;
-				raf = requestAnimationFrame(() => {
-					raf = 0;
-					if (pendingX === null) return;
-					const delta = edge === "left" ? startX - pendingX : pendingX - startX;
-					// Floor = the CSS default width, so dragging to the smallest
-					// size doubles as reset-to-default.
-					const w = Math.max(340, Math.min(maxW, startW + delta));
-					panel.style.setProperty("--tmr-pane-w", `${w}px`);
-				});
-			};
-			const onUp = () => {
-				if (raf) cancelAnimationFrame(raf);
-				grip.removeEventListener("pointermove", onMove);
-				grip.removeEventListener("pointerup", onUp);
-				grip.removeEventListener("pointercancel", onUp);
-				document.body.removeClass("tmr-pane-resizing");
-			};
-			grip.addEventListener("pointermove", onMove);
-			grip.addEventListener("pointerup", onUp);
-			grip.addEventListener("pointercancel", onUp);
-		});
+		makePaneResizable(this, panel, edge, this.contentEl);
 	}
 
 	toggleToc(): void {
@@ -1580,36 +1171,6 @@ export class ReaderView extends ItemView {
 				this.toggleToc();
 			});
 			if (item.children.length > 0) this.renderTocItems(item.children, container, level + 1);
-		}
-	}
-
-	toggleHighlightsPanel(): void {
-		this.highlightsOpen = !this.highlightsOpen;
-		const panel = this.highlightsPanelEl;
-		const backdrop = this.contentEl.querySelector(".tmr-highlights-backdrop");
-		const toggle = this.contentEl.querySelector(".tmr-highlights-toggle");
-		if (panel) panel.inert = !this.highlightsOpen;
-		if (this.highlightsOpen) {
-			this.applyPaneTabUI();
-			this.renderActivePane();
-			this.updateCompanionDocButton();
-			panel?.addClass("tmr-highlights-open");
-			backdrop?.addClass("tmr-highlights-backdrop-visible");
-			toggle?.addClass("tmr-highlights-toggle-hidden");
-			// The panel slides over the search corner — hide the bar the same
-			// way and fold the results card away with it.
-			this.searchBarEl?.addClass("tmr-search-bar-hidden");
-			if (this.searchOpen) this.toggleBookSearch(false);
-		} else {
-			panel?.removeClass("tmr-highlights-open");
-			backdrop?.removeClass("tmr-highlights-backdrop-visible");
-			toggle?.removeClass("tmr-highlights-toggle-hidden");
-			this.searchBarEl?.removeClass("tmr-search-bar-hidden");
-			// Clear active-highlight styling when the panel is dismissed.
-			if (this.activeConversationIdx !== -1) {
-				this.activeConversationIdx = -1;
-				this.renderSavedHighlights();
-			}
 		}
 	}
 
@@ -1891,1213 +1452,48 @@ export class ReaderView extends ItemView {
 		window.setTimeout(() => overlay.remove(), 4600);
 	}
 
-	/** Switch the active right-rail tab. Persists to settings so re-opening
-	 *  the book restores the same tab. Re-renders the now-visible list. */
-	private setPaneTab(tab: "annotations" | "conversations"): void {
-		if (this.paneTab === tab) return;
-		this.paneTab = tab;
-		this.applyPaneTabUI();
-		this.renderActivePane();
-		this.persistPaneTab();
-	}
-
-	/** Sync the tab-bar active state and list visibility with `paneTab`.
-	 *  Called from `toggleHighlightsPanel` (when the panel opens) and
-	 *  `setPaneTab` (on tab click). Pure DOM swap; no data work. */
-	private applyPaneTabUI(): void {
-		const tabs = this.paneTabsEl;
-		if (tabs) {
-			tabs.dataset.active = this.paneTab;
-			tabs.querySelectorAll<HTMLElement>(".tmr-pane-tab").forEach((el) => {
-				el.toggleClass("tmr-pane-tab-active", el.dataset.paneTab === this.paneTab);
-			});
-		}
-		const ann = this.highlightsListEl;
-		const conv = this.conversationsListEl;
-		if (ann) ann.toggleClass("tmr-hidden", this.paneTab !== "annotations");
-		if (conv) conv.toggleClass("tmr-hidden", this.paneTab !== "conversations");
-	}
-
 	/** Reflect the AI-features master switch across this view: the GlossBar
 	 *  collapses to the lone Emphasise tile (Lite) and the Highlights pane hides
 	 *  its Annotations/Conversations tab bar, showing only the Annotations list.
 	 *  Public so `saveSettings` can fan it out to open views on a toggle. */
 	applyAiFeaturesState(): void {
-		const lite = !this.plugin.settings.aiFeaturesEnabled;
-		this.highlightsPanelEl?.toggleClass("tmr-pane-lite", lite);
-		this.glossBarEl?.toggleClass("tmr-gloss-lite", lite);
-		if (lite && this.paneTab !== "annotations") this.paneTab = "annotations";
-		this.applyPaneTabUI();
+		this.glossSurface.syncModeState();
+		this.pane.applyAiFeaturesState();
 	}
 
-	/** Open (or focus) the book's companion annotation doc in a markdown tab.
-	 *  No-op when the doc doesn't exist yet (no annotations made). Bound to the
-	 *  Highlights-pane header button so it's reachable from either tab. */
-	async openCompanionDoc(): Promise<void> {
-		const path = this.getCompanionDocPath();
-		if (!path) return;
-		const file = this.app.vault.getAbstractFileByPath(path);
-		if (!(file instanceof TFile)) return;
-		const existing = this.app.workspace.getLeavesOfType("markdown").find(
-			(l) => (l.view as { file?: TFile }).file?.path === path,
-		);
-		if (existing) {
-			this.app.workspace.setActiveLeaf(existing, { focus: true });
-		} else {
-			await this.app.workspace.getLeaf("tab").openFile(file);
-		}
+	/** Toggle the right-rail pane. Public so the plugin's command can reach it
+	 *  without knowing the pane exists. */
+	toggleHighlightsPane(): void {
+		this.pane.toggle();
 	}
 
-	/** Show the Highlights-pane note button only once a companion doc exists on
-	 *  disk — there's nothing to open before the reader's first annotation. */
-	private updateCompanionDocButton(): void {
-		if (!this.hlNoteBtnEl) return;
-		const path = this.getCompanionDocPath();
-		const exists = !!path && this.app.vault.getAbstractFileByPath(path) instanceof TFile;
-		this.hlNoteBtnEl.toggleClass("tmr-hidden", !exists);
-	}
-
-	/** Build the filter row that lives at the bottom of the conversations list.
-	 *  A `list-filter` icon button sits pinned to the right; clicking it reveals
-	 *  the three sort pills that slide in from the right. The button turns teal
-	 *  while the filter is open. */
-	private buildConvFilterRow(row: HTMLElement): void {
-		this.convFilterRowEl = row;
-
-		// Middle: sort pills — hidden until filter is open.
-		const optionsEl = row.createEl("div", { cls: "tmr-conv-filter-options" });
-		const opts: Array<{ key: "priority" | "recent" | "chapter"; label: string }> = [
-			{ key: "priority", label: "Priority" },
-			{ key: "recent",   label: "Recent"   },
-			{ key: "chapter",  label: "Chapter"  },
-		];
-		for (const { key, label } of opts) {
-			const btn = optionsEl.createEl("button", { cls: "tmr-conv-sort-btn", text: label });
-			btn.dataset.sortKey = key;
-			btn.toggleClass("tmr-conv-sort-btn-active", this.convSort === key);
-			this.registerDomEvent(btn, "click", () => {
-				if (this.convSort === key) return;
-				this.convSort = key;
-				optionsEl.querySelectorAll<HTMLElement>(".tmr-conv-sort-btn").forEach((b) => {
-					b.toggleClass("tmr-conv-sort-btn-active", b.dataset.sortKey === key);
-				});
-				this.renderConversationsList();
-			});
-		}
-
-		// Right: filter toggle button — always visible when row is visible.
-		const filterBtn = row.createEl("button", { cls: "tmr-conv-filter-btn" });
-		setIcon(filterBtn, "list-filter");
-		setTooltip(filterBtn, "Sort conversations");
-		this.registerDomEvent(filterBtn, "click", (e: MouseEvent) => {
-			e.stopPropagation();
-			this.convFilterOpen = !this.convFilterOpen;
-			filterBtn.toggleClass("tmr-conv-filter-btn-active", this.convFilterOpen);
-			optionsEl.toggleClass("tmr-conv-filter-options-open", this.convFilterOpen);
-		});
-	}
-
-	/** Dispatch render to whichever list is currently active. Re-running
-	 *  the inactive list would be wasted DOM work. */
-	private renderActivePane(): void {
-		if (this.paneTab === "annotations") this.renderHighlightsList();
-		else this.renderConversationsList();
+	/** Open this book's companion annotation doc. Delegates to the pane, which
+	 *  owns the header button that does the same thing; exposed here for the
+	 *  "Open annotation notes" command. */
+	openCompanionDoc(): Promise<void> {
+		return this.pane.openCompanionDoc();
 	}
 
 	/** Persist the active pane tab into the per-book position record so
 	 *  re-opening the book lands on the same tab. Mirrors
 	 *  `schedulePositionSave`'s write but is fire-and-forget (debounce-less)
 	 *  because tab toggles are user-paced, not stream-of-events. */
-	private persistPaneTab(): void {
+	private persistPaneTab(tab: PaneTab): void {
 		const path = this.currentFile?.path ?? this.currentFolder?.path;
 		if (!path) return;
 		const existing = this.plugin.settings.bookPositions[path] ?? {
 			unitIndex: this.currentUnitIndex,
 			spread: this.currentSpread,
 		};
-		this.plugin.settings.bookPositions[path] = { ...existing, pane: this.paneTab };
+		this.plugin.settings.bookPositions[path] = { ...existing, pane: tab };
 		void this.plugin.persistSettings();
 	}
 
-	/** Restore `paneTab` from the saved per-book position. Called after
-	 *  `loadEpub` has populated `currentFile`. Defaults to "annotations"
-	 *  when no record exists. */
-	private restorePaneTab(): void {
-		const path = this.currentFile?.path ?? this.currentFolder?.path;
-		const stored = path ? this.plugin.settings.bookPositions[path]?.pane : undefined;
-		// Lite mode has no Conversations tab — always land on Annotations.
-		this.paneTab = this.plugin.settings.aiFeaturesEnabled ? (stored ?? "annotations") : "annotations";
-	}
-
-	private syncHighlightsPanelTheme(): void {
-		const el = this.highlightsPanelEl;
-		if (!el) return;
-		const { tmrMode, tmrTheme } = this.plugin.settings;
-		if (tmrMode === "3c") {
-			el.addClass("tmr-3c-mode");
-			el.setAttribute("data-tmr-theme", tmrTheme);
-		} else {
-			el.removeClass("tmr-3c-mode");
-			el.removeAttribute("data-tmr-theme");
-		}
-	}
-
-	/** Build the grouped list of saved highlights for the sidebar. Groups by
-	 *  the host section's label (derived from paraId → spineIdx → sectionIdx).
-	 *  Renders in document order so the sidebar reflects reading order. */
-	private renderHighlightsList(): void {
-		const list = this.highlightsListEl;
-		if (!list) return;
-		list.empty();
-
-		if (this.savedHighlights.length === 0) {
-			list.createEl("div", {
-				cls: "tmr-highlights-empty",
-				text: "No highlights yet — select any text to begin annotating.",
-			});
-			return;
-		}
-
-		// Stable doc-order sort: by spine index, then by start-char within the paragraph.
-		const ordered = this.savedHighlights.map((saved, idx) => {
-			const match = /^s(\d+)-p(\d+)$/.exec(saved.paraIdHint);
-			const spineIdx = match ? parseInt(match[1], 10) : 0;
-			const paraIdx = match ? parseInt(match[2], 10) : 0;
-			const section = this.sections[this.sectionIndexBySpine[spineIdx] ?? 0];
-			return { saved, idx, paraIdx, spineIdx, sectionId: section?.id ?? "", sectionLabel: section?.label ?? "—" };
-		}).sort((a, b) =>
-			(a.spineIdx - b.spineIdx) ||
-			(a.paraIdx - b.paraIdx) ||
-			(a.saved.startChar - b.saved.startChar)
-		);
-
-		// Per-chapter annotation counts, for the collapsed-header badge.
-		const sectionCounts = new Map<string, number>();
-		for (const o of ordered) sectionCounts.set(o.sectionId, (sectionCounts.get(o.sectionId) ?? 0) + 1);
-
-		// Once the whole list is long (>10 marks), every chapter becomes
-		// collapsible so even sparse ones can be folded away to navigate.
-		const manyTotal = ordered.length > 10;
-
-		let lastSectionId = "";
-		let itemsParent: HTMLElement | null = null;
-		for (const { saved, idx, sectionId, sectionLabel } of ordered) {
-			if (sectionId !== lastSectionId) {
-				lastSectionId = sectionId;
-				const count = sectionCounts.get(sectionId) ?? 0;
-				// Collapse earns its UI past a few annotations per chapter, or
-				// once the book as a whole is heavily annotated. Sparse chapters
-				// in a short list stay as plain, always-open headers.
-				const collapsible = count > 3 || manyTotal;
-				itemsParent = this.renderSection(
-					list, sectionId, sectionLabel, count, collapsible,
-					collapsible && this.collapsedSections.has(sectionId),
-				);
-			}
-			if (itemsParent) this.renderHighlightItem(itemsParent, saved, idx);
-		}
-	}
-
-	/** Render a chapter section (header + items container) into the Annotations
-	 *  list and return the element new item rows should be appended to.
-	 *
-	 *  Collapse is animated, so the toggle flips a single `tmr-section-collapsed`
-	 *  class on the wrapper *in place* (no re-render) and CSS drives all three
-	 *  motions off it: chevron rotation, count fade-in, and the rows' grid-row
-	 *  height collapse. Non-collapsible chapters (≤3 annotations) get a plain,
-	 *  static header with no chevron, count, or click handler. */
-	private renderSection(
-		list: HTMLElement,
-		sectionId: string,
-		label: string,
-		count: number,
-		collapsible: boolean,
-		collapsed: boolean,
-	): HTMLElement {
-		const section = list.createEl("div", { cls: "tmr-section" });
-		section.toggleClass("tmr-section-collapsed", collapsed);
-
-		const header = section.createEl("div", { cls: "tmr-highlights-section-header" });
-		const left = header.createEl("div", { cls: "tmr-section-header-left" });
-		left.createEl("span", { cls: "tmr-section-header-label", text: label });
-
-		if (collapsible) {
-			header.addClass("tmr-section-header-collapsible");
-			setIcon(left.createEl("span", { cls: "tmr-section-chevron" }), "chevron-down");
-			const countEl = header.createEl("div", { cls: "tmr-section-count" });
-			setIcon(countEl.createEl("span", { cls: "tmr-section-count-icon" }), "bookmark");
-			countEl.createEl("span", { cls: "tmr-section-count-num", text: String(count) });
-			this.registerDomEvent(header, "click", () => {
-				const nowCollapsed = !this.collapsedSections.has(sectionId);
-				if (nowCollapsed) this.collapsedSections.add(sectionId);
-				else this.collapsedSections.delete(sectionId);
-				section.toggleClass("tmr-section-collapsed", nowCollapsed);
-			});
-		}
-
-		const itemsOuter = section.createEl("div", { cls: "tmr-section-items" });
-		return itemsOuter.createEl("div", { cls: "tmr-section-items-inner" });
-	}
-
-	/** Render one saved-highlight row into `parent`. */
-	private renderHighlightItem(parent: HTMLElement, saved: SavedHighlight, idx: number): void {
-		const item = parent.createEl("div", { cls: "tmr-highlights-item" });
-		item.dataset.glossMode = saved.mode;
-		item.dataset.highlightIdx = String(idx);
-
-		const iconEl = item.createEl("span", { cls: "tmr-highlights-item-icon" });
-		const modeMeta = GLOSS_MODES.find((m) => m.id === saved.mode);
-		if (modeMeta) setIcon(iconEl, modeMeta.icon);
-
-		const body = item.createEl("div", { cls: "tmr-highlights-item-body" });
-		const quote = saved.quote.replace(/\s+/g, " ").trim();
-		body.createEl("div", {
-			cls: "tmr-highlights-item-quote",
-			text: quote.length > 0 ? quote : "(no quote)",
-		});
-		// Note slot. Emphasise notes are free text the reader owns, so they
-		// are click-to-edit and empty ones offer a "+ Add a note" prompt.
-		// Other modes' "note" is the AI query — shown, but not editable here
-		// (that belongs to the Conversations chat surface).
-		const note = saved.userText.trim();
-		const isEmphasise = saved.mode === "emphasise";
-		if (this.editingNoteIdx === idx && isEmphasise) {
-			this.renderNoteEditor(body, idx, saved.userText);
-		} else if (note.length > 0) {
-			const noteEl = body.createEl("div", { cls: "tmr-highlights-item-note", text: note });
-			if (isEmphasise) {
-				noteEl.addClass("tmr-highlights-item-note-editable");
-				noteEl.setAttr("title", "Click to edit");
-				this.registerDomEvent(noteEl, "click", (e) => {
-					e.stopPropagation();
-					this.editingNoteIdx = idx;
-					this.renderHighlightsList();
-				});
-			}
-		} else if (isEmphasise) {
-			const addEl = body.createEl("div", {
-				cls: "tmr-highlights-item-add-note",
-				text: "+ Add a note",
-			});
-			this.registerDomEvent(addEl, "click", (e) => {
-				e.stopPropagation();
-				this.editingNoteIdx = idx;
-				this.renderHighlightsList();
-			});
-		}
-
-		// No delete affordance while this row's note editor is open — it
-		// would overlap the full-width input.
-		if (this.editingNoteIdx !== idx) {
-			const delBtn = item.createEl("button", {
-				cls: "tmr-highlights-item-delete",
-				attr: { "aria-label": "Delete annotation" },
-			});
-			setIcon(delBtn, "trash-2");
-			this.registerDomEvent(delBtn, "click", (e) => {
-				e.stopPropagation();
-				void this.deleteHighlightAt(idx);
-			});
-		}
-
-		this.registerDomEvent(item, "click", () => {
-			void this.jumpToHighlight(idx);
-		});
-	}
-
-	/** Render the inline note editor into an Annotations-pane row. Commits on
-	 *  Enter or blur, cancels on Escape. The blur commit is deferred so an
-	 *  Enter/Escape keystroke or a click on another control wins the race before
-	 *  the list re-renders the input away. */
-	private renderNoteEditor(container: HTMLElement, idx: number, initial: string): void {
-		const input = container.createEl("input", { cls: "tmr-highlights-note-input", type: "text" });
-		input.value = initial;
-		input.placeholder = GLOSS_PLACEHOLDERS["emphasise"] ?? "your thought…";
-		// Keep pointer/keyboard activity inside the editor from bubbling to the
-		// row's jump-to-highlight handler.
-		this.registerDomEvent(input, "click", (e) => e.stopPropagation());
-		this.registerDomEvent(input, "mousedown", (e) => e.stopPropagation());
-
-		let settled = false;
-		const commit = () => {
-			if (settled) return;
-			settled = true;
-			void this.commitNoteEdit(idx, input.value);
-		};
-		this.registerDomEvent(input, "keydown", (e) => {
-			if (e.key === "Enter") {
-				e.preventDefault();
-				commit();
-			} else if (e.key === "Escape") {
-				e.preventDefault();
-				settled = true;
-				this.cancelNoteEdit();
-			}
-		});
-		this.registerDomEvent(input, "blur", () => window.setTimeout(commit, 120));
-		requestAnimationFrame(() => { input.focus(); input.select(); });
-	}
-
-	private cancelNoteEdit(): void {
-		this.editingNoteIdx = null;
-		this.renderHighlightsList();
-	}
-
-	/** Persist an edited Emphasise note. An empty value clears the note back to
-	 *  a bare callout. No-op write when the text is unchanged. */
-	private async commitNoteEdit(idx: number, value: string): Promise<void> {
-		const saved = this.savedHighlights[idx];
-		this.editingNoteIdx = null;
-		if (!saved) { this.renderHighlightsList(); return; }
-		const next = value.trim();
-		if (next === saved.userText.trim()) { this.renderHighlightsList(); return; }
-		saved.userText = next;
-		try {
-			await this.patchCalloutInDoc(saved);
-		} catch (err) {
-			console.error("[ThirdMindReader] commitNoteEdit failed", err);
-			new Notice("Third Mind Reader: failed to save note");
-		}
-		this.renderSavedHighlights();
-		this.renderHighlightsList();
-	}
-
-	/** Delete an annotation: excise its callout from the companion doc, drop it
-	 *  from the in-memory list, and repaint overlays + pane. Confirmation-gated
-	 *  because the callout (and any AI conversation it holds) is removed. */
-	private async deleteHighlightAt(idx: number): Promise<void> {
-		const saved = this.savedHighlights[idx];
-		if (!saved) return;
-		const ok = window.confirm(
-			"Delete this annotation? It will be removed from the companion doc. This cannot be undone (the doc remains in vault history).",
-		);
-		if (!ok) return;
-
-		const path = this.getCompanionDocPath();
-		const file = path ? this.app.vault.getFileByPath(path) : null;
-		if (file) {
-			try {
-				await this.app.vault.process(file, (doc) => this.removeCalloutFromDoc(doc, saved));
-			} catch (err) {
-				console.error("[ThirdMindReader] deleteHighlightAt failed", err);
-				new Notice("Third Mind Reader: failed to delete annotation");
-				return;
-			}
-		}
-
-		this.savedHighlights.splice(idx, 1);
-		this.editingNoteIdx = null;
-		this.renderSavedHighlights();
-		this.renderHighlightsList();
-		if (this.paneTab === "conversations") this.renderConversationsList();
-		new Notice("Annotation deleted");
-	}
-
-	/** Build the Conversations tab list. Filters `savedHighlights` to
-	 *  AI-bearing modes (Exclaim/Explain/Examine/Enquiry — Emphasise is
-	 *  permanently excluded), sorts by mode priority then doc order, and
-	 *  renders one card per entry. Clicking a card opens the chat screen
-	 *  (`openConversation`), which replaces the list content until the back
-	 *  button returns to it. */
-	private renderConversationsList(): void {
-		const list = this.convCardsEl;
-		if (!list) return;
-		list.empty();
-
-		const showBare = this.plugin.settings.showBareFlaggedConversations;
-		const conversations = this.savedHighlights
-			.map((saved, idx) => ({ saved, idx }))
-			.filter(({ saved }) => GLOSS_AI_MODES.has(saved.mode))
-			.filter(({ saved }) => showBare || !this.isBareFlaggedConversation(saved));
-
-		const hasConversations = conversations.length > 0;
-		if (this.convFilterRowEl) this.convFilterRowEl.toggleClass("tmr-hidden", !hasConversations);
-
-		if (!hasConversations) {
-			// A chat can't stay open with nothing to return to (e.g. the last
-			// conversation was just deleted) — fall back to the empty state.
-			if (this.convChatEl?.dataset.conversationIdx !== undefined) this.closeConversation();
-			list.createEl("div", {
-				cls: "tmr-highlights-empty",
-				text: "No conversations yet — use Explain, Examine, Exclaim or Enquiry on a selection to start one.",
-			});
-			return;
-		}
-
-		const enriched = conversations.map((entry) => {
-			const match = /^s(\d+)-p(\d+)$/.exec(entry.saved.paraIdHint);
-			const spineIdx = match ? parseInt(match[1], 10) : 0;
-			const paraIdx  = match ? parseInt(match[2], 10) : 0;
-			const priority = CONV_MODE_PRIORITY[entry.saved.mode] ?? 99;
-			return { ...entry, spineIdx, paraIdx, priority };
-		});
-
-		let ordered: typeof enriched;
-		if (this.convSort === "recent") {
-			// Reverse insertion order — later entries in savedHighlights were appended last.
-			ordered = enriched.slice().sort((a, b) => b.idx - a.idx);
-		} else if (this.convSort === "chapter") {
-			// Doc order (spine → para → startChar), same as Annotations tab.
-			ordered = enriched.slice().sort((a, b) =>
-				(a.spineIdx - b.spineIdx) ||
-				(a.paraIdx  - b.paraIdx)  ||
-				(a.saved.startChar - b.saved.startChar)
-			);
-		} else {
-			// Priority (default): mode order → doc order.
-			ordered = enriched.slice().sort((a, b) =>
-				(a.priority - b.priority) ||
-				(a.spineIdx - b.spineIdx) ||
-				(a.paraIdx  - b.paraIdx)  ||
-				(a.saved.startChar - b.saved.startChar)
-			);
-		}
-
-		let lastSectionId = "";
-		for (const { saved, idx, spineIdx } of ordered) {
-			// Chapter headers when sorting by chapter — mirrors Annotations tab grouping.
-			if (this.convSort === "chapter") {
-				const sectionIdx = this.sectionIndexBySpine[spineIdx] ?? 0;
-				const section    = this.sections[sectionIdx];
-				const sectionId  = section?.id ?? "";
-				if (sectionId !== lastSectionId) {
-					lastSectionId = sectionId;
-					list.createEl("div", {
-						cls: "tmr-highlights-section-header",
-						text: section?.label ?? "—",
-					});
-				}
-			}
-
-			const card = list.createEl("div", { cls: "tmr-conv-card" });
-			card.dataset.glossMode = saved.mode;
-			card.dataset.conversationIdx = String(idx);
-
-			// Header row — body + chevron sit here so the card can flex-column
-			// when the conversation surface is appended below.
-			const row = card.createEl("div", { cls: "tmr-conv-card-row" });
-			const body = row.createEl("div", { cls: "tmr-conv-card-body" });
-
-			// Title = user's first turn (or `userText` for legacy callouts).
-			// Falls through to "(no prompt)" for bare-flagged entries.
-			const title = saved.userText.trim();
-			body.createEl("div", {
-				cls: "tmr-conv-card-title",
-				text: title.length > 0 ? title : "(no prompt)",
-			});
-
-			// Preview = first assistant turn, or a status placeholder.
-			const firstAssistant = saved.turns.find((t) => t.role === "assistant");
-			const previewText = this.conversationPreviewText(saved, firstAssistant);
-			if (previewText) {
-				const preview = body.createEl("div", { cls: "tmr-conv-card-preview" });
-				preview.toggleClass("tmr-conv-card-preview-pending", saved.aiState === "pending");
-				preview.toggleClass("tmr-conv-card-preview-error",   saved.aiState === "error");
-				preview.setText(this.stripInlineMarkdown(previewText));
-			}
-
-			const chevron = row.createEl("span", { cls: "tmr-conv-card-chevron" });
-			setIcon(chevron, "chevron-right");
-
-			this.registerDomEvent(row, "click", () => {
-				this.openConversation(idx);
-			});
-		}
-
-		// Re-render any open chat screen against the fresh data (tab switch,
-		// data refresh, pane reopen). The screen's dataset survives the list
-		// rebuild — it lives outside `convCardsEl`. Restore without navigating:
-		// a persisted open chat must not yank the reader back to its source.
-		const openIdxStr = this.convChatEl?.dataset.conversationIdx;
-		if (openIdxStr !== undefined) {
-			const openIdx = parseInt(openIdxStr, 10);
-			const openSaved = this.savedHighlights[openIdx];
-			if (openSaved && GLOSS_AI_MODES.has(openSaved.mode)) {
-				this.openConversation(openIdx, false);
-			} else {
-				// The conversation is gone (deleted / book changed) — fall back
-				// to the list.
-				this.closeConversation();
-			}
-		}
-	}
-
-	/** Resolve the muted-italic preview line for a conversation card based on
-	 *  `aiState` and the first assistant turn (if any). Returns "" when the
-	 *  card should render title-only (bare Phase 2 reactions with no AI). */
-	private conversationPreviewText(saved: SavedHighlight, firstAssistant?: ConversationTurn): string {
-		if (saved.aiState === "pending") return "Awaiting response…";
-		if (saved.aiState === "error")   return `Failed: ${saved.aiError ?? "model unreachable"}`;
-		return firstAssistant?.content.trim() ?? "";
-	}
-
-	private stripInlineMarkdown(text: string): string {
-		return text
-			.replace(/\*\*([^*]+)\*\*/g, "$1")
-			.replace(/\*([^*\n]+)\*/g, "$1")
-			.replace(/_([^_\n]+)_/g, "$1")
-			.replace(/`([^`]+)`/g, "$1")
-			.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-			.replace(/#{1,6}\s+/gm, "")
-			.replace(/\n+/g, " ")
-			.trim();
-	}
-
-	/** Open the chat screen for `savedHighlights[idx]`. The screen replaces
-	 *  the list content (cards + filter row) inside the conversations panel —
-	 *  tabs and header stay put. `jumpToSource` navigates the reader to the
-	 *  source paragraph — true for explicit user opens, false when *restoring*
-	 *  a persisted open chat (pane reopen / data refresh), so a remembered
-	 *  conversation never yanks the reader away from where it is. */
-	private openConversation(idx: number, jumpToSource = true): void {
-		const screen = this.convChatEl;
-		const saved = this.savedHighlights[idx];
-		if (!screen || !saved) return;
-
-		screen.empty();
-		screen.dataset.conversationIdx = String(idx);
-		screen.dataset.glossMode = saved.mode;
-		this.conversationsListEl?.addClass("tmr-conv-chat-open");
-
-		// Back button — the only dismissal affordance (Esc stays global).
-		const back = screen.createEl("button", { cls: "tmr-conv-back" });
-		setIcon(back, "chevron-left");
-		setTooltip(back, "Back to conversations");
-		this.registerDomEvent(back, "click", (e: MouseEvent) => {
-			e.stopPropagation();
-			this.closeConversation();
-		});
-
-		this.renderConversationSurface(screen, saved);
-		// Pin the highlight in active styling for the duration of the open
-		// conversation. On an explicit open, also jump the reader to the source
-		// paragraph; on a restore, repaint styling without navigating so the
-		// reader keeps its current position.
-		this.activeConversationIdx = idx;
-		if (jumpToSource) {
-			void this.jumpToHighlight(idx, false);
-		} else {
-			this.renderSavedHighlights();
-		}
-	}
-
-	/** Close the chat screen back to the conversations list. The list never
-	 *  unmounted, so its scroll position is preserved. Cancels any in-flight
-	 *  stream and drops the active-highlight styling. */
-	private closeConversation(): void {
-		this.activeStreamAbort?.abort();
-		this.activeConversationIdx = -1;
-		this.activeConvLog = null;
-		const screen = this.convChatEl;
-		this.conversationsListEl?.removeClass("tmr-conv-chat-open");
-		if (screen) {
-			// Clear the open-marker immediately (the list-restore logic keys
-			// off it) but keep the DOM + mode tint alive through the 220ms
-			// slide-out; tear down once the screen is off-stage. A conversation
-			// reopened mid-exit re-adds the class and owns the screen — skip.
-			delete screen.dataset.conversationIdx;
-			window.setTimeout(() => {
-				if (this.conversationsListEl?.hasClass("tmr-conv-chat-open")) return;
-				screen.empty();
-				delete screen.dataset.glossMode;
-			}, 250);
-		}
-		this.renderSavedHighlights();
-	}
-
-	private renderConversationSurface(host: HTMLElement, saved: SavedHighlight): void {
-		const surface = host.createEl("div", { cls: "tmr-conv-surface" });
-
-		// Chat log — scrollable middle section. Quote is prepended inside so it scrolls away.
-		const log = surface.createEl("div", { cls: "tmr-conv-log" });
-		this.activeConvLog = log;
-		void this.renderConversationLog(log, saved);
-
-		// Chat box — fixed-height bottom section matching DLS "Chat box" component.
-		const chatbox = surface.createEl("div", { cls: "tmr-conv-chatbox" });
-
-		// Top: textarea + send button.
-		const chatboxTop = chatbox.createEl("div", { cls: "tmr-conv-chatbox-top" });
-		const textarea = chatboxTop.createEl("textarea", {
-			cls: "tmr-conv-textarea",
-			attr: { placeholder: "Say something…", rows: "1" },
-		});
-		const sendBtn = chatboxTop.createEl("button", { cls: "tmr-conv-send" });
-		setIcon(sendBtn, "send-horizontal");
-		(sendBtn).disabled = true;
-
-		// Bottom: model picker + settings button. The label surfaces the
-		// user-given provider name from settings (provider.id), not the raw
-		// model id — the picker dialog still lists raw model ids; the hover
-		// tooltip carries the currently resolved one.
-		const chatboxBottom = chatbox.createEl("div", { cls: "tmr-conv-chatbox-bottom" });
-		const provider = this.getActiveProvider();
-		const modelPicker = chatboxBottom.createEl("div", { cls: "tmr-conv-model-picker" });
-		setIcon(modelPicker, "chevron-down");
-		modelPicker.createEl("span", { text: provider ? provider.id : "No model configured" });
-		if (provider?.defaultModel) setTooltip(modelPicker, provider.defaultModel);
-		// Clickable when a provider is resolved: opens the model browser for it
-		// and updates this provider's default model. No-op when unconfigured.
-		if (provider) {
-			modelPicker.addClass("tmr-conv-model-picker-clickable");
-			this.registerDomEvent(modelPicker, "click", (e: MouseEvent) => {
-				e.stopPropagation();
-				void pickModel(this.app, provider, (model) => {
-					provider.defaultModel = model;
-					setTooltip(modelPicker, model);
-					void this.plugin.saveSettings();
-				});
-			});
-		}
-		const settingsBtn = chatboxBottom.createEl("button", { cls: "tmr-conv-settings-btn" });
-		setIcon(settingsBtn, "settings-2");
-		this.registerDomEvent(settingsBtn, "click", (e: MouseEvent) => {
-			e.stopPropagation();
-			this.openConvQuickSettings(settingsBtn, saved, log);
-		});
-
-		// Textarea auto-resize + send enable/disable.
-		this.registerDomEvent(textarea, "input", () => {
-			textarea.setCssProps({ height: "auto" });
-			textarea.setCssProps({ height: Math.min(textarea.scrollHeight, 80) + "px" });
-			(sendBtn).disabled = textarea.value.trim().length === 0;
-		});
-		this.registerDomEvent(textarea, "click", (e: MouseEvent) => e.stopPropagation());
-		this.registerDomEvent(sendBtn, "click", (e: MouseEvent) => {
-			e.stopPropagation();
-			const text = textarea.value.trim();
-			if (!text) return;
-			textarea.value = "";
-			textarea.setCssProps({ height: "auto" });
-			(sendBtn).disabled = true;
-			this.submitConversationMessage(saved, log, text);
-		});
-		this.registerDomEvent(chatbox, "click", (e: MouseEvent) => e.stopPropagation());
-		this.registerDomEvent(textarea, "keydown", (e: KeyboardEvent) => {
-			if (e.key === "Enter" && !e.shiftKey) {
-				e.preventDefault();
-				if (!(sendBtn).disabled) sendBtn.click();
-			}
-		});
-
-		log.scrollTop = log.scrollHeight;
-	}
-
-	/** Update the live pending indicator's label + phase class in place (no
-	 *  re-render) as `livePhase` advances connecting → loading → thinking. Called
-	 *  by the model-load probe and `onResponseStart`. No-op once streaming. */
-	private updatePendingIndicator(log: HTMLElement, saved: SavedHighlight): void {
-		const phase = saved.livePhase;
-		if (phase !== "connecting" && phase !== "loading" && phase !== "thinking") return;
-		const ind = log.querySelector<HTMLElement>(
-			".tmr-conv-pending-wrap .tmr-conv-turn-ai-bubble");
-		if (!ind) return;
-		ind.removeClass("tmr-turn-connecting", "tmr-turn-loading", "tmr-turn-thinking");
-		ind.addClass(`tmr-turn-${phase}`);
-		const lbl = ind.querySelector(".tmr-thinking-label");
-		if (lbl) lbl.textContent = pendingLabel(phase);
-	}
-
-	private async renderConversationLog(log: HTMLElement, saved: SavedHighlight): Promise<void> {
-		const seq = ++this.convRenderSeq;
-		this.convLogSeq.set(log, seq);
-		log.empty();
-		for (const turn of saved.turns) {
-			if (turn.role === "user") {
-				const wrap = log.createEl("div", { cls: "tmr-conv-turn-user-wrap" });
-				wrap.createEl("div", { cls: "tmr-conv-turn-user-bubble", text: turn.content });
-			} else {
-				const wrap = log.createEl("div", { cls: "tmr-conv-turn-ai-wrap" });
-				const bubble = wrap.createEl("div", { cls: "tmr-conv-turn-ai-bubble" });
-				await this.renderAssistantBubble(bubble, turn.content);
-				// A newer render superseded us mid-await — stop before appending
-				// into the tree it has since rebuilt.
-				if (this.convLogSeq.get(log) !== seq) return;
-			}
-		}
-		if (this.convLogSeq.get(log) !== seq) return;
-		if (saved.aiState === "pending") {
-			const phase = saved.livePhase ?? "thinking";
-			if (phase === "streaming") {
-				// Live token stream — plain text while arriving; renderAssistant-
-				// Bubble re-renders it as formatted markdown once the turn lands.
-				const wrap = log.createEl("div", { cls: "tmr-conv-turn-ai-wrap" });
-				const bubble = wrap.createEl("div", { cls: "tmr-conv-turn-ai-bubble tmr-turn-streaming" });
-				bubble.textContent = saved.streamingText ?? "";
-			} else {
-				// Animated indicator: "Connecting…" while probing the server,
-				// "Loading model…" during a cold load, "Thinking…" once generating.
-				const wrap = log.createEl("div", { cls: "tmr-conv-turn-ai-wrap tmr-conv-pending-wrap" });
-				const ind = wrap.createEl("div", {
-					cls: `tmr-conv-turn-ai-bubble tmr-turn-pending tmr-turn-${phase}`,
-				});
-				ind.createSpan({
-					cls: "tmr-thinking-label",
-					text: pendingLabel(phase),
-				});
-				const dots = ind.createSpan({ cls: "tmr-thinking-dots" });
-				dots.createSpan({ cls: "tmr-dot" });
-				dots.createSpan({ cls: "tmr-dot" });
-				dots.createSpan({ cls: "tmr-dot" });
-			}
-		} else if (saved.aiState === "error") {
-			const wrap = log.createEl("div", { cls: "tmr-conv-turn-ai-wrap" });
-			wrap.createEl("div", {
-				cls: "tmr-conv-turn-ai-bubble tmr-turn-error",
-				text: saved.aiError ?? "Model unreachable — check plugin settings.",
-			});
-		}
-	}
-
-	/** Render an assistant turn into `bubble` with full markdown support.
-	 *  `[N]` citation markers (Examine mode) are wired as hover-clickable pills
-	 *  via a DOM walk after markdown rendering. */
-	private async renderAssistantBubble(bubble: HTMLElement, content: string): Promise<void> {
-		const { body, citations } = parseAssistantCitations(content);
-		await MarkdownRenderer.render(this.app, body, bubble, "", this);
-		if (citations.size > 0) this.wireCitationSpans(bubble, citations);
-	}
-
-	/** Post-process rendered markdown in `root`: find bare `[N]` text nodes
-	 *  matching known citations and replace them with hover-clickable spans. */
-	private wireCitationSpans(root: HTMLElement, citations: Map<number, AssistantCitation>): void {
-		const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-		const replacements: Array<{ node: Text; parts: Array<string | number> }> = [];
-		let node: Text | null;
-		while ((node = walker.nextNode() as Text | null)) {
-			const text = node.textContent ?? "";
-			const re = /\[(\d+)\]/g;
-			let m: RegExpExecArray | null;
-			const parts: Array<string | number> = [];
-			let pos = 0;
-			let hasKnown = false;
-			while ((m = re.exec(text)) !== null) {
-				const num = parseInt(m[1], 10);
-				if (!citations.has(num)) continue;
-				if (m.index > pos) parts.push(text.slice(pos, m.index));
-				parts.push(num);
-				pos = m.index + m[0].length;
-				hasKnown = true;
-			}
-			if (!hasKnown) continue;
-			if (pos < text.length) parts.push(text.slice(pos));
-			replacements.push({ node, parts });
-		}
-		for (const { node, parts } of replacements) {
-			const frag = document.createDocumentFragment();
-			for (const part of parts) {
-				if (typeof part === "string") {
-					frag.appendChild(document.createTextNode(part));
-				} else {
-					const cite = citations.get(part)!;
-					const span = document.createElement("span");
-					span.className = "tmr-citation";
-					span.textContent = `[${part}]`;
-					span.dataset.citationNum = String(part);
-					this.registerDomEvent(span, "mouseenter", (e: MouseEvent) =>
-						this.renderTooltip({ kind: "text", text: `${cite.title} — ${cite.url}` }, e));
-					this.registerDomEvent(span, "mouseleave", () => this.hideTooltip());
-					this.registerDomEvent(span, "click", (e: MouseEvent) => {
-						e.stopPropagation(); e.preventDefault();
-						window.open(cite.url, "_blank");
-					});
-					frag.appendChild(span);
-				}
-			}
-			node.parentNode?.replaceChild(frag, node);
-		}
-	}
-
-	private submitConversationMessage(
-		saved: SavedHighlight,
-		log: HTMLElement,
-		text: string,
-	): void {
-		saved.turns.push({ role: "user", content: text });
-		saved.aiState = "pending";
-		void this.renderConversationLog(log, saved);
-		log.scrollTop = log.scrollHeight;
-
-		this.doAiExchange(saved, log).catch((err) =>
-			console.error("[ThirdMindReader] submitConversationMessage AI call failed", err),
-		);
-	}
-
-	/** Core AI exchange: sends turns to the provider, writes the assistant
-	 *  turn (or error) back into `saved`, patches the companion doc, and
-	 *  refreshes the conversations list.
-	 *
-	 *  When called from `persistGloss` (initial auto-fire), `saved.turns` is
-	 *  empty and `log` is null — the first user turn is seeded from
-	 *  `saved.userText` before the API call fires. When called from
-	 *  `submitConversationMessage`, the user turn is already in `saved.turns`. */
-	private async doAiExchange(
-		saved: SavedHighlight,
-		log: HTMLElement | null,
-	): Promise<void> {
-		// Seed the first user turn from legacy userText when this is the
-		// initial auto-fire (turns array is empty at persistGloss time).
-		if (saved.turns.length === 0) {
-			saved.turns.push({ role: "user", content: saved.userText });
-		}
-
-		// Persist the pending state so the user turn is durable before the
-		// network round-trip.
-		await this.patchCalloutInDoc(saved);
-
-		const provider = this.getActiveProvider();
-		if (!provider) {
-			saved.aiState = "error";
-			saved.aiError = "No AI provider configured — open plugin settings.";
-			delete saved.livePhase; delete saved.streamingText;
-			if (log) { await this.renderConversationLog(log, saved); log.scrollTop = log.scrollHeight; }
-			await this.patchCalloutInDoc(saved);
-			if (this.paneTab === "conversations") this.renderConversationsList();
-			return;
-		}
-		const model = this.resolveModel(provider, saved.mode);
-		if (!model) {
-			saved.aiState = "error";
-			saved.aiError = "No model configured for this provider.";
-			delete saved.livePhase; delete saved.streamingText;
-			if (log) { await this.renderConversationLog(log, saved); log.scrollTop = log.scrollHeight; }
-			await this.patchCalloutInDoc(saved);
-			if (this.paneTab === "conversations") this.renderConversationsList();
-			return;
-		}
-
-		const messages: ChatMessage[] = saved.turns.map((t) => ({
-			role: t.role,
-			content: t.content,
-		}));
-
-		// Stream only on local openai-compatible servers (cloud kinds CORS-block
-		// a browser fetch and fall back to buffered). A streamed run opens on
-		// "Connecting…" while it probes the server, then "Loading model…" (cold
-		// load) or "Thinking…" (warm), flipping to "Thinking…" once headers
-		// arrive; buffered runs just show "Thinking…".
-		const useStreaming =
-			this.plugin.settings.streaming && provider.kind === "openai-compatible";
-		saved.streamingText = "";
-		saved.livePhase = useStreaming ? "connecting" : "thinking";
-		if (log) { await this.renderConversationLog(log, saved); log.scrollTop = log.scrollHeight; }
-
-		// Active probe (local/streaming only): ask the server whether the model is
-		// already resident so "Loading model…" shows only for a genuine cold load.
-		// Fired in parallel with the chat call below so it never delays the answer;
-		// only updates the indicator while we're still in the "connecting" window
-		// (a fast warm response can reach headers/tokens before the probe resolves).
-		if (useStreaming) {
-			void probeModelLoaded(provider, model).then((loaded) => {
-				if (saved.livePhase !== "connecting") return;
-				saved.livePhase = loaded === true ? "thinking" : "loading";
-				if (log) this.updatePendingIndicator(log, saved);
-			}).catch(() => { /* probe is best-effort; heuristic carries on */ });
-		}
-
-		const abort = new AbortController();
-		this.activeStreamAbort = abort;
-		let streamBubble: HTMLElement | null = null;
-
-		try {
-			const res = await chat(provider, model, {
-				messages,
-				systemPrompt: this.buildAiSystemPrompt(saved),
-				maxTokens: saved.mode === "explain" ? 512 : 1024,
-				stream: useStreaming,
-				signal: abort.signal,
-				onResponseStart: () => {
-					// Headers arrived → model is loaded and generating. Flip the
-					// indicator from "Connecting…"/"Loading model…" to "Thinking…"
-					// in place (no re-render).
-					if (saved.livePhase !== "connecting" && saved.livePhase !== "loading") return;
-					saved.livePhase = "thinking";
-					if (log) this.updatePendingIndicator(log, saved);
-				},
-				onDelta: (delta) => {
-					saved.streamingText = (saved.streamingText ?? "") + delta;
-					if (!log) return;
-					if (!streamBubble) {
-						// First token: drop the animated indicator and open a
-						// plain-text bubble we append to (formatted on completion).
-						saved.livePhase = "streaming";
-						log.querySelector(".tmr-conv-pending-wrap")?.remove();
-						const wrap = log.createEl("div", { cls: "tmr-conv-turn-ai-wrap" });
-						streamBubble = wrap.createEl("div",
-							{ cls: "tmr-conv-turn-ai-bubble tmr-turn-streaming" });
-					}
-					streamBubble.textContent = saved.streamingText ?? "";
-					log.scrollTop = log.scrollHeight;
-				},
-			});
-			saved.turns.push({ role: "assistant", content: res.content });
-			saved.aiState = "complete";
-			delete saved.aiError;
-		} catch (err) {
-			if (abort.signal.aborted) {
-				// Cancelled (card closed / view unloaded). Leave the turn pending
-				// for retry; no error bubble, no further render against dead DOM.
-				delete saved.livePhase; delete saved.streamingText;
-				return;
-			}
-			const msg = (err as Error).message ?? "Unknown error";
-			saved.aiState = "error";
-			saved.aiError = msg.length > 200 ? msg.slice(0, 200) + "…" : msg;
-		} finally {
-			if (this.activeStreamAbort === abort) this.activeStreamAbort = null;
-		}
-
-		delete saved.livePhase;
-		delete saved.streamingText;
-		if (log) { await this.renderConversationLog(log, saved); log.scrollTop = log.scrollHeight; }
-		await this.patchCalloutInDoc(saved);
-		if (this.paneTab === "conversations") this.renderConversationsList();
-	}
-
-	/** Build a mode-specific system prompt from the user-editable template,
-	 *  substituting the book title and appending the source quote as context
-	 *  so the model knows what passage is being discussed. */
+	/** Mode-specific system prompt for this book. The template logic is shared
+	 *  with the PDF host; only the title differs. */
 	private buildAiSystemPrompt(saved: SavedHighlight): string {
 		const book = this.book?.title ?? this.currentFile?.basename ?? "the current book";
-		const quoteCtx = saved.quote.trim()
-			? `\n\nSelected passage:\n"${saved.quote.trim()}"`
-			: "";
-		const template = this.plugin.settings.systemPrompts[saved.mode as AiPromptMode]
-			?? DEFAULT_SYSTEM_PROMPTS[saved.mode as AiPromptMode]
-			?? `You are a helpful reading assistant for "{book}".`;
-		return template.replace(/\{book\}/g, book) + quoteCtx;
-	}
-
-	/** Pick a model ID for the given provider + mode, falling back to sensible
-	 *  per-kind defaults when `provider.defaultModel` is unset. */
-	private resolveModel(provider: AiProvider, mode: string): string {
-		if (provider.defaultModel) return provider.defaultModel;
-		if (provider.kind === "anthropic") {
-			return mode === "explain" ? "claude-haiku-4-5-20251001" : "claude-sonnet-4-6";
-		}
-		if (provider.kind === "openai") {
-			return mode === "explain" ? "gpt-4o-mini" : "gpt-4o";
-		}
-		return "";
-	}
-
-	private async patchCalloutInDoc(saved: SavedHighlight): Promise<void> {
-		const path = this.getCompanionDocPath();
-		if (!path) return;
-		const file = this.app.vault.getFileByPath(path);
-		if (!file) return;
-		try {
-			// AI-bearing callouts are rebuilt from `turns`; non-AI (Emphasise)
-			// callouts carry a free-text note in `userText` instead.
-			await this.app.vault.process(file, (doc) =>
-				GLOSS_AI_MODES.has(saved.mode)
-					? this.rewriteCalloutBody(doc, saved)
-					: this.rewriteEmphasiseNote(doc, saved),
-			);
-		} catch (err) {
-			console.error("[ThirdMindReader] patchCalloutInDoc failed", err);
-		}
-	}
-
-	/** Rewrite the body lines of a single callout (from anchor line to the
-	 *  first non-`>` line) to reflect `saved.turns` and `saved.aiState`.
-	 *  Identifies the callout by `paraIdHint` + `chars` for disambiguation.
-	 *  Returns the unchanged doc string when the callout cannot be found. */
-	/** Locate a single callout in `lines` by its anchor (`para:` + optional
-	 *  `chars:` token). Returns the header line index (`> [!mode]`), the anchor
-	 *  comment line index, and the exclusive end index (first line past the
-	 *  callout body). Null when the callout cannot be found. Shared by the body
-	 *  rewriters and the delete path. */
-	private findCalloutBounds(
-		lines: string[],
-		saved: SavedHighlight,
-	): { startIdx: number; anchorIdx: number; endIdx: number } | null {
-		// Cross-para anchors store the `chars:S,-1` sentinel in the doc; the real
-		// end offset lives in `endChars:` (folded into saved.endChar on parse).
-		const charsToken = saved.startChar >= 0
-			? (saved.endParaIdHint
-				? `chars:${saved.startChar},-1`
-				: `chars:${saved.startChar},${saved.endChar}`)
-			: null;
-		let anchorIdx = -1;
-		for (let i = 0; i < lines.length; i++) {
-			const line = lines[i];
-			if (!line.includes(`para:${saved.paraIdHint}`)) continue;
-			if (charsToken && !line.includes(charsToken)) continue;
-			if (/<!--\s*tmr-anchor/.test(line)) { anchorIdx = i; break; }
-		}
-		if (anchorIdx === -1) return null;
-
-		// Header is the nearest `> [!mode]` line at or above the anchor.
-		let startIdx = anchorIdx;
-		while (startIdx > 0 && !/^>\s*\[!/.test(lines[startIdx])) startIdx--;
-
-		// End of the callout: first line not starting with `>` (or the next
-		// callout header).
-		let endIdx = anchorIdx + 1;
-		while (endIdx < lines.length) {
-			if (!/^>/.test(lines[endIdx])) break;
-			if (/^>\s*\[!/.test(lines[endIdx])) break;
-			endIdx++;
-		}
-		return { startIdx, anchorIdx, endIdx };
-	}
-
-	private rewriteCalloutBody(doc: string, saved: SavedHighlight): string {
-		const lines = doc.split("\n");
-		const bounds = this.findCalloutBounds(lines, saved);
-		if (!bounds) return doc;
-		const { anchorIdx, endIdx } = bounds;
-
-		// Rebuild body: source quote → turns → state marker.
-		const body: string[] = [];
-		if (saved.quote.trim()) {
-			for (const ql of saved.quote.split("\n")) body.push(`> > ${ql}`);
-		}
-		for (const turn of saved.turns) {
-			const prefix = turn.role === "user" ? "User" : "AI";
-			const contentLines = turn.content.split("\n");
-			body.push(`> ${prefix}: ${contentLines[0]}`);
-			for (let i = 1; i < contentLines.length; i++) body.push(`> ${contentLines[i]}`);
-		}
-		if (saved.aiState === "pending") {
-			body.push(">");
-			body.push("> <!-- ai response pending -->");
-		} else if (saved.aiState === "error") {
-			body.push(">");
-			body.push(`> <!-- ai error: ${saved.aiError ?? "unknown"} -->`);
-		}
-
-		return [
-			...lines.slice(0, anchorIdx + 1),
-			...body,
-			...lines.slice(endIdx),
-		].join("\n");
-	}
-
-	/** Rewrite a non-AI (Emphasise) callout body to reflect `saved.userText`.
-	 *  Mirrors the non-AI branch of {@link buildCallout}: source quote, then a
-	 *  blank `>` separator + the note lines when a note is present. An empty
-	 *  note collapses the callout back to its bare form. */
-	private rewriteEmphasiseNote(doc: string, saved: SavedHighlight): string {
-		const lines = doc.split("\n");
-		const bounds = this.findCalloutBounds(lines, saved);
-		if (!bounds) return doc;
-		const { anchorIdx, endIdx } = bounds;
-
-		const body: string[] = [];
-		if (saved.quote.length > 0) {
-			for (const ql of saved.quote.split(/\r?\n/)) body.push(`> > ${ql}`);
-		}
-		const note = saved.userText.trim();
-		if (note.length > 0) {
-			body.push(">");
-			for (const ul of note.split(/\r?\n/)) body.push(`> ${ul}`);
-		}
-
-		return [
-			...lines.slice(0, anchorIdx + 1),
-			...body,
-			...lines.slice(endIdx),
-		].join("\n");
-	}
-
-	/** Excise a callout entirely from the companion doc, absorbing one adjacent
-	 *  blank line so deletions don't leave widening gaps. Returns the doc
-	 *  unchanged when the callout can't be located. */
-	private removeCalloutFromDoc(doc: string, saved: SavedHighlight): string {
-		const lines = doc.split("\n");
-		const bounds = this.findCalloutBounds(lines, saved);
-		if (!bounds) return doc;
-		let { startIdx } = bounds;
-		let { endIdx } = bounds;
-		if (lines[endIdx] === "") endIdx++;
-		else if (startIdx > 0 && lines[startIdx - 1] === "") startIdx--;
-		lines.splice(startIdx, endIdx - startIdx);
-		return lines.join("\n");
-	}
-
-	/** A bare-flagged conversation is an AI-mode callout with no user prompt
-	 *  text and no AI turns — only valid for Exclaim/Enquiry submitted with
-	 *  empty input. Filtered out of the Conversations list by default; the
-	 *  chat-box gear popover toggles visibility. */
-	private isBareFlaggedConversation(saved: SavedHighlight): boolean {
-		return saved.userText.trim() === "" && saved.turns.length === 0;
-	}
-
-	/** Quick-settings popover for the chat-box gear icon. Anchored above the
-	 *  gear via `Menu.showAtPosition`. Items: bare-flag toggle (pane-scoped),
-	 *  reset-conversation (conversation-scoped, requires confirmation), and
-	 *  a link to the plugin settings tab. */
-	private openConvQuickSettings(
-		anchor: HTMLElement,
-		saved: SavedHighlight,
-		log: HTMLElement,
-	): void {
-		const menu = new Menu();
-		const settings = this.plugin.settings;
-
-		menu.addItem((item) =>
-			item
-				.setTitle("Show bare-flagged Exclaims/Enquiries")
-				.setIcon("eye")
-				.setChecked(settings.showBareFlaggedConversations)
-				.onClick(async () => {
-					settings.showBareFlaggedConversations = !settings.showBareFlaggedConversations;
-					await this.plugin.saveSettings();
-					this.renderConversationsList();
-				})
-		);
-
-		menu.addSeparator();
-
-		const canReset = saved.turns.length > 2;
-		menu.addItem((item) => {
-			item
-				.setTitle(canReset ? "Reset this conversation" : "Reset this conversation (nothing to reset)")
-				.setIcon("rotate-ccw")
-				.setDisabled(!canReset)
-				.onClick(async () => {
-					const ok = window.confirm(
-						"Reset this conversation? All turns after the first exchange will be removed. This cannot be undone (the companion doc remains in vault history).",
-					);
-					if (!ok) return;
-					const firstUser = saved.turns.find((t) => t.role === "user");
-					const firstAi = saved.turns.find((t) => t.role === "assistant");
-					saved.turns = [firstUser, firstAi].filter(
-						(t): t is ConversationTurn => Boolean(t),
-					);
-					saved.aiState = "complete";
-					delete saved.aiError;
-					await this.patchCalloutInDoc(saved);
-					await this.renderConversationLog(log, saved);
-					this.renderConversationsList();
-				});
-		});
-
-		menu.addSeparator();
-
-		menu.addItem((item) =>
-			item
-				.setTitle("Open plugin settings →")
-				.setIcon("settings")
-				.onClick(() => {
-					const setting = (this.app as unknown as { setting?: { open: () => void; openTabById: (id: string) => void } }).setting;
-					if (setting) {
-						setting.open();
-						setting.openTabById("third-mind-reader");
-					}
-				})
-		);
-
-		const rect = anchor.getBoundingClientRect();
-		menu.showAtPosition({ x: rect.left, y: rect.top });
-	}
-
-	private getActiveProvider(): AiProvider | null {
-		const s = this.plugin.settings;
-		const primary = s.aiProviders.find((p) => p.id === s.aiDefaults.primaryProviderId);
-		return primary ?? s.aiProviders[0] ?? null;
+		return buildGlossSystemPrompt(this.plugin.settings, book, saved);
 	}
 
 	/** Mount the unit hosting the highlight, then scroll the paragraph into
@@ -3126,7 +1522,7 @@ export class ReaderView extends ItemView {
 			const entry = this.offsetMap.get(resolvedId);
 			if (entry?.element) this.scrollToTarget(entry.element);
 		}
-		if (closeHighlightsPanel && this.highlightsOpen) this.toggleHighlightsPanel();
+		if (closeHighlightsPanel && this.pane.isOpen) this.pane.toggle();
 	}
 
 	private async loadFile(file: TFile, initialPos?: { unitIndex: number; spread: number }): Promise<void> {
@@ -3175,17 +1571,13 @@ export class ReaderView extends ItemView {
 		this.mountedUnitKeys.next = "";
 		this.offsetMap.clear();
 		this.savedHighlights = [];
-		this.collapsedSections.clear();
-		// Close any open chat screen — its dataset idx points into the old
-		// book's savedHighlights and must not survive into the next one.
-		if (this.activeConversationIdx !== -1 || this.convChatEl?.dataset.conversationIdx) {
-			this.closeConversation();
-		}
+		// Drops collapsed-chapter state, the open-note editor, the tab, and any
+		// open chat screen (whose dataset idx points into the old book's list).
+		this.pane.reset();
 		this.layoutMode = "spread";
 		this.linkPreviewCache.clear();
 		this.linkPreviewPending.clear();
 		this.hoveredLinkPreviewKey = null;
-		this.paneTab = "annotations";
 		// Book search: index and query are per-book; the popover DOM itself is
 		// rebuilt by renderShell right after this.
 		this.searchIndexPromise = null;
@@ -3228,7 +1620,7 @@ export class ReaderView extends ItemView {
 				this.buildSectionIndex();
 				await this.buildRenderUnits();
 				await this.loadSavedHighlights();
-				this.restorePaneTab();
+				this.pane.restoreTab();
 				if (!this.spreadEl?.isConnected) return; // torn down mid-build
 				const startUnit = Math.min(initialPos?.unitIndex ?? 0, Math.max(0, this.units.length - 1));
 				const startSpread = initialPos?.spread ?? 0;
@@ -3245,6 +1637,12 @@ export class ReaderView extends ItemView {
 				new HelpModal(this.app).open();
 			}
 		} catch (err) {
+			// DRM is a known limitation, not a failure — state it plainly and skip
+			// the console noise, since there's nothing here to debug.
+			if (err instanceof EpubDrmError) {
+				this.showError(err.message);
+				return;
+			}
 			console.error("[ThirdMindReader] epub parse error", err);
 			this.showError(`Failed to open epub: ${(err as Error).message}`);
 		}
@@ -3738,10 +2136,10 @@ export class ReaderView extends ItemView {
 		const liveTransform = getComputedStyle(this.contentNode).transform;
 		const liveX = liveTransform === "none" ? 0 : -new DOMMatrixReadOnly(liveTransform).m41;
 		if (Math.abs(liveX - targetX) > stride * 1.5) {
-			this.contentNode.style.transition = "none";
+			this.contentNode.addClass("tmr-no-transition");
 			this.contentNode.style.transform = `translateX(-${targetX}px)`;
 			void this.contentNode.offsetWidth; // commit without transition
-			this.contentNode.style.removeProperty("transition");
+			this.contentNode.removeClass("tmr-no-transition");
 		} else {
 			this.contentNode.style.transform = `translateX(-${targetX}px)`;
 		}
@@ -3951,10 +2349,12 @@ export class ReaderView extends ItemView {
 		return Number.isFinite(width) && width > 0 ? width : 680;
 	}
 
+	/** Mirrors the `4.5rem` floor of `--tmr-side-pad` in styles.css — keep the two
+	 *  in step or the layout breakpoint drifts from the gutters it assumes. */
 	private getMinSidePaddingPx(spread: HTMLElement | null = this.spreadEl): number {
-		if (!spread) return 48;
+		if (!spread) return 72;
 		const fontSize = parseFloat(getComputedStyle(spread).fontSize);
-		return Number.isFinite(fontSize) && fontSize > 0 ? fontSize * 3 : 48;
+		return Number.isFinite(fontSize) && fontSize > 0 ? fontSize * 4.5 : 72;
 	}
 
 	private getLayoutCandidateWidth(spread: HTMLElement | null = this.spreadEl): number {
@@ -4002,6 +2402,9 @@ export class ReaderView extends ItemView {
 	private syncSpreadLayoutMode(spread: HTMLElement | null, mode: LayoutMode = this.layoutMode): void {
 		if (!spread) return;
 		spread.toggleClass("tmr-layout-single", mode === "single");
+		// Mirrored onto the root so the footer's `--tmr-side-pad` tracks the
+		// spread's — the progress bar spans the reading column, not the pane.
+		this.contentEl.toggleClass("tmr-layout-single", mode === "single");
 	}
 
 	private getColumnGap(mode: LayoutMode = this.layoutMode, spread: HTMLElement | null = this.spreadEl): number {
@@ -4277,27 +2680,13 @@ export class ReaderView extends ItemView {
 		return this.activeHighlight !== null;
 	}
 
-	/** True when a text field has focus — any reader-owned input, textarea, or
-	 *  contenteditable. Reader navigation and shortcuts defer to it so typing
-	 *  isn't hijacked by page turns or panel toggles. */
-	isTextInputFocused(): boolean {
-		const el = document.activeElement as HTMLElement | null;
-		return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
-	}
-
 	/** The gloss mode a numeric shortcut (1–5) maps to right now, or null if the
 	 *  shortcut isn't currently actionable: the GlossBar is hidden, a mode input
 	 *  panel is open (the number belongs to that field), or the mode is suppressed
 	 *  in Lite mode. Mirrors the GlossBar tile order. Used by the gloss commands'
 	 *  checkCallback so `1`–`5` only fire over a live selection. */
 	glossShortcutMode(slot: number): string | null {
-		if (!this.glossBarEl || this.glossBarEl.hasClass("tmr-hidden")) return null;
-		if (this.glossInputEl?.hasClass("tmr-hidden") === false) return null;
-		const mode = GLOSS_MODES[slot - 1];
-		if (!mode) return null;
-		// Lite mode hides the AI tiles — only Emphasise (1) stays live.
-		if (!this.plugin.settings.aiFeaturesEnabled && mode.id !== "emphasise") return null;
-		return mode.id;
+		return this.glossSurface.shortcutMode(slot);
 	}
 
 	/** Flip 3C mode on/off. Shared by the TOC footer button and the
@@ -4310,106 +2699,6 @@ export class ReaderView extends ItemView {
 			this.plugin.settings.tmrTheme = document.body.classList.contains("theme-light") ? "light" : "dark";
 		}
 		await this.plugin.saveSettings();
-	}
-
-	private ensureGlossBar(): HTMLElement {
-		if (this.glossBarEl) return this.glossBarEl;
-		const bar = document.body.createEl("div", { cls: "tmr-gloss-bar tmr-hidden" });
-		GLOSS_MODES.forEach((mode, idx) => {
-			const tile = bar.createEl("button", { cls: "tmr-gloss-tile" });
-			tile.dataset.glossMode = mode.id;
-			tile.dataset.shortcut = String(idx + 1);
-			setIcon(tile, mode.icon);
-			// Prevent mousedown from clearing the text selection before the click fires.
-			this.registerDomEvent(tile, "mousedown", (e: MouseEvent) => e.preventDefault());
-			this.registerDomEvent(tile, "click", (e: MouseEvent) => {
-				e.stopPropagation();
-				this.openGlossInput(mode.id);
-			});
-			// Custom tile tooltip (theme-synced, tinted per-mode). Replaces the
-			// neutral Obsidian aria-label tooltip so the hint can inherit the
-			// tile's fill colour and carry the numeric shortcut hint.
-			this.registerDomEvent(tile, "mouseenter", () => {
-				const label = `${mode.label} (${idx + 1})`;
-				this.showGlossTileTooltip(tile, mode.id, label);
-			});
-			this.registerDomEvent(tile, "mouseleave", () => this.hideGlossTileTooltip());
-			// Separator stroke after the standard-highlight tile (Emphasise),
-			// before the AI tiles. Hidden in Lite mode along with those tiles.
-			if (idx === 0) bar.createEl("div", { cls: "tmr-gloss-sep" });
-		});
-
-		// Extend-across-pages action (not a gloss mode). Stays visible in Lite
-		// mode — cross-page highlighting matters for plain Emphasise too.
-		bar.createEl("div", { cls: "tmr-gloss-sep tmr-gloss-sep-extend" });
-		const extendTile = bar.createEl("button", { cls: "tmr-gloss-tile tmr-gloss-tile-extend" });
-		setIcon(extendTile, "unfold-horizontal");
-		this.registerDomEvent(extendTile, "mousedown", (e: MouseEvent) => e.preventDefault());
-		this.registerDomEvent(extendTile, "click", (e: MouseEvent) => {
-			e.stopPropagation();
-			this.beginExtend();
-		});
-		this.registerDomEvent(extendTile, "mouseenter", () =>
-			this.showGlossTileTooltip(extendTile, "extend", "Extend across pages"));
-		this.registerDomEvent(extendTile, "mouseleave", () => this.hideGlossTileTooltip());
-
-		this.glossBarEl = bar;
-		this.syncGlossBarTheme();
-		return bar;
-	}
-
-	private ensureGlossTileTooltip(): HTMLElement {
-		if (this.glossTileTooltipEl) return this.glossTileTooltipEl;
-		const el = document.body.createEl("div", { cls: "tmr-gloss-tooltip tmr-hidden" });
-		this.glossTileTooltipEl = el;
-		this.syncGlossTileTooltipTheme();
-		return el;
-	}
-
-	private syncGlossTileTooltipTheme(): void {
-		const el = this.glossTileTooltipEl;
-		if (!el) return;
-		const { tmrMode, tmrTheme } = this.plugin.settings;
-		if (tmrMode === "3c") {
-			el.addClass("tmr-3c-mode");
-			el.setAttribute("data-tmr-theme", tmrTheme);
-		} else {
-			el.removeClass("tmr-3c-mode");
-			el.removeAttribute("data-tmr-theme");
-		}
-	}
-
-	private showGlossTileTooltip(tile: HTMLElement, modeId: string, label: string): void {
-		const el = this.ensureGlossTileTooltip();
-		el.dataset.glossMode = modeId;
-		el.setText(label);
-		el.removeClass("tmr-hidden");
-		const tileRect = tile.getBoundingClientRect();
-		const tipRect = el.getBoundingClientRect();
-		const margin = 6;
-		const left = Math.max(4, Math.min(
-			tileRect.left + tileRect.width / 2 - tipRect.width / 2,
-			window.innerWidth - tipRect.width - 4,
-		));
-		const top = tileRect.bottom + margin;
-		el.style.left = `${left}px`;
-		el.style.top = `${top}px`;
-	}
-
-	private hideGlossTileTooltip(): void {
-		this.glossTileTooltipEl?.addClass("tmr-hidden");
-	}
-
-	private syncGlossBarTheme(): void {
-		if (!this.glossBarEl) return;
-		const { tmrMode, tmrTheme } = this.plugin.settings;
-		if (tmrMode === "3c") {
-			this.glossBarEl.addClass("tmr-3c-mode");
-			this.glossBarEl.setAttribute("data-tmr-theme", tmrTheme);
-		} else {
-			this.glossBarEl.removeClass("tmr-3c-mode");
-			this.glossBarEl.removeAttribute("data-tmr-theme");
-		}
 	}
 
 	private onSelectionMouseUp(): void {
@@ -4436,9 +2725,8 @@ export class ReaderView extends ItemView {
 		this.activeSelectionText = sel.toString();
 		this.activeSelectionRect = anchorRect;
 		this.renderHighlightOverlay(cursorRange);
-		this.glossInputEl?.addClass("tmr-hidden");
-		this.activeGlossMode = null;
-		this.showGlossBar(anchorRect, this.selectionReachesSpreadEnd(sel));
+		this.glossSurface.hideInput();
+		this.glossSurface.showBar(anchorRect, this.selectionReachesSpreadEnd(sel));
 	}
 
 	/** True when the selection ends on the last visible line of the spread —
@@ -4523,8 +2811,7 @@ export class ReaderView extends ItemView {
 		if (!this.spreadEl?.contains(range.startContainer)) return;
 		this.extendAnchor = { node: range.startContainer, offset: range.startOffset };
 		this.isExtending = true;
-		this.glossBarEl?.addClass("tmr-hidden");
-		this.hideGlossTileTooltip();
+		this.glossSurface.hideBar();
 		this.showExtendHint();
 	}
 
@@ -4582,11 +2869,7 @@ export class ReaderView extends ItemView {
 			cls: "tmr-extend-hint tmr-hidden",
 			text: "Turn the page, then click where the highlight should end · Esc to cancel",
 		});
-		const { tmrMode, tmrTheme } = this.plugin.settings;
-		if (tmrMode === "3c") {
-			el.addClass("tmr-3c-mode");
-			el.setAttribute("data-tmr-theme", tmrTheme);
-		}
+		applyGlossTheme(el, this.plugin.settings);
 		this.extendHintEl = el;
 		return el;
 	}
@@ -4599,107 +2882,16 @@ export class ReaderView extends ItemView {
 		this.extendHintEl?.addClass("tmr-hidden");
 	}
 
-	/** Position a fixed-position floater (bar or input) relative to a selection
-	 *  rect, flipping below if above doesn't fit and clamping to the viewport. */
-	private positionFloater(el: HTMLElement, selectionRect: DOMRect): void {
-		el.setCssProps({ left: "0px", top: "0px" });
-		const rect = el.getBoundingClientRect();
-		const margin = 8;
-		const flipBelow = selectionRect.top < rect.height + margin + 16;
-		const top = flipBelow
-			? selectionRect.bottom + margin
-			: selectionRect.top - rect.height - margin;
-		const midX = selectionRect.left + selectionRect.width / 2;
-		const maxLeft = window.innerWidth - rect.width - 8;
-		const left = Math.max(8, Math.min(midX - rect.width / 2, maxLeft));
-		el.style.left = `${left}px`;
-		el.style.top = `${Math.max(8, top)}px`;
-	}
-
-	private showGlossBar(selectionRect: DOMRect, canExtend = false): void {
-		const bar = this.ensureGlossBar();
-		// Lite mode (no AI) collapses the bar to the Emphasise tile only.
-		bar.toggleClass("tmr-gloss-lite", !this.plugin.settings.aiFeaturesEnabled);
-		// Extend control only surfaces when the selection runs to the page end.
-		bar.toggleClass("tmr-gloss-can-extend", canExtend);
-		bar.removeClass("tmr-hidden");
-		this.positionFloater(bar, selectionRect);
-	}
-
-	private ensureGlossInput(): HTMLElement {
-		if (this.glossInputEl) return this.glossInputEl;
-		const panel = document.body.createEl("div", { cls: "tmr-gloss-input tmr-hidden" });
-		const input = panel.createEl("input", {
-			cls: "tmr-gloss-input-field",
-			attr: { type: "text" },
-		});
-		const submitBtn = panel.createEl("button", { cls: "tmr-gloss-input-submit" });
-		setIcon(submitBtn, "corner-down-left");
-		submitBtn.setAttribute("aria-label", "Submit annotation");
-		this.registerDomEvent(submitBtn, "mousedown", (e) => e.preventDefault());
-		this.registerDomEvent(submitBtn, "click", (e) => {
-			e.stopPropagation();
-			void this.onGlossSubmit();
-		});
-		this.registerDomEvent(input, "keydown", (e: KeyboardEvent) => {
-			if (e.key === "Enter") {
-				e.preventDefault();
-				e.stopPropagation();
-				void this.onGlossSubmit();
-			} else if (e.key === "Escape") {
-				e.preventDefault();
-				e.stopPropagation();
-				this.dismissGloss();
-			}
-		});
-		this.glossInputEl = panel;
-		this.syncGlossInputTheme();
-		return panel;
-	}
-
-	private syncGlossInputTheme(): void {
-		if (!this.glossInputEl) return;
-		const { tmrMode, tmrTheme } = this.plugin.settings;
-		if (tmrMode === "3c") {
-			this.glossInputEl.addClass("tmr-3c-mode");
-			this.glossInputEl.setAttribute("data-tmr-theme", tmrTheme);
-		} else {
-			this.glossInputEl.removeClass("tmr-3c-mode");
-			this.glossInputEl.removeAttribute("data-tmr-theme");
-		}
-	}
-
 	openGlossInput(modeId: string): void {
-		const mode = GLOSS_MODES.find((m) => m.id === modeId);
-		if (!mode) return;
 		if (!this.activeHighlight || !this.activeSelectionRect) return;
-		this.activeGlossMode = modeId;
-		this.glossBarEl?.addClass("tmr-hidden");
-		const panel = this.ensureGlossInput();
-		this.syncGlossInputTheme();
-		panel.dataset.glossMode = modeId;
-		const input = panel.querySelector<HTMLInputElement>(".tmr-gloss-input-field");
-		if (input) {
-			input.value = "";
-			input.placeholder = GLOSS_PLACEHOLDERS[modeId] ?? "";
-		}
-		panel.removeClass("tmr-hidden");
-		this.positionFloater(panel, this.activeSelectionRect);
-		input?.focus();
+		this.glossSurface.openInput(modeId, this.activeSelectionRect);
 	}
 
-	private async onGlossSubmit(): Promise<void> {
-		const mode = this.activeGlossMode;
+	/** A gloss tile was submitted. `text` is already trimmed and validated by the
+	 *  surface (only Emphasise may be empty). */
+	private async onGlossSubmit(mode: string, userText: string): Promise<void> {
 		const highlight = this.activeHighlight;
-		if (!mode || !highlight) return;
-		const input = this.glossInputEl?.querySelector(".tmr-gloss-input-field") as HTMLInputElement | null;
-		const userText = input?.value.trim() ?? "";
-		// Non-emphasise modes require at least some text. Emphasise-with-empty
-		// writes a bare colour-flagged callout (spec §Phase 2, Emphasise).
-		if (mode !== "emphasise" && userText.length === 0) {
-			input?.focus();
-			return;
-		}
+		if (!highlight) return;
 		const quote = this.activeSelectionText ?? "";
 		try {
 			await this.persistGloss(mode, userText, quote, highlight);
@@ -4713,16 +2905,12 @@ export class ReaderView extends ItemView {
 		// initial AI call is fired into the now-open chat's live log so the first
 		// turn streams token-by-token like every follow-up.
 		if (GLOSS_AI_MODES.has(mode)) {
-			if (!this.highlightsOpen) this.toggleHighlightsPanel();
-			this.setPaneTab("conversations");
+			if (!this.pane.isOpen) this.pane.toggle();
+			this.pane.setTab("conversations");
 			const idx = this.savedHighlights.length - 1;
-			this.openConversation(idx);
+			this.pane.openConversation(idx);
 			const saved = this.savedHighlights[idx];
-			if (saved) {
-				void this.doAiExchange(saved, this.activeConvLog).catch((err) =>
-					console.error("[ThirdMindReader] initial AI call failed", err),
-				);
-			}
+			if (saved) this.pane.runInitialExchange(saved);
 		}
 		this.dismissGloss();
 	}
@@ -4736,12 +2924,14 @@ export class ReaderView extends ItemView {
 		const path = this.getCompanionDocPath();
 		if (!path) return;
 		const callout = this.buildCallout(modeId, userText, quote, highlight);
-		const file = await this.ensureCompanionDoc(path);
+		const file = await ensureCompanionDoc(
+			this.app,
+			path,
+			this.book?.title ?? this.currentFile?.basename ?? "Book",
+			this.currentFile ? `[[${this.currentFile.path}]]` : "",
+		);
 		if (!file) return;
-		await this.app.vault.process(file, (existing) => {
-			const pad = existing.endsWith("\n\n") ? "" : existing.endsWith("\n") ? "\n" : "\n\n";
-			return existing + pad + callout + "\n";
-		});
+		await appendCallout(this.app, file, callout);
 
 		const chars = this.offsetMap.cursorRangeToChars(highlight);
 		const entry = this.offsetMap.get(highlight.paraId);
@@ -4785,7 +2975,7 @@ export class ReaderView extends ItemView {
 		} finally {
 			// Companion-doc existence is now resolved for this book — sync the
 			// note button (it may not exist yet for a never-annotated book).
-			this.updateCompanionDocButton();
+			this.pane.refreshCompanionDocButton();
 		}
 	}
 
@@ -4797,7 +2987,7 @@ export class ReaderView extends ItemView {
 		// Runs on every unit mount + after each annotation submit, so it's the
 		// natural place to refresh the note button once the first save creates
 		// the companion doc.
-		this.updateCompanionDocButton();
+		this.pane.refreshCompanionDocButton();
 		if (!this.contentNode) return;
 		this.contentNode.querySelectorAll(".tmr-saved-highlight-overlay").forEach((n) => n.remove());
 		if (this.savedHighlights.length === 0) return;
@@ -4841,7 +3031,7 @@ export class ReaderView extends ItemView {
 					if (r.width === 0 || r.height === 0) continue;
 					const rectEl = document.createElement("div");
 					rectEl.className = "tmr-saved-highlight-rect";
-					if (idx === this.activeConversationIdx) {
+					if (idx === this.pane.activeConversationIdx) {
 						rectEl.classList.add("tmr-saved-highlight-rect-active");
 					}
 					rectEl.dataset.mode = saved.mode;
@@ -4859,52 +3049,31 @@ export class ReaderView extends ItemView {
 
 	/** Hit-test the pointer against rendered highlight rects. On enter, surface
 	 *  a body-scoped preview with the annotation's user text; on exit, hide it.
-	 *  Tracks `hoveredHighlightIdx` so we don't thrash the DOM as the pointer
-	 *  moves across rects belonging to the same highlight. */
+	 *  The shared preview tracks its own index so the DOM isn't rebuilt as the
+	 *  pointer moves across rects belonging to the same highlight. */
 	private handleAnnotationHover(e: MouseEvent): void {
 		// Footnote refs, citations and links summon their own floater via the
 		// spread's mouseover handler — give that one priority instead of
 		// stacking the annotation preview beneath it (both fire when the ref
 		// sits inside a saved highlight's rect).
 		const hoverEl = e.target instanceof Element ? e.target : null;
-		if (hoverEl?.closest(".tmr-citation, a[href], [data-rid]")) {
-			if (this.hoveredHighlightIdx !== -1) this.hideAnnotationPreview();
-			return;
-		}
-		if (!this.contentNode || this.savedHighlights.length === 0) {
-			if (this.hoveredHighlightIdx !== -1) this.hideAnnotationPreview();
-			return;
-		}
-		const overlay = this.contentNode.querySelector(".tmr-saved-highlight-overlay");
-		if (!overlay) {
-			if (this.hoveredHighlightIdx !== -1) this.hideAnnotationPreview();
+		const overlay = this.contentNode?.querySelector(".tmr-saved-highlight-overlay");
+		if (
+			hoverEl?.closest(".tmr-citation, a[href], [data-rid]") ||
+			!overlay ||
+			this.savedHighlights.length === 0
+		) {
+			this.hideAnnotationPreview();
 			return;
 		}
 
-		const rects = overlay.querySelectorAll<HTMLElement>(".tmr-saved-highlight-rect");
-		let matchedIdx = -1;
-		for (const rectEl of Array.from(rects)) {
-			const r = rectEl.getBoundingClientRect();
-			if (e.clientX >= r.left && e.clientX <= r.right &&
-				e.clientY >= r.top  && e.clientY <= r.bottom) {
-				matchedIdx = parseInt(rectEl.dataset.highlightIdx ?? "-1", 10);
-				break;
-			}
-		}
-
-		if (matchedIdx === -1) {
-			if (this.hoveredHighlightIdx !== -1) this.hideAnnotationPreview();
+		const matchedIdx = hitTestHighlightRects(overlay, e.clientX, e.clientY);
+		const saved = matchedIdx === -1 ? null : this.savedHighlights[matchedIdx];
+		if (!saved) {
+			this.hideAnnotationPreview();
 			return;
 		}
-
-		const saved = this.savedHighlights[matchedIdx];
-		if (!saved) return;
-
-		if (matchedIdx !== this.hoveredHighlightIdx) {
-			this.hoveredHighlightIdx = matchedIdx;
-			this.populateAnnotationPreview(saved);
-		}
-		this.positionAnnotationPreview(e.clientX, e.clientY);
+		this.annotationPreview.showFor(matchedIdx, saved, e.clientX, e.clientY);
 	}
 
 	/** Hit-test the click against rendered highlight rects. If the pointer
@@ -4917,16 +3086,7 @@ export class ReaderView extends ItemView {
 		const overlay = this.contentNode.querySelector(".tmr-saved-highlight-overlay");
 		if (!overlay) return false;
 
-		const rects = overlay.querySelectorAll<HTMLElement>(".tmr-saved-highlight-rect");
-		let matchedIdx = -1;
-		for (const rectEl of Array.from(rects)) {
-			const r = rectEl.getBoundingClientRect();
-			if (e.clientX >= r.left && e.clientX <= r.right &&
-				e.clientY >= r.top  && e.clientY <= r.bottom) {
-				matchedIdx = parseInt(rectEl.dataset.highlightIdx ?? "-1", 10);
-				break;
-			}
-		}
+		const matchedIdx = hitTestHighlightRects(overlay, e.clientX, e.clientY);
 		if (matchedIdx === -1) return false;
 
 		const saved = this.savedHighlights[matchedIdx];
@@ -4937,154 +3097,25 @@ export class ReaderView extends ItemView {
 		// quick-settings toggle is on. Without it, expanding the card would
 		// not be visible — so respect that and bail.
 		if (
-			this.isBareFlaggedConversation(saved) &&
+			this.pane.isBareFlagged(saved) &&
 			!this.plugin.settings.showBareFlaggedConversations
 		) {
 			return false;
 		}
 
-		if (!this.highlightsOpen) this.toggleHighlightsPanel();
-		this.setPaneTab("conversations");
-		this.openConversation(matchedIdx);
+		if (!this.pane.isOpen) this.pane.toggle();
+		this.pane.setTab("conversations");
+		this.pane.openConversation(matchedIdx);
 		return true;
 	}
 
-	private ensureAnnotationPreview(): HTMLElement {
-		if (this.annotationPreviewEl) return this.annotationPreviewEl;
-		const el = document.body.createEl("div", {
-			cls: "tmr-annotation-preview tmr-hidden",
-		});
-		this.annotationPreviewEl = el;
-		this.syncAnnotationPreviewTheme();
-		return el;
-	}
-
-	private populateAnnotationPreview(saved: SavedHighlight): void {
-		const el = this.ensureAnnotationPreview();
-		el.empty();
-		el.dataset.glossMode = saved.mode;
-		el.createEl("div", { cls: "tmr-annotation-preview-mode",
-			text: saved.mode[0].toUpperCase() + saved.mode.slice(1) });
-
-		const CHARS = ReaderView.TOOLTIP_MAX_CHARS;
-		let body: string;
-		const isComplete = saved.aiState === "complete";
-
-		if ((saved.mode === "exclaim" || saved.mode === "enquiry") && isComplete && saved.turns.length > 0) {
-			// Conversation view: interleave You/AI turns until the char budget runs out.
-			const parts: string[] = [];
-			let used = 0;
-			for (const turn of saved.turns) {
-				const prefix = turn.role === "user" ? "You: " : "AI: ";
-				const content = turn.content
-					.replace(/\[\^[^\]]+\]:.*$/gm, "")
-					.replace(/\[\^[^\]]+\]/g, "")
-					.trim();
-				const sep = parts.length > 0 ? 2 : 0; // "\n\n" between turns
-				const available = CHARS - used - sep;
-				if (available <= 15) break;
-				if (prefix.length + content.length <= available) {
-					parts.push(prefix + content);
-					used += sep + prefix.length + content.length;
-				} else {
-					parts.push((prefix + content.slice(0, available - prefix.length)).trimEnd() + "…");
-					break;
-				}
-			}
-			body = parts.join("\n\n");
-		} else if (saved.mode === "explain" && isComplete) {
-			// Explain: show the first AI response only.
-			const first = saved.turns.find((t) => t.role === "assistant");
-			body = first
-				? first.content.replace(/\[\^[^\]]+\]:.*$/gm, "").replace(/\[\^[^\]]+\]/g, "").trim()
-				: "";
-			if (body.length > CHARS) body = body.slice(0, CHARS).trimEnd() + "…";
-		} else {
-			// Examine, Emphasise, or any mode with a pending/error AI state: show the user's note.
-			body = saved.userText.trim();
-		}
-
-		if (body.length > 0) {
-			const bodyEl = el.createEl("div", { cls: "tmr-annotation-preview-body" });
-			setInlineMarkdown(bodyEl, body);
-		} else {
-			const emptyText = GLOSS_AI_MODES.has(saved.mode) && isComplete
-				? "(no response)"
-				: "No note yet — add one from the Highlights panel";
-			el.createEl("div", { cls: "tmr-annotation-preview-body tmr-annotation-preview-empty", text: emptyText });
-		}
-
-		el.removeClass("tmr-hidden");
-	}
-
-	private positionAnnotationPreview(clientX: number, clientY: number): void {
-		const el = this.annotationPreviewEl;
-		if (!el) return;
-		const rect = el.getBoundingClientRect();
-		const margin = 12;
-		let x = clientX + 16;
-		let y = clientY + 18;
-		if (x + rect.width + margin > window.innerWidth) x = clientX - rect.width - 16;
-		if (y + rect.height + margin > window.innerHeight) y = clientY - rect.height - 18;
-		el.style.left = `${Math.max(margin, x)}px`;
-		el.style.top  = `${Math.max(margin, y)}px`;
-	}
-
 	private hideAnnotationPreview(): void {
-		this.hoveredHighlightIdx = -1;
-		this.annotationPreviewEl?.addClass("tmr-hidden");
-	}
-
-	private syncAnnotationPreviewTheme(): void {
-		const el = this.annotationPreviewEl;
-		if (!el) return;
-		const { tmrMode, tmrTheme } = this.plugin.settings;
-		if (tmrMode === "3c") {
-			el.addClass("tmr-3c-mode");
-			el.setAttribute("data-tmr-theme", tmrTheme);
-		} else {
-			el.removeClass("tmr-3c-mode");
-			el.removeAttribute("data-tmr-theme");
-		}
+		if (this.annotationPreview.hoveredIdx !== -1) this.annotationPreview.hide();
 	}
 
 	private getCompanionDocPath(): string | null {
 		if (!this.book && !this.currentFile) return null;
 		return companionDocPath(this.book?.title || this.currentFile?.basename || "Book");
-	}
-
-	/** Resolve the companion doc's `TFile`, creating doc (and folder) on first
-	 *  use. Null only if creation fails outright. */
-	private async ensureCompanionDoc(path: string): Promise<TFile | null> {
-		const existing = this.app.vault.getFileByPath(path);
-		if (existing) return existing;
-		const folder = path.substring(0, path.lastIndexOf("/"));
-		if (folder && !this.app.vault.getFolderByPath(folder)) {
-			try {
-				await this.app.vault.createFolder(folder);
-			} catch {
-				// Folder may have been created in a parallel call — re-check below.
-			}
-		}
-		const title = this.book?.title ?? this.currentFile?.basename ?? "Book";
-		const sourceLink = this.currentFile ? `[[${this.currentFile.path}]]` : "";
-		const frontmatter = [
-			"---",
-			`title: "${title.replace(/"/g, '\\"')}"`,
-			`source: ${sourceLink}`,
-			"tags: [annotations, third-mind-reader]",
-			`created: ${new Date().toISOString()}`,
-			"---",
-			"",
-			`# ${title} — Annotations`,
-			"",
-		].join("\n");
-		try {
-			return await this.app.vault.create(path, frontmatter);
-		} catch {
-			// Doc may have been created in a parallel call — re-resolve.
-			return this.app.vault.getFileByPath(path);
-		}
 	}
 
 	private buildCallout(
@@ -5099,9 +3130,7 @@ export class ReaderView extends ItemView {
 		const sectionIdx = this.sectionIndexBySpine[spineIdx] ?? 0;
 		const sectionLabel = this.sections[sectionIdx]?.label ?? "";
 
-		const snippet = quote.replace(/\s+/g, " ").trim();
-		const snippetShort = snippet.length > 48 ? snippet.slice(0, 48).trim() + "…" : snippet;
-		const header = [snippetShort, sectionLabel, `¶${paraIdx}`].filter(Boolean).join(" · ");
+		const header = calloutHeader(quote, sectionLabel, `¶${paraIdx}`);
 
 		// CFI-style anchor: absolute char offsets within the paragraph's text
 		// (segment-agnostic) + a URL-encoded text prefix for drift recovery.
@@ -5126,21 +3155,7 @@ export class ReaderView extends ItemView {
 				`chars:${chars.startChar},${chars.endChar} prefix:"${prefix}" -->`;
 		}
 
-		const lines: string[] = [];
-		lines.push(`> [!${modeId}]- ${header}`);
-		lines.push(`> ${anchor}`);
-		if (quote.length > 0) {
-			for (const ql of quote.split(/\r?\n/)) lines.push(`> > ${ql}`);
-		}
-		if (userText.length > 0) {
-			lines.push(">");
-			for (const ul of userText.split(/\r?\n/)) lines.push(`> ${ul}`);
-		}
-		if (GLOSS_AI_MODES.has(modeId)) {
-			lines.push(">");
-			lines.push("> <!-- ai response pending -->");
-		}
-		return lines.join("\n");
+		return buildCallout({ modeId, header, anchor, quote, userText });
 	}
 
 	private renderHighlightOverlay(cursorRange: CursorRange): void {
@@ -5174,9 +3189,7 @@ export class ReaderView extends ItemView {
 	}
 
 	private dismissGloss(): void {
-		this.glossBarEl?.addClass("tmr-hidden");
-		this.glossInputEl?.addClass("tmr-hidden");
-		this.activeGlossMode = null;
+		this.glossSurface.hide();
 		this.activeSelectionText = null;
 		this.activeSelectionRect = null;
 		// Tear down any armed extend (Escape-cancel, outside-click, or a unit
@@ -5194,11 +3207,7 @@ export class ReaderView extends ItemView {
 		if (this.tooltipEl) return this.tooltipEl;
 		const el = document.body.createEl("div", { cls: "tmr-tooltip tmr-hidden" });
 		this.tooltipEl = el;
-		const { tmrMode, tmrTheme } = this.plugin.settings;
-		if (tmrMode === "3c") {
-			el.addClass("tmr-3c-mode");
-			el.setAttribute("data-tmr-theme", tmrTheme);
-		}
+		applyGlossTheme(el, this.plugin.settings);
 		return el;
 	}
 
@@ -5555,6 +3564,10 @@ export default class ThirdMindReader extends Plugin {
 	 *  a single Library re-scan. */
 	private _libraryRefreshTimer: number | null = null;
 
+	/** PDF Gloss manager — desktop only, absent when the platform gate declines.
+	 *  Held so settings changes and the pane command can reach attached PDFs. */
+	private pdfGloss: PdfGlossManager | null = null;
+
 	async onload(): Promise<void> {
 		await this.loadSettings();
 		// Obsidian's bundled Lucide set predates `book-search` — register the
@@ -5578,23 +3591,75 @@ export default class ThirdMindReader extends Plugin {
 		// install. Non-blocking — failure just falls back to lazy creation.
 		void this.ensureLibraryFolder();
 
-		// Intercept epub clicks in the file explorer so they always open in a
-		// new tab instead of replacing the active leaf (mirrors Cmd+Click).
+		// Intercept epub clicks so a book always lands in its own tab instead of
+		// replacing the active leaf (mirrors Cmd+Click). Two sources: the file
+		// explorer, and internal links inside notes — `.internal-link[data-href]`
+		// covers reading-view anchors and the rendered `source:` property link on
+		// every companion doc, which is the link a reader actually clicks.
 		// Runs in capture phase so it fires before Obsidian's own click handler.
+		// Modified clicks fall through untouched: Cmd/Alt/Shift already carry
+		// their own destination (new tab, split, window) and shouldn't be hijacked.
 		this.registerDomEvent(document, "click", (e: MouseEvent) => {
-			if (e.button !== 0) return;
-			const fileTitle = (e.target as Element).closest<HTMLElement>(".nav-file-title");
-			if (!fileTitle) return;
-			const path =
-				fileTitle.dataset.path ??
-				fileTitle.closest<HTMLElement>(".nav-file")?.dataset.path;
-			if (!path?.endsWith(".epub")) return;
+			if (e.button !== 0 || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+			const target = e.target as Element;
+			const fileTitle = target.closest<HTMLElement>(".nav-file-title");
+			// `a[data-href]` is deliberately narrow — the reader's own ToC rows are
+			// `div[data-href]` carrying epub-internal hrefs, not vault paths.
+			const link = target.closest<HTMLElement>(".internal-link[data-href], a[data-href]");
+			const href =
+				fileTitle?.dataset.path ??
+				fileTitle?.closest<HTMLElement>(".nav-file")?.dataset.path ??
+				link?.dataset.href;
+			if (!href) return;
+			// Drop any `#heading` / `^block` subpath before the extension test.
+			const linkpath = getLinkpath(href);
+			if (!linkpath.endsWith(".epub")) return;
+			const file = this.app.metadataCache.getFirstLinkpathDest(
+				linkpath,
+				this.app.workspace.getActiveFile()?.path ?? "",
+			);
+			if (!(file instanceof TFile)) return;
+			e.preventDefault();
 			e.stopImmediatePropagation();
-			const file = this.app.vault.getAbstractFileByPath(path);
-			if (file instanceof TFile) void this.openEpubInNewTab(file.path);
+			void this.openEpubInNewTab(file.path);
 		}, { capture: true });
 
 		this.registerVaultEvents();
+
+		// PDF Gloss: augment Obsidian's native PDF viewer with the same GlossBar.
+		// Desktop-only for now (mobile PDF belongs to the Phase 5.5 track), and
+		// internally feature-gated — an unrecognised viewer simply stays native.
+		if (Platform.isDesktopApp) {
+			this.pdfGloss = new PdfGlossManager(
+				this.app, () => this.settings, () => this.saveSettings(),
+			);
+			this.addChild(this.pdfGloss);
+		}
+
+		this.app.workspace.onLayoutReady(() => void this.repairCompanionSourceLinks());
+	}
+
+	/** Companion docs created before 2026-07-24 wrote `source:` unquoted, which
+	 *  YAML parses as a nested list — the wikilink never resolved, so the note
+	 *  had no graph edge to its book. Quote the value wherever the old form
+	 *  survives. Runs each load; no-ops once every doc is migrated. */
+	private async repairCompanionSourceLinks(): Promise<void> {
+		const folder = this.app.vault.getFolderByPath(LIBRARY_ROOT + "/Annotations");
+		if (!folder) return;
+		for (const child of folder.children) {
+			if (!(child instanceof TFile) || child.extension !== "md") continue;
+			try {
+				const content = await this.app.vault.cachedRead(child);
+				const fmEnd = content.indexOf("\n---", 4);
+				if (!content.startsWith("---\n") || fmEnd === -1) continue;
+				if (!/^source: \[\[.*\]\][ \t]*$/m.test(content.slice(0, fmEnd))) continue;
+				await this.app.vault.process(child, (doc) =>
+					doc.replace(/^source: (\[\[.*\]\])[ \t]*$/m, 'source: "$1"'),
+				);
+			} catch (err) {
+				console.error("[ThirdMindReader] source-link repair failed", child.path, err);
+			}
+		}
 	}
 
 	/** Create the `Library/` root on load if it's missing, so a fresh install
@@ -5738,6 +3803,24 @@ export default class ThirdMindReader extends Plugin {
 			},
 		});
 		this.addCommand({
+			// No default hotkey: `h` toggles it from inside the reader and from a
+			// PDF (both view-scoped keydown listeners); the command exists so the
+			// pane is reachable by a bindable combo, and it is the only affordance
+			// users of a customised PDF toolbar may have.
+			id: "toggle-highlights-pane",
+			name: "Toggle highlights & annotations pane",
+			checkCallback: (checking) => {
+				const reader = this.activeReaderView();
+				const pdf = this.pdfGloss?.activeController() ?? null;
+				if (!reader && !pdf) return false;
+				if (!checking) {
+					if (reader) reader.toggleHighlightsPane();
+					else pdf?.togglePane();
+				}
+				return true;
+			},
+		});
+		this.addCommand({
 			// No default hotkey: 3C-mode toggling is the least-used reader action
 			// and Shift+Mod+3 clashes with the macOS screenshot shortcut. Exposed
 			// for users to bind to a combo of their choosing.
@@ -5872,6 +3955,7 @@ export default class ThirdMindReader extends Plugin {
 			const view = leaf.view;
 			if (view instanceof LibraryView) view.applyThemeClasses();
 		});
+		this.pdfGloss?.applySettings();
 	}
 
 	/** Open (or reveal) the Library home view. Replaces the old `activateView`,
