@@ -29,7 +29,17 @@ export interface ChatMessage {
 export interface ChatRequest {
 	messages: ChatMessage[];
 	systemPrompt?: string;
+	/** Ceiling on the **answer**, not on the whole generation. Transports that
+	 *  bill hidden reasoning to the same budget add `reasoningTokens` on top, so
+	 *  a caller asking for 512 always gets 512 tokens of prose to spend. */
 	maxTokens?: number;
+	/** Headroom for hidden reasoning, on top of `maxTokens`. Reasoning models
+	 *  emit their chain of thought into the same completion budget as the
+	 *  answer, so a single cap makes brevity and deliberation compete: the model
+	 *  thinks, runs out, and returns a truncated answer — or none at all. This
+	 *  splits them: an allowance added on top, with how hard to think left to
+	 *  the model. See `applyTokenBudget` for why it isn't capped explicitly. */
+	reasoningTokens?: number;
 	/** Request a token-by-token stream. Only honoured for openai-compatible
 	 *  providers (local servers like LM Studio / Ollama, which permit a direct
 	 *  browser `fetch`); anthropic/openai cloud kinds ignore it and return a
@@ -173,6 +183,11 @@ export async function probeModelLoaded(
 	if (provider.kind !== "openai-compatible") return null;
 	const endpoint = endpointFor(provider);
 	if (!endpoint) return null;
+	// "Is the model resident?" is a question only a server you control can
+	// answer — these are LM Studio's and Ollama's own endpoints. Against a
+	// hosted service both 404, so asking costs two wasted requests per exchange,
+	// which on a rate-limited free tier is not free at all.
+	if (!isLocalEndpoint(endpoint)) return null;
 	const rt = provider.localRuntime;
 	if (rt === "ollama") return probeOllamaLoaded(endpoint, model);
 	if (rt === "lm-studio") return probeLmStudioLoaded(endpoint, provider.apiKey, model);
@@ -251,6 +266,11 @@ async function chatAnthropic(
 	if (!provider.apiKey) throw new Error("Anthropic API key not configured");
 	const body: Record<string, any> = {
 		model,
+		// No `reasoningTokens` headroom: extended thinking is opt-in on this API
+		// and we never send the `thinking` block, so the whole budget is answer.
+		// If thinking is ever enabled here it must become
+		// `maxTokens + reasoningTokens`, with `budget_tokens: reasoningTokens` —
+		// Anthropic requires the thinking budget to fit inside `max_tokens`.
 		max_tokens: req.maxTokens ?? 1024,
 		// Anthropic's messages API accepts only user/assistant roles; system
 		// content goes in the top-level `system` field. Callers shouldn't
@@ -285,6 +305,30 @@ async function chatAnthropic(
 	return { content, raw: json };
 }
 
+/** Write `max_tokens` (and, where supported, an explicit reasoning cap) onto an
+ *  OpenAI-shaped request body.
+ *
+ *  Every provider in this file bills hidden reasoning tokens against the same
+ *  completion budget as the answer — Anthropic's `budget_tokens` must fit
+ *  inside `max_tokens`, and OpenAI/OpenRouter count reasoning as completion
+ *  tokens — so a single cap is not a length control, it's a race between
+ *  thinking and answering that the answer loses. The budget is therefore
+ *  additive here, and brevity is left to the system prompts, which ask for it
+ *  directly and can shorten prose instead of truncating it mid-sentence.
+ *
+ *  Deliberately does NOT send OpenRouter's `reasoning.max_tokens`. Models that
+ *  expose effort levels rather than a token budget (gpt-oss, and most of the
+ *  open-weight reasoning set) have it mapped onto an effort level, and measured
+ *  against gpt-oss-20b a 1024-token budget mapped *below* the model's own
+ *  default — 60 reasoning tokens against 98 unconstrained. Capping reasoning
+ *  bought nothing and quietly made the model think less than it would have on
+ *  its own. The headroom alone is the whole fix: leave effort to the model and
+ *  make sure there are tokens left for the answer afterwards. */
+function applyTokenBudget(req: ChatRequest, body: Record<string, any>): void {
+	if (!req.maxTokens) return;
+	body.max_tokens = req.maxTokens + (req.reasoningTokens ?? 0);
+}
+
 async function chatOpenAILike(
 	provider: AiProvider,
 	model: string,
@@ -298,7 +342,7 @@ async function chatOpenAILike(
 		model,
 		messages: messages.map(m => ({ role: m.role, content: m.content })),
 	};
-	if (req.maxTokens) body.max_tokens = req.maxTokens;
+	applyTokenBudget(req, body);
 
 	const headers: Record<string, string> = { "content-type": "application/json" };
 	if (provider.apiKey) headers["Authorization"] = `Bearer ${provider.apiKey}`;
@@ -314,7 +358,20 @@ async function chatOpenAILike(
 		throw new Error(`${provider.kind} ${res.status}: ${truncate(res.text)}`);
 	}
 	const json = res.json as OpenAIChatResponse;
-	const content = json.choices?.[0]?.message?.content ?? "";
+	const choice = json.choices?.[0];
+	const content = choice?.message?.content ?? "";
+	// A 200 with no text is not success. Reasoning models (gpt-oss, nemotron)
+	// spend `max_tokens` on hidden reasoning first and return `content: null`
+	// with `finish_reason: "length"` when the budget runs out — which would
+	// otherwise be written into the callout as a blank, "complete" answer.
+	if (!content.trim()) {
+		const why = (choice as { finish_reason?: string })?.finish_reason;
+		throw new Error(
+			why === "length"
+				? "Model returned no text — the token budget went to reasoning. Try a non-reasoning model."
+				: `Model returned an empty response${why ? ` (${why})` : ""}.`,
+		);
+	}
 	return { content, raw: json };
 }
 
@@ -341,7 +398,7 @@ async function chatOpenAILikeStreaming(
 		messages: messages.map(m => ({ role: m.role, content: m.content })),
 		stream: true,
 	};
-	if (req.maxTokens) body.max_tokens = req.maxTokens;
+	applyTokenBudget(req, body);
 
 	const headers: Record<string, string> = { "content-type": "application/json" };
 	if (provider.apiKey) headers["Authorization"] = `Bearer ${provider.apiKey}`;
@@ -406,7 +463,69 @@ async function chatOpenAILikeStreaming(
 		}
 	}
 
+	// Same guard as the buffered path: a stream that carried only reasoning
+	// deltas and no content is a failure, not a blank answer.
+	if (!content.trim()) throw new Error("Model returned an empty response.");
 	return { content, raw: lastRaw };
+}
+
+/** Is this endpoint a model server on the machine (or the network) rather than
+ *  a hosted service?
+ *
+ *  `openai-compatible` names a *wire format*, not a location — LM Studio, a LAN
+ *  desktop, OpenRouter and Groq all speak it. Several behaviours only make sense
+ *  for a server you control (probing which model is resident, expecting no auth),
+ *  and they used to key off the kind, which quietly assumed local. Derive it from
+ *  the URL instead: no extra state to persist, and it stays correct for a LAN
+ *  address, which is equally "yours" and equally not localhost.
+ *
+ *  Private-network ranges per RFC 1918 + loopback + `.local` mDNS names. A
+ *  hostname we can't parse is treated as remote: the conservative direction,
+ *  since the cost of being wrong is a skipped optimisation rather than a
+ *  pointless request to somebody else's server. */
+export function isLocalEndpoint(endpoint: string | undefined): boolean {
+	if (!endpoint) return false;
+	let host: string;
+	try {
+		host = new URL(endpoint).hostname.toLowerCase();
+	} catch {
+		return false;
+	}
+	if (host === "localhost" || host.endsWith(".local")) return true;
+	if (host === "::1" || host === "[::1]") return true;
+	if (/^127\./.test(host)) return true;
+	if (/^10\./.test(host)) return true;
+	if (/^192\.168\./.test(host)) return true;
+	// 172.16.0.0 – 172.31.255.255
+	return /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+}
+
+/** Pick a model ID for the given provider + mode, falling back to sensible
+ *  per-kind defaults when `provider.defaultModel` is unset. Lives beside the
+ *  client because the Highlights pane and the deferred-queue processor both
+ *  resolve models, and a second copy would drift from these defaults. */
+/** The answer-length and thinking allowances for one gloss mode.
+ *
+ *  Explain is the terse one by design; the others are given room for prose.
+ *  These are ceilings that stop a runaway, not the lever for brevity — the
+ *  system prompts do that, and a prompt shortens an answer where a low ceiling
+ *  merely cuts it off. The reasoning allowance is uniform: how hard a question
+ *  is to think about has little to do with how long its answer should be. */
+export function tokenBudget(mode: string): { maxTokens: number; reasoningTokens: number } {
+	return { maxTokens: mode === "explain" ? 512 : 1024, reasoningTokens: 1024 };
+}
+
+/** The model a newly-added provider starts on, so it works without a trip to
+ *  the model browser. Empty for openai-compatible: the model list there is
+ *  whatever the user's server or gateway happens to serve, and no id we could
+ *  hardcode would be right — the presets that *do* know (OpenRouter) set
+ *  `defaultModel` themselves.
+ *
+ *  Also used to backfill providers saved before `defaultModel` was mandatory. */
+export function starterModel(kind: ProviderKind): string {
+	if (kind === "anthropic") return "claude-haiku-4-5-20251001";
+	if (kind === "openai") return "gpt-4o-mini";
+	return "";
 }
 
 function endpointFor(provider: AiProvider): string {

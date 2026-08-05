@@ -24,6 +24,7 @@ import {
 	buildCallout,
 	calloutHeader,
 	ensureCompanionDoc,
+	getSafeViewport,
 	hitTestHighlightRects,
 	isTextInputFocused,
 	parseSavedHighlights,
@@ -472,10 +473,11 @@ export class PdfGlossController extends Component {
 		tip.removeClass("tmr-hidden");
 		// Clamp to the viewport the same way the reader's tooltip does.
 		const rect = tip.getBoundingClientRect();
-		const x = Math.min(e.clientX + 14, window.innerWidth - rect.width - 16);
-		const y = Math.min(e.clientY + 18, window.innerHeight - rect.height - 16);
-		tip.style.left = `${Math.max(16, x)}px`;
-		tip.style.top = `${Math.max(16, y)}px`;
+		const safe = getSafeViewport();
+		const x = Math.min(e.clientX + 14, safe.right - rect.width - 16);
+		const y = Math.min(e.clientY + 18, safe.bottom - rect.height - 16);
+		tip.style.left = `${Math.max(safe.left + 16, x)}px`;
+		tip.style.top = `${Math.max(safe.top + 16, y)}px`;
 	}
 
 	private hideCitationTooltip(): void {

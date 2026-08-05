@@ -3,7 +3,11 @@ import { defineConfig } from "eslint/config";
 import obsidianmd from "eslint-plugin-obsidianmd";
 
 export default defineConfig([
-	{ ignores: ["main.js", "node_modules/**", "esbuild.config.mjs", "fonts/**"] },
+	// `scripts/` holds build tooling that runs under Node, not plugin code that
+	// ships to users — console output there is the point, so the Obsidian plugin
+	// rules (no-console chief among them) don't apply. Same reasoning as
+	// esbuild.config.mjs above it.
+	{ ignores: ["main.js", "node_modules/**", "esbuild.config.mjs", "scripts/**", "fonts/**"] },
 	...obsidianmd.configs.recommended,
 	{
 		files: ["**/*.ts"],

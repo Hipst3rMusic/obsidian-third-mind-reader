@@ -20,6 +20,7 @@ import {
 	MarkdownRenderer,
 	Menu,
 	Notice,
+	Platform,
 	SuggestModal,
 	TFile,
 	setIcon,
@@ -29,6 +30,7 @@ import {
 	chat,
 	probeModelLoaded,
 	probeProvider,
+	tokenBudget,
 	type AiProvider,
 	type ChatMessage,
 } from "./ai-client";
@@ -36,8 +38,11 @@ import {
 	GLOSS_AI_MODES,
 	GLOSS_MODES,
 	GLOSS_PLACEHOLDERS,
-	SOURCE_LINK_RE,
 	applyGlossTheme,
+	existingSourceLink,
+	findCalloutBounds,
+	rewriteCalloutBody,
+	setAiPendingCount,
 	type ConversationTurn,
 	type GlossHostSettings,
 	type SavedHighlight,
@@ -99,6 +104,8 @@ export interface HighlightsPaneSettings extends GlossHostSettings {
 	aiDefaults: { primaryProviderId: string | null };
 	streaming: boolean;
 	showBareFlaggedConversations: boolean;
+	/** Mobile only: force every AI submission into the deferred queue. */
+	deferAiToDesktop: boolean;
 	systemPrompts: Record<AiPromptMode, string>;
 	/** Per-document record; only `pane` is the pane's business. Keyed by vault
 	 *  path, shared with the reader's position store. */
@@ -189,6 +196,18 @@ export interface HighlightsPaneHost {
 	onPanelToggle(open: boolean): void;
 	/** Drag-to-resize wiring — the host owns the geometry constraints. */
 	makeResizable(panel: HTMLElement, edge: "left" | "right"): void;
+}
+
+/** Pending with no live phase = nobody is calling anything: the callout is a
+ *  queue entry waiting for a desktop session (Mobile spec, Tier 1). `livePhase`
+ *  exists only for the duration of a real request, so it is the discriminator
+ *  between "queued" and "in flight" without a second stored state. */
+function isQueued(saved: SavedHighlight): boolean {
+	return saved.aiState === "pending" && !saved.livePhase;
+}
+
+function queuedLabel(): string {
+	return Platform.isMobile ? "Queued — processes on desktop" : "Queued";
 }
 
 /** User-facing label for a pre-token live-exchange phase (the animated dots are
@@ -976,6 +995,7 @@ export class HighlightsPane extends Component {
 	 *  `aiState` and the first assistant turn (if any). Returns "" when the
 	 *  card should render title-only (bare Phase 2 reactions with no AI). */
 	private conversationPreviewText(saved: SavedHighlight, firstAssistant?: ConversationTurn): string {
+		if (isQueued(saved)) return queuedLabel();
 		if (saved.aiState === "pending") return "Awaiting response…";
 		if (saved.aiState === "error")   return `Failed: ${saved.aiError ?? "model unreachable"}`;
 		return firstAssistant?.content.trim() ?? "";
@@ -1166,7 +1186,15 @@ export class HighlightsPane extends Component {
 			}
 		}
 		if (this.convLogSeq.get(log) !== seq) return;
-		if (saved.aiState === "pending") {
+		if (isQueued(saved)) {
+			// Static, not the animated indicator: nothing is happening, and
+			// three bouncing dots would promise otherwise.
+			const wrap = log.createEl("div", { cls: "tmr-conv-turn-ai-wrap" });
+			wrap.createEl("div", {
+				cls: "tmr-conv-turn-ai-bubble tmr-turn-queued",
+				text: queuedLabel(),
+			});
+		} else if (saved.aiState === "pending") {
 			const phase = saved.livePhase ?? "thinking";
 			if (phase === "streaming") {
 				// Live token stream — plain text while arriving; renderAssistant-
@@ -1282,6 +1310,35 @@ export class HighlightsPane extends Component {
 		);
 	}
 
+	/** Should this exchange be queued for a desktop session instead of called?
+	 *
+	 *  Mobile only, and either because there is nothing to call (no provider, or
+	 *  one with no model for this mode) or because the user asked for it. On
+	 *  desktop a missing provider stays an *error* — there is no later session
+	 *  to defer to, so silently queueing would just look like nothing happened. */
+	private shouldQueueAi(provider: AiProvider | null): boolean {
+		if (!Platform.isMobile) return false;
+		if (this.host.settings().deferAiToDesktop) return true;
+		// Only "there is nothing to call". A provider that exists but resolves
+		// no model is *misconfigured*, not absent — queueing that would answer a
+		// settings mistake with "Queued — processes on desktop" and the user
+		// would never learn what was wrong. It falls through to the explicit
+		// "No model configured" error instead, same as desktop.
+		return !provider;
+	}
+
+	/** Rewrite the companion doc's pending-count hint from the live parse.
+	 *  Public because the host writes the *first* pending marker itself, when a
+	 *  fresh AI annotation is appended — without this the doc could carry a
+	 *  marker and no hint if the session ended before the exchange resolved. */
+	async syncAiPendingFlag(): Promise<void> {
+		const path = this.host.companionDocPath();
+		const file = path ? this.app.vault.getFileByPath(path) : null;
+		if (!file) return;
+		const count = this.saved.filter((h) => h.aiState === "pending").length;
+		await setAiPendingCount(this.app, file, count);
+	}
+
 	/** Core AI exchange: sends turns to the provider, writes the assistant
 	 *  turn (or error) back into `saved`, patches the companion doc, and
 	 *  refreshes the conversations list.
@@ -1305,6 +1362,24 @@ export class HighlightsPane extends Component {
 		await this.patchCalloutInDoc(saved);
 
 		const provider = this.getActiveProvider();
+
+		// Tier 1 deferred queue. The callout has just been written with the user
+		// turn and a pending marker, which *is* the queue entry — so queueing is
+		// the absence of a call, not an extra write. One branch here covers both
+		// entry points (opener and follow-up) because they both funnel through
+		// this method, and the transcript parser reconstructs turn history either
+		// way, so a queued continuation is indistinguishable from a queued
+		// opener when the desktop picks it up.
+		if (this.shouldQueueAi(provider)) {
+			saved.aiState = "pending";
+			delete saved.livePhase; delete saved.streamingText;
+			if (log) { await this.renderConversationLog(log, saved); log.scrollTop = log.scrollHeight; }
+			await this.syncAiPendingFlag();
+			if (this.paneTab === "conversations") this.renderConversationsList();
+			new Notice("Queued — processes on desktop.");
+			return;
+		}
+
 		if (!provider) {
 			saved.aiState = "error";
 			saved.aiError = "No AI provider configured — open plugin settings.";
@@ -1314,7 +1389,7 @@ export class HighlightsPane extends Component {
 			if (this.paneTab === "conversations") this.renderConversationsList();
 			return;
 		}
-		const model = this.resolveModel(provider, saved.mode);
+		const model = provider.defaultModel;
 		if (!model) {
 			saved.aiState = "error";
 			saved.aiError = "No model configured for this provider.";
@@ -1362,7 +1437,7 @@ export class HighlightsPane extends Component {
 			const res = await chat(provider, model, {
 				messages,
 				systemPrompt: this.host.buildAiSystemPrompt(saved),
-				maxTokens: saved.mode === "explain" ? 512 : 1024,
+				...tokenBudget(saved.mode),
 				stream: useStreaming,
 				signal: abort.signal,
 				onResponseStart: () => {
@@ -1413,19 +1488,6 @@ export class HighlightsPane extends Component {
 		if (this.paneTab === "conversations") this.renderConversationsList();
 	}
 
-	/** Pick a model ID for the given provider + mode, falling back to sensible
-	 *  per-kind defaults when `provider.defaultModel` is unset. */
-	private resolveModel(provider: AiProvider, mode: string): string {
-		if (provider.defaultModel) return provider.defaultModel;
-		if (provider.kind === "anthropic") {
-			return mode === "explain" ? "claude-haiku-4-5-20251001" : "claude-sonnet-4-6";
-		}
-		if (provider.kind === "openai") {
-			return mode === "explain" ? "gpt-4o-mini" : "gpt-4o";
-		}
-		return "";
-	}
-
 	private getActiveProvider(): AiProvider | null {
 		const s = this.host.settings();
 		const primary = s.aiProviders.find((p) => p.id === s.aiDefaults.primaryProviderId);
@@ -1444,122 +1506,16 @@ export class HighlightsPane extends Component {
 			// callouts carry a free-text note in `userText` instead.
 			await this.app.vault.process(file, (doc) =>
 				GLOSS_AI_MODES.has(saved.mode)
-					? this.rewriteCalloutBody(doc, saved)
+					? rewriteCalloutBody(doc, saved)
 					: this.rewriteEmphasiseNote(doc, saved),
 			);
+			// Every durable state change funnels through here, so this is the one
+			// place the discovery hint has to be kept honest — including the
+			// resolutions, which is what lets the flag clear itself.
+			if (GLOSS_AI_MODES.has(saved.mode)) await this.syncAiPendingFlag();
 		} catch (err) {
 			console.error("[ThirdMindReader] patchCalloutInDoc failed", err);
 		}
-	}
-
-	/** The anchor-comment substrings that identify one saved highlight uniquely.
-	 *  Two shapes, because the two sources anchor differently: an EPUB entry is
-	 *  `para:` (+ a `chars:` disambiguator when several marks share a paragraph),
-	 *  a PDF entry is `pdfPage:` + `pdfSel:`. Getting this wrong is silent — the
-	 *  rewriters simply fail to find the callout and return the doc untouched. */
-	private anchorTokens(saved: SavedHighlight): string[] {
-		if (saved.pdfPage !== undefined && saved.pdfSel) {
-			return [`pdfPage:${saved.pdfPage}`, `pdfSel:${saved.pdfSel.join(",")}`];
-		}
-		// Cross-para anchors store the `chars:S,-1` sentinel in the doc; the real
-		// end offset lives in `endChars:` (folded into saved.endChar on parse).
-		const charsToken = saved.startChar >= 0
-			? (saved.endParaIdHint
-				? `chars:${saved.startChar},-1`
-				: `chars:${saved.startChar},${saved.endChar}`)
-			: null;
-		return charsToken
-			? [`para:${saved.paraIdHint}`, charsToken]
-			: [`para:${saved.paraIdHint}`];
-	}
-
-	/** Locate a single callout in `lines` by its anchor comment. Returns the
-	 *  header line index (`> [!mode]`), the anchor comment line index, and the
-	 *  exclusive end index (first line past the callout body). Null when the
-	 *  callout cannot be found. Shared by the body rewriters and the delete path. */
-	private findCalloutBounds(
-		lines: string[],
-		saved: SavedHighlight,
-	): { startIdx: number; anchorIdx: number; endIdx: number } | null {
-		// Tokens must end at a field boundary. Anchor fields are space-separated,
-		// so a bare `includes` would let `pdfSel:2,0,4,5` match a *different*
-		// mark's `pdfSel:2,0,4,50` and rewrite the wrong callout.
-		const tokens = this.anchorTokens(saved).map(
-			(t) => new RegExp(t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(?=\\s)"),
-		);
-		let anchorIdx = -1;
-		for (let i = 0; i < lines.length; i++) {
-			const line = lines[i];
-			if (!tokens.every((t) => t.test(line))) continue;
-			if (/<!--\s*tmr-anchor/.test(line)) { anchorIdx = i; break; }
-		}
-		if (anchorIdx === -1) return null;
-
-		// Header is the nearest `> [!mode]` line at or above the anchor.
-		let startIdx = anchorIdx;
-		while (startIdx > 0 && !/^>\s*\[!/.test(lines[startIdx])) startIdx--;
-
-		// End of the callout: first line not starting with `>` (or the next
-		// callout header).
-		let endIdx = anchorIdx + 1;
-		while (endIdx < lines.length) {
-			if (!/^>/.test(lines[endIdx])) break;
-			if (/^>\s*\[!/.test(lines[endIdx])) break;
-			endIdx++;
-		}
-		return { startIdx, anchorIdx, endIdx };
-	}
-
-	/** The callout's existing interop deep-link line, if it has one. The
-	 *  rewriters rebuild the body from the model, and the link is the one piece
-	 *  that lives only in the doc — carried through verbatim rather than
-	 *  reconstructed, since only the PDF child can mint it. */
-	private existingSourceLink(lines: string[], anchorIdx: number, endIdx: number): string | null {
-		for (let i = anchorIdx + 1; i < endIdx; i++) {
-			const stripped = lines[i].replace(/^>\s?/, "").trim();
-			if (SOURCE_LINK_RE.test(stripped)) return lines[i];
-		}
-		return null;
-	}
-
-	/** Rewrite the body lines of a single callout (from anchor line to the
-	 *  first non-`>` line) to reflect `saved.turns` and `saved.aiState`. */
-	private rewriteCalloutBody(doc: string, saved: SavedHighlight): string {
-		const lines = doc.split("\n");
-		const bounds = this.findCalloutBounds(lines, saved);
-		if (!bounds) return doc;
-		const { anchorIdx, endIdx } = bounds;
-
-		// Rebuild body: source quote → deep link → turns → state marker.
-		const body: string[] = [];
-		if (saved.quote.trim()) {
-			for (const ql of saved.quote.split("\n")) body.push(`> > ${ql}`);
-		}
-		const sourceLink = this.existingSourceLink(lines, anchorIdx, endIdx);
-		if (sourceLink) body.push(sourceLink);
-		for (const turn of saved.turns) {
-			const prefix = turn.role === "user" ? "User" : "AI";
-			const contentLines = turn.content.split("\n");
-			body.push(`> ${prefix}: ${contentLines[0]}`);
-			// Paragraph breaks emit a bare `>` (no trailing space) so the line
-			// round-trips through the parser unchanged.
-			for (let i = 1; i < contentLines.length; i++) {
-				body.push(contentLines[i].length ? `> ${contentLines[i]}` : ">");
-			}
-		}
-		if (saved.aiState === "pending") {
-			body.push(">");
-			body.push("> <!-- ai response pending -->");
-		} else if (saved.aiState === "error") {
-			body.push(">");
-			body.push(`> <!-- ai error: ${saved.aiError ?? "unknown"} -->`);
-		}
-
-		return [
-			...lines.slice(0, anchorIdx + 1),
-			...body,
-			...lines.slice(endIdx),
-		].join("\n");
 	}
 
 	/** Rewrite a non-AI (Emphasise) callout body to reflect `saved.userText`.
@@ -1568,7 +1524,7 @@ export class HighlightsPane extends Component {
 	 *  collapses the callout back to its bare form. */
 	private rewriteEmphasiseNote(doc: string, saved: SavedHighlight): string {
 		const lines = doc.split("\n");
-		const bounds = this.findCalloutBounds(lines, saved);
+		const bounds = findCalloutBounds(lines, saved);
 		if (!bounds) return doc;
 		const { anchorIdx, endIdx } = bounds;
 
@@ -1576,7 +1532,7 @@ export class HighlightsPane extends Component {
 		if (saved.quote.length > 0) {
 			for (const ql of saved.quote.split(/\r?\n/)) body.push(`> > ${ql}`);
 		}
-		const sourceLink = this.existingSourceLink(lines, anchorIdx, endIdx);
+		const sourceLink = existingSourceLink(lines, anchorIdx, endIdx);
 		if (sourceLink) body.push(sourceLink);
 		const note = saved.userText.trim();
 		if (note.length > 0) {
@@ -1596,7 +1552,7 @@ export class HighlightsPane extends Component {
 	 *  unchanged when the callout can't be located. */
 	private removeCalloutFromDoc(doc: string, saved: SavedHighlight): string {
 		const lines = doc.split("\n");
-		const bounds = this.findCalloutBounds(lines, saved);
+		const bounds = findCalloutBounds(lines, saved);
 		if (!bounds) return doc;
 		let { startIdx } = bounds;
 		let { endIdx } = bounds;

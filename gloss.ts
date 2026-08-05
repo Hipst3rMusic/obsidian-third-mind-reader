@@ -11,6 +11,8 @@
 import {
 	App,
 	Component,
+	Notice,
+	Platform,
 	TFile,
 	AbstractInputSuggest,
 	prepareFuzzySearch,
@@ -352,6 +354,148 @@ export async function appendCallout(app: App, file: TFile, callout: string): Pro
 	});
 }
 
+/** Maintain the companion doc's `ai-pending` frontmatter count.
+ *
+ *  A **discovery hint**, not state: it lets "Process pending AI requests" find
+ *  flagged docs through `metadataCache` without opening a single file. The
+ *  per-callout `<!-- ai response pending -->` marker stays ground truth, and
+ *  processing always recounts from the parse rather than trusting this number.
+ *  Cleared (not zeroed) at zero, so a fully-answered doc carries no key. */
+export async function setAiPendingCount(app: App, file: TFile, count: number): Promise<void> {
+	try {
+		await app.fileManager.processFrontMatter(file, (fm: Record<string, unknown>) => {
+			if (count > 0) fm[AI_PENDING_KEY] = count;
+			else delete fm[AI_PENDING_KEY];
+		});
+	} catch (err) {
+		// A stale hint costs a doc being skipped by the vault-wide sweep until
+		// the book is next opened; never worth failing the write it rode in on.
+		console.error("[ThirdMindReader] setAiPendingCount failed", err);
+	}
+}
+
+/** Frontmatter key carrying the pending-exchange count. */
+export const AI_PENDING_KEY = "ai-pending";
+
+// ─── Callout editing ─────────────────────────────────────────────────────────
+//
+// Pure string surgery over a companion doc: locate one callout by its anchor
+// comment and rewrite its body from a SavedHighlight. Lives here rather than in
+// the Highlights pane because the deferred-queue processor (Mobile spec, Tier 1)
+// has to resolve exchanges in docs whose book is not open, so it has no pane —
+// and two implementations of "find the callout" would be two ways to silently
+// rewrite the wrong one.
+
+/** The anchor-comment substrings that identify one saved highlight uniquely.
+ *  Two shapes, because the two sources anchor differently: an EPUB entry is
+ *  `para:` (+ a `chars:` disambiguator when several marks share a paragraph),
+ *  a PDF entry is `pdfPage:` + `pdfSel:`. Getting this wrong is silent — the
+ *  rewriters simply fail to find the callout and return the doc untouched. */
+export function anchorTokens(saved: SavedHighlight): string[] {
+	if (saved.pdfPage !== undefined && saved.pdfSel) {
+		return [`pdfPage:${saved.pdfPage}`, `pdfSel:${saved.pdfSel.join(",")}`];
+	}
+	// Cross-para anchors store the `chars:S,-1` sentinel in the doc; the real
+	// end offset lives in `endChars:` (folded into saved.endChar on parse).
+	const charsToken = saved.startChar >= 0
+		? (saved.endParaIdHint
+			? `chars:${saved.startChar},-1`
+			: `chars:${saved.startChar},${saved.endChar}`)
+		: null;
+	return charsToken
+		? [`para:${saved.paraIdHint}`, charsToken]
+		: [`para:${saved.paraIdHint}`];
+}
+
+/** Locate a single callout in `lines` by its anchor comment. Returns the
+ *  header line index (`> [!mode]`), the anchor comment line index, and the
+ *  exclusive end index (first line past the callout body). Null when the
+ *  callout cannot be found. Shared by the body rewriters and the delete path. */
+export function findCalloutBounds(
+	lines: string[],
+	saved: SavedHighlight,
+): { startIdx: number; anchorIdx: number; endIdx: number } | null {
+	// Tokens must end at a field boundary. Anchor fields are space-separated,
+	// so a bare `includes` would let `pdfSel:2,0,4,5` match a *different*
+	// mark's `pdfSel:2,0,4,50` and rewrite the wrong callout.
+	const tokens = anchorTokens(saved).map(
+		(t) => new RegExp(t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(?=\\s)"),
+	);
+	let anchorIdx = -1;
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		if (!tokens.every((t) => t.test(line))) continue;
+		if (/<!--\s*tmr-anchor/.test(line)) { anchorIdx = i; break; }
+	}
+	if (anchorIdx === -1) return null;
+
+	// Header is the nearest `> [!mode]` line at or above the anchor.
+	let startIdx = anchorIdx;
+	while (startIdx > 0 && !/^>\s*\[!/.test(lines[startIdx])) startIdx--;
+
+	// End of the callout: first line not starting with `>` (or the next
+	// callout header).
+	let endIdx = anchorIdx + 1;
+	while (endIdx < lines.length) {
+		if (!/^>/.test(lines[endIdx])) break;
+		if (/^>\s*\[!/.test(lines[endIdx])) break;
+		endIdx++;
+	}
+	return { startIdx, anchorIdx, endIdx };
+}
+
+/** The callout's existing interop deep-link line, if it has one. The
+ *  rewriters rebuild the body from the model, and the link is the one piece
+ *  that lives only in the doc — carried through verbatim rather than
+ *  reconstructed, since only the PDF child can mint it. */
+export function existingSourceLink(lines: string[], anchorIdx: number, endIdx: number): string | null {
+	for (let i = anchorIdx + 1; i < endIdx; i++) {
+		const stripped = lines[i].replace(/^>\s?/, "").trim();
+		if (SOURCE_LINK_RE.test(stripped)) return lines[i];
+	}
+	return null;
+}
+
+/** Rewrite the body lines of a single callout (from anchor line to the
+ *  first non-`>` line) to reflect `saved.turns` and `saved.aiState`. */
+export function rewriteCalloutBody(doc: string, saved: SavedHighlight): string {
+	const lines = doc.split("\n");
+	const bounds = findCalloutBounds(lines, saved);
+	if (!bounds) return doc;
+	const { anchorIdx, endIdx } = bounds;
+
+	// Rebuild body: source quote → deep link → turns → state marker.
+	const body: string[] = [];
+	if (saved.quote.trim()) {
+		for (const ql of saved.quote.split("\n")) body.push(`> > ${ql}`);
+	}
+	const sourceLink = existingSourceLink(lines, anchorIdx, endIdx);
+	if (sourceLink) body.push(sourceLink);
+	for (const turn of saved.turns) {
+		const prefix = turn.role === "user" ? "User" : "AI";
+		const contentLines = turn.content.split("\n");
+		body.push(`> ${prefix}: ${contentLines[0]}`);
+		// Paragraph breaks emit a bare `>` (no trailing space) so the line
+		// round-trips through the parser unchanged.
+		for (let i = 1; i < contentLines.length; i++) {
+			body.push(contentLines[i].length ? `> ${contentLines[i]}` : ">");
+		}
+	}
+	if (saved.aiState === "pending") {
+		body.push(">");
+		body.push("> <!-- ai response pending -->");
+	} else if (saved.aiState === "error") {
+		body.push(">");
+		body.push(`> <!-- ai error: ${saved.aiError ?? "unknown"} -->`);
+	}
+
+	return [
+		...lines.slice(0, anchorIdx + 1),
+		...body,
+		...lines.slice(endIdx),
+	].join("\n");
+}
+
 /** Assemble the callout body. Format-neutral: the caller supplies the header
  *  text and the already-rendered `<!-- tmr-anchor ... -->` line, since only it
  *  knows how its own anchors are shaped. `sourceLink`, when given, is written
@@ -524,14 +668,78 @@ export class AnnotationPreview extends Component {
 		const el = this.el;
 		if (!el) return;
 		const rect = el.getBoundingClientRect();
+		const safe = getSafeViewport();
 		const margin = 12;
 		let x = clientX + 16;
 		let y = clientY + 18;
-		if (x + rect.width + margin > window.innerWidth) x = clientX - rect.width - 16;
-		if (y + rect.height + margin > window.innerHeight) y = clientY - rect.height - 18;
-		el.style.left = `${Math.max(margin, x)}px`;
-		el.style.top  = `${Math.max(margin, y)}px`;
+		if (x + rect.width + margin > safe.right) x = clientX - rect.width - 16;
+		if (y + rect.height + margin > safe.bottom) y = clientY - rect.height - 18;
+		el.style.left = `${Math.max(safe.left + margin, x)}px`;
+		el.style.top  = `${Math.max(safe.top + margin, y)}px`;
 	}
+}
+
+/** Bounds a body-appended floater may occupy, in client coordinates.
+ *
+ *  Every tooltip, preview and popover in the plugin clamps itself to
+ *  `window.innerWidth/innerHeight`. On a phone that viewport runs *underneath*
+ *  the status bar and Obsidian's floating navbar, so a preview clamped to it
+ *  lands half-hidden behind the navbar and a flipped-up tooltip can sit under
+ *  the notch. This is the same viewport with those regions taken off.
+ *
+ *  The navbar is measured rather than derived from `--mobile-toolbar-height`:
+ *  it floats above the bottom safe-area inset rather than inside it, so its
+ *  real top edge is the only figure that doesn't need two tokens added up
+ *  correctly. On desktop there's no navbar and every inset resolves to 0, so
+ *  this collapses to the plain viewport and callers behave exactly as before. */
+export function getSafeViewport(): { top: number; left: number; right: number; bottom: number } {
+	const bodyStyle = getComputedStyle(document.body);
+	const inset = (name: string): number => {
+		const value = parseFloat(bodyStyle.getPropertyValue(name));
+		return Number.isFinite(value) ? value : 0;
+	};
+	const navbar = document.body.querySelector<HTMLElement>(".mobile-navbar");
+	const navbarTop = navbar?.getBoundingClientRect().top ?? 0;
+	return {
+		top: inset("--safe-area-inset-top"),
+		left: inset("--safe-area-inset-left"),
+		right: window.innerWidth - inset("--safe-area-inset-right"),
+		bottom: navbarTop > 0 ? navbarTop : window.innerHeight - inset("--safe-area-inset-bottom"),
+	};
+}
+
+/** The band Obsidian's floating navbar pill occupies, or null where there isn't
+ *  one — desktop, and tablets, where Obsidian sets `.mobile-navbar { display:
+ *  none }` and the rect measures 0×0. Phase C docks the GlossBar here (see
+ *  Mobile/GlossBarActive): iOS puts its own selection menu wherever it finds
+ *  room, so anything anchored to the selection is competing for those pixels.
+ *
+ *  Vertical geometry comes from `offsetTop`/`offsetHeight`, NOT from the client
+ *  rect: the auto-hide moves the navbar with `transform: translateY(...)` rather
+ *  than removing it, so the rect's top is wrong exactly when the user is reading
+ *  — which is when the slot is wanted. Offsets are layout values and a transform
+ *  never touches them. Left and width still come from the rect, which keeps
+ *  subpixel precision and only a *vertical* transform is in play.
+ *
+ *  Don't be tempted to derive the top from `innerHeight` and the height instead:
+ *  the pill's clearance above the home indicator is a bottom *margin* under
+ *  `is-floating-nav` and bottom *padding* otherwise, so that arithmetic is right
+ *  in one configuration and 32px out in the other. Padding is still subtracted
+ *  from the height, since when it is used it sits inside the box. */
+export function getNavbarSlot(): { left: number; top: number; width: number; height: number } | null {
+	if (!Platform.isMobile) return null;
+	const navbar = document.body.querySelector<HTMLElement>(".mobile-navbar");
+	if (!navbar || navbar.offsetHeight < 1) return null;
+	const rect = navbar.getBoundingClientRect();
+	if (rect.width < 1) return null;
+	const padBottom = parseFloat(getComputedStyle(navbar).paddingBottom);
+	const inset = Number.isFinite(padBottom) ? padBottom : 0;
+	return {
+		left: rect.left,
+		width: rect.width,
+		top: navbar.offsetTop,
+		height: navbar.offsetHeight - inset,
+	};
 }
 
 /** Hit-test a pointer position against painted highlight rects, returning the
@@ -666,6 +874,11 @@ export interface GlossSurfaceOptions {
 	/** The user dismissed the input with Escape. Hosts tear down their own
 	 *  selection state here; the surface has already hidden itself. */
 	onDismiss: () => void;
+	/** The input panel opened. Tiles are clicked *inside* the surface, so a host
+	 *  that needs to react to the input appearing — the reader dims the page
+	 *  behind it on mobile — can't see it through its own entry points. Closing
+	 *  already routes through `onDismiss` or the host's own submit handler. */
+	onInputOpen?: () => void;
 }
 
 /** The GlossBar, its per-tile tooltip, and the annotation input — the three
@@ -679,12 +892,16 @@ export class GlossSurface extends Component {
 	private tooltipEl: HTMLElement | null = null;
 	private linkSuggest: WikilinkSuggest | null = null;
 	private activeMode: string | null = null;
+	private vvListener: (() => void) | null = null;
+	private kbdObserver: ResizeObserver | null = null;
+	private kbdTimers: number[] = [];
 
 	constructor(private opts: GlossSurfaceOptions) {
 		super();
 	}
 
 	onunload(): void {
+		this.untrackKeyboard();
 		this.linkSuggest?.close();
 		this.barEl?.remove();
 		this.inputEl?.remove();
@@ -743,7 +960,23 @@ export class GlossSurface extends Component {
 		this.syncModeState();
 		bar.removeClass("tmr-hidden");
 		this.syncTheme();
-		this.positionFloater(bar, selectionRect);
+		// Read the slot on every raise rather than caching it: a rotation or an
+		// iPad Split View change moves it, and there is no re-registration hook.
+		const slot = getNavbarSlot();
+		bar.toggleClass("tmr-gloss-docked", !!slot);
+		if (slot) {
+			// The tile click needs the selection rect, which positionFloater
+			// would normally have recorded.
+			this.lastRect = selectionRect;
+			bar.style.left = `${slot.left}px`;
+			bar.style.top = `${slot.top}px`;
+			bar.style.width = `${slot.width}px`;
+			bar.style.height = `${slot.height}px`;
+		} else {
+			bar.style.removeProperty("width");
+			bar.style.removeProperty("height");
+			this.positionFloater(bar, selectionRect);
+		}
 	}
 
 	/** Re-apply which tiles are live. Called on every raise, and by hosts when
@@ -779,8 +1012,21 @@ export class GlossSurface extends Component {
 			input.placeholder = GLOSS_PLACEHOLDERS[modeId] ?? "";
 		}
 		panel.removeClass("tmr-hidden");
-		this.positionFloater(panel, selectionRect);
+		// On touch the input has to clear the on-screen keyboard, which the
+		// selection rect knows nothing about; on desktop it still opens over the
+		// selection it belongs to.
+		if (Platform.isMobile) {
+			panel.addClass("tmr-gloss-input-docked");
+			this.lastRect = selectionRect;
+			// Clear any inline top a previous desktop-style open may have left
+			// behind, which would outrank the stylesheet and fight `bottom`.
+			panel.style.removeProperty("top");
+			this.trackKeyboard();
+		} else {
+			this.positionFloater(panel, selectionRect);
+		}
 		input?.focus();
+		this.opts.onInputOpen?.();
 	}
 
 	hideBar(): void {
@@ -789,9 +1035,127 @@ export class GlossSurface extends Component {
 	}
 
 	hideInput(): void {
+		this.untrackKeyboard();
 		this.inputEl?.addClass("tmr-hidden");
+		this.inputEl?.removeClass("tmr-gloss-input-docked");
+		this.inputEl?.removeClass("tmr-gloss-input-top");
+		this.inputEl?.removeClass("tmr-gloss-input-ready");
+		this.inputEl?.style.removeProperty("bottom");
 		this.linkSuggest?.close();
 		this.activeMode = null;
+	}
+
+	/** Keep the docked input above the on-screen keyboard.
+	 *
+	 *  Two rounds of device testing killed one assumption each: the *layout*
+	 *  viewport does not shrink for the keyboard (so a fixed `bottom: 16px` sits
+	 *  behind the keys), and neither, on this platform, does `visualViewport`.
+	 *  What demonstrably does move is Obsidian's own app container — that is why
+	 *  the book repaginates and why the search bar clears the keyboard for free.
+	 *  So measure every box that could report it and trust the shortest, rather
+	 *  than betting the feature on one of them (`keyboardTop`).
+	 *
+	 *  Three triggers, because the keyboard slides in over ~300ms and which of
+	 *  them fires is exactly what's in question: `visualViewport` events if it
+	 *  moves at all, a ResizeObserver on the containers, and a short ladder of
+	 *  timers as the backstop. The last timer also unlocks the top-docked
+	 *  fallback — if nothing has reported a keyboard by then, the panel goes to
+	 *  the top of the screen where it is at least reachable. */
+	private trackKeyboard(): void {
+		this.untrackKeyboard();
+		const vv = window.visualViewport;
+		if (vv) {
+			this.vvListener = () => this.layoutDockedInput();
+			vv.addEventListener("resize", this.vvListener);
+			vv.addEventListener("scroll", this.vvListener);
+		}
+		this.kbdObserver = new ResizeObserver(() => this.layoutDockedInput());
+		for (const el of this.keyboardBoxes()) this.kbdObserver.observe(el);
+		// The ladder runs to 1.6s because the device showed the containers still
+		// reporting full height at 700ms — the keyboard reports late, not never
+		// (every box read 852 in the fallback dump, then the observer corrected
+		// the panel a moment later). Only the last rung may give up.
+		const rungs = [80, 200, 400, 700, 1100, 1600];
+		for (const [i, ms] of rungs.entries()) {
+			this.kbdTimers.push(
+				window.setTimeout(() => this.layoutDockedInput(i === rungs.length - 1), ms),
+			);
+		}
+		this.layoutDockedInput();
+	}
+
+	private untrackKeyboard(): void {
+		const vv = window.visualViewport;
+		if (vv && this.vvListener) {
+			vv.removeEventListener("resize", this.vvListener);
+			vv.removeEventListener("scroll", this.vvListener);
+		}
+		this.vvListener = null;
+		this.kbdObserver?.disconnect();
+		this.kbdObserver = null;
+		for (const t of this.kbdTimers) window.clearTimeout(t);
+		this.kbdTimers = [];
+	}
+
+	/** Elements that shrink when the keyboard opens, if anything does. */
+	private keyboardBoxes(): HTMLElement[] {
+		const sel = ".app-container, .workspace, .mod-root, .workspace-leaf.mod-active";
+		return Array.from(document.body.querySelectorAll<HTMLElement>(sel));
+	}
+
+	/** Lowest screen y that is *not* under the keyboard, per the most pessimistic
+	 *  box that reports one. Falls back to the full window height. */
+	private keyboardTop(): number {
+		const full = window.innerHeight;
+		let top = full;
+		const vv = window.visualViewport;
+		if (vv) top = Math.min(top, vv.offsetTop + vv.height);
+		for (const el of this.keyboardBoxes()) {
+			const bottom = el.getBoundingClientRect().bottom;
+			// A collapsed or hidden container reports 0 and would win every time.
+			if (bottom > full * 0.4) top = Math.min(top, bottom);
+		}
+		return top;
+	}
+
+	/** One-line dump of every candidate box, for the fallback Notice. */
+	private keyboardReport(): string {
+		const vv = window.visualViewport;
+		const parts = [
+			`win ${Math.round(window.innerHeight)}`,
+			vv ? `vv ${Math.round(vv.offsetTop + vv.height)}` : "vv none",
+		];
+		for (const el of this.keyboardBoxes()) {
+			const cls = el.className.split(/\s+/)[0] || "?";
+			parts.push(`${cls} ${Math.round(el.getBoundingClientRect().bottom)}`);
+		}
+		return parts.join(" · ");
+	}
+
+	private layoutDockedInput(allowFallback = false): void {
+		const panel = this.inputEl;
+		if (!panel || !panel.hasClass("tmr-gloss-input-docked")) return;
+		const covered = window.innerHeight - this.keyboardTop();
+		// Rounding noise in a container's rect is not a keyboard.
+		if (covered > 24) {
+			panel.removeClass("tmr-gloss-input-top");
+			// Offsetting `bottom` (not `top`) keeps the panel's height auto —
+			// setting both edges on a fixed element stretches it, not moves it.
+			panel.style.bottom = `${covered + 16}px`;
+			// Revealed only once placed: until the keyboard reports itself the
+			// resting `bottom` is under the keys, and showing the panel there
+			// first is the very bug this replaced. The rise is CSS.
+			panel.addClass("tmr-gloss-input-ready");
+		} else if (allowFallback) {
+			panel.style.removeProperty("bottom");
+			panel.addClass("tmr-gloss-input-top");
+			panel.addClass("tmr-gloss-input-ready");
+			// Mobile has no console, and this branch means every box we know how
+			// to measure claims the keyboard isn't there. Report what they said,
+			// so a third round has data instead of another guess. Remove once the
+			// bottom-docked path is confirmed on device.
+			new Notice(`gloss dock: ${this.keyboardReport()}`, 8000);
+		}
 	}
 
 	/** Retract every floater. Does *not* fire `onDismiss` — hosts call this from
@@ -828,6 +1192,10 @@ export class GlossSurface extends Component {
 			// tile's fill colour and carry the numeric shortcut hint. A disabled
 			// tile shows the host's reason instead of the shortcut hint.
 			this.registerDomEvent(tile, "mouseenter", () => {
+				// Touch synthesises mouseenter on tap, so without this the tooltip
+				// fires on the very gesture that opens the input — and its hint is
+				// a keyboard shortcut the phone has no way to send anyway.
+				if (Platform.isMobile) return;
 				const reason = this.opts.disabledModes?.().get(mode.id);
 				this.showTileTooltip(tile, mode.id, reason ?? `${mode.label} (${idx + 1})`);
 			});
@@ -850,8 +1218,10 @@ export class GlossSurface extends Component {
 				e.stopPropagation();
 				onExtend();
 			});
-			this.registerDomEvent(extendTile, "mouseenter", () =>
-				this.showTileTooltip(extendTile, "extend", "Extend across pages"));
+			this.registerDomEvent(extendTile, "mouseenter", () => {
+				if (Platform.isMobile) return;
+				this.showTileTooltip(extendTile, "extend", "Extend across pages");
+			});
 			this.registerDomEvent(extendTile, "mouseleave", () => this.hideTileTooltip());
 		}
 
@@ -934,10 +1304,11 @@ export class GlossSurface extends Component {
 		el.removeClass("tmr-hidden");
 		const tileRect = tile.getBoundingClientRect();
 		const tipRect = el.getBoundingClientRect();
+		const safe = getSafeViewport();
 		const margin = 6;
-		const left = Math.max(4, Math.min(
+		const left = Math.max(safe.left + 4, Math.min(
 			tileRect.left + tileRect.width / 2 - tipRect.width / 2,
-			window.innerWidth - tipRect.width - 4,
+			safe.right - tipRect.width - 4,
 		));
 		el.style.left = `${left}px`;
 		el.style.top = `${tileRect.bottom + margin}px`;
@@ -967,15 +1338,19 @@ export class GlossSurface extends Component {
 		this.lastRect = selectionRect;
 		el.setCssProps({ left: "0px", top: "0px" });
 		const rect = el.getBoundingClientRect();
+		const safe = getSafeViewport();
 		const margin = 8;
-		const flipBelow = selectionRect.top < rect.height + margin + 16;
+		// Flip below when there isn't room above *within the safe area* — on a
+		// phone the 16px of slack was being measured against the top of the
+		// screen, i.e. behind the status bar.
+		const flipBelow = selectionRect.top - safe.top < rect.height + margin + 16;
 		const top = flipBelow
 			? selectionRect.bottom + margin
 			: selectionRect.top - rect.height - margin;
 		const midX = selectionRect.left + selectionRect.width / 2;
-		const maxLeft = window.innerWidth - rect.width - 8;
-		const left = Math.max(8, Math.min(midX - rect.width / 2, maxLeft));
+		const maxLeft = safe.right - rect.width - 8;
+		const left = Math.max(safe.left + 8, Math.min(midX - rect.width / 2, maxLeft));
 		el.style.left = `${left}px`;
-		el.style.top = `${Math.max(8, top)}px`;
+		el.style.top = `${Math.min(Math.max(safe.top + 8, top), safe.bottom - rect.height - 8)}px`;
 	}
 }

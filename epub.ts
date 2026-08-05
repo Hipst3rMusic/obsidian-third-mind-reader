@@ -1,6 +1,4 @@
 import JSZip from "jszip";
-import * as nodePath from "path";
-import { promises as nodeFs } from "fs";
 import DOMPurify from "dompurify";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -40,9 +38,7 @@ export interface EpubBook {
 	opfDir: string;
 	cssCache: Record<string, string>;  // manifest-relative href → css text
 	citations: Record<number, EpubCitation>;  // citation number → text + navigable target
-	// One of these will be set depending on source format
-	zip?: JSZip;
-	dirPath?: string;  // absolute path for exploded epubs
+	zip: JSZip;  // the book's backing archive — every raw read goes through it
 }
 
 export interface ResolvedEpubHref {
@@ -74,32 +70,7 @@ export async function parseEpub(data: ArrayBuffer): Promise<EpubBook> {
 		},
 		exists: async (p) => zip.file(p) !== null,
 	};
-	const book = await parseWithFS(fs);
-	book.zip = zip;
-	return book;
-}
-
-// ─── Parse from directory (exploded epub) ────────────────────────────────────
-
-export async function parseEpubDir(absoluteDirPath: string): Promise<EpubBook> {
-	const fs: EpubFS = {
-		readString: (p) => nodeFs.readFile(nodePath.join(absoluteDirPath, p), "utf8"),
-		readBytes: async (p) => {
-			const buf = await nodeFs.readFile(nodePath.join(absoluteDirPath, p));
-			return new Uint8Array(buf);
-		},
-		exists: async (p) => {
-			try {
-				await nodeFs.access(nodePath.join(absoluteDirPath, p));
-				return true;
-			} catch {
-				return false;
-			}
-		},
-	};
-	const book = await parseWithFS(fs);
-	book.dirPath = absoluteDirPath;
-	return book;
+	return { ...await parseWithFS(fs), zip };
 }
 
 // ─── Lightweight metadata read (Library scan) ────────────────────────────────
@@ -177,7 +148,7 @@ interface EpubFS {
 	exists(path: string): Promise<boolean>;
 }
 
-async function parseWithFS(fs: EpubFS): Promise<EpubBook> {
+async function parseWithFS(fs: EpubFS): Promise<Omit<EpubBook, "zip">> {
 	// 0. Bail out on encrypted content before the parse produces a book of
 	// ciphertext-as-text pages (DOMParser in HTML mode never throws, so an
 	// LCP/ADEPT epub would otherwise "open" as garbage).
@@ -385,16 +356,8 @@ export async function renderSpineRange(
 		wrapper.dataset.spineIndex = String(i);
 		container.appendChild(wrapper);
 
-		let raw: string;
 		const filePath = book.opfDir + item.href;
-
-		if (book.zip) {
-			raw = await book.zip.file(filePath)!.async("string");
-		} else if (book.dirPath) {
-			raw = await nodeFs.readFile(nodePath.join(book.dirPath, filePath), "utf8");
-		} else {
-			throw new Error("EpubBook has neither zip nor dirPath");
-		}
+		const raw = await book.zip.file(filePath)!.async("string");
 
 		const parser = new DOMParser();
 		const doc = parser.parseFromString(raw, "text/html");
@@ -530,15 +493,9 @@ async function getPreviewDocument(book: EpubBook, path: string): Promise<Documen
 
 async function readBookTextFile(book: EpubBook, path: string): Promise<string> {
 	const filePath = book.opfDir + path;
-	if (book.zip) {
-		const file = book.zip.file(filePath);
-		if (!file) throw new Error(`Missing epub asset: ${filePath}`);
-		return file.async("string");
-	}
-	if (book.dirPath) {
-		return nodeFs.readFile(nodePath.join(book.dirPath, filePath), "utf8");
-	}
-	throw new Error("EpubBook has neither zip nor dirPath");
+	const file = book.zip.file(filePath);
+	if (!file) throw new Error(`Missing epub asset: ${filePath}`);
+	return file.async("string");
 }
 
 function buildImagePreview(target: Element, path: string, book: EpubBook): EpubLinkPreview | null {

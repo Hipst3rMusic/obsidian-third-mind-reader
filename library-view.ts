@@ -367,7 +367,23 @@ export class LibraryView extends ItemView {
 			t.toggleClass("tmr-lib-tab-active", t.dataset.collection === value)
 		);
 		this.positionTabIndicator(true);
+		this.scrollActiveTabIntoView();
 		this.paintBody();
+	}
+
+	/** Pull the tapped tab to the strip's left edge, so the collections *after*
+	 *  it come into view. On a phone the strip is a horizontal scroller, and
+	 *  tapping the second tab otherwise leaves everything past it off-screen
+	 *  with nothing to suggest more exists. No-op wherever the strip fits. */
+	private scrollActiveTabIntoView(): void {
+		const group = this.tabsGroupEl;
+		if (!group || group.scrollWidth <= group.clientWidth) return;
+		const active = group.querySelector<HTMLElement>(".tmr-lib-tab-active");
+		if (!active) return;
+		// offsetLeft is measured against the strip itself (it is `position:
+		// relative` for the indicator), so the only correction is its padding.
+		const pad = parseFloat(getComputedStyle(group).paddingLeft) || 0;
+		group.scrollTo({ left: Math.max(0, active.offsetLeft - pad), behavior: "smooth" });
 	}
 
 	/** Park the sliding indicator under the active tab. `animate` lets a user tab

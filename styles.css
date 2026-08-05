@@ -14,7 +14,11 @@
 .tmr-root,
 .tmr-pdf-pane-host {
 	/* surfaces */
-	--background: var(--bg1);
+	/* Fallback, like every sibling here: `--bg1` only exists when the 3C Style
+	   Settings snippet is installed, and without it `var(--bg1)` fails
+	   substitution — so `--background` computed to nothing and every consumer
+	   silently painted transparent in non-3C mode. */
+	--background: var(--bg1, var(--background-primary));
 	--card: var(--bg2, var(--background-primary));
 	--popover: var(--bg2, var(--background-primary));
 	--sidebar: var(--bg2, var(--background-primary));
@@ -224,6 +228,23 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	display: none;
 }
 
+/* …and reclaim the space that header was holding. On mobile Obsidian gives
+   every .view-content `margin-top: safe-area-inset-top + mobile-toolbar-height`
+   — the inset clears the status bar, the toolbar height clears the view header.
+   Both our full-screen views hide that header (see the rules above and the
+   Library's), so on a phone 52 of the 111px band was being reserved for an
+   element that isn't rendered: 6% of the screen, sitting above the first line
+   of every page, and the single biggest thing making the reader feel cramped.
+
+   Stated as an absolute inset rather than `calc(111px - 52px)` or a negative
+   margin: if Obsidian ever resizes that band, this still lands exactly below
+   the status bar instead of underneath it. The failure mode is "unchanged",
+   not "text under the notch". */
+body.is-phone .workspace-leaf-content[data-type="third-mind-reader"] .view-content,
+body.is-phone .workspace-leaf-content[data-type="tmr-library"] .view-content {
+	margin-top: var(--safe-area-inset-top, 0px);
+}
+
 .tmr-root {
 	/* Mirror Obsidian's Readable Line Length setting; fall back to 680px. */
 	--tmr-line-width: var(--file-line-width, 680px);
@@ -233,7 +254,20 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	   pane. Percentages resolve against the using element's containing block —
 	   spread and footer are both full-width children of .tmr-root, so both
 	   compute the same value. Overridden below for single-page layout. */
-	--tmr-side-pad: max(4.5rem, calc((100% - var(--tmr-line-width) * 2 - var(--tmr-gap)) / 2));
+	/* Floor for the inset above. Read back by getMinSidePaddingPx() in main.ts,
+	   which needs the *minimum* padding to work out how much width a layout
+	   could have before it knows which layout it's choosing — so this token is
+	   the single source of truth for both, and overriding it (see the phone
+	   rule below) moves the layout maths with it. */
+	--tmr-side-pad-min: 4.5rem;
+	--tmr-side-pad: max(var(--tmr-side-pad-min), calc((100% - var(--tmr-line-width) * 2 - var(--tmr-gap)) / 2));
+	/* Edge of the square corner controls (ToC, help, search, highlights, the
+	   page-turn chevrons), and their distance from the pane's corners. Every
+	   neighbour and the search results card are positioned *off* these rather
+	   than off hardcoded 2.9375/3.0625/2.875rem values, so changing either for
+	   touch moves the whole cluster together instead of overlapping it. */
+	--tmr-chrome-btn: 2.0625rem;
+	--tmr-chrome-inset: 0.5rem;
 	display: flex;
 	flex-direction: column;
 	height: 100%;
@@ -253,12 +287,19 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 
 /* ── Spread ─────────────────────────────────────────────────────────────────── */
 
-/* Clipping container — overflow hidden at the padding box edge so only one
-   spread is visible at a time.  Padding lives here (not on .tmr-content)
-   so every "page" gets consistent margins after translateX shifts. */
+/* Clipping container — padding lives here (not on .tmr-content) so every "page"
+   gets consistent margins after translateX shifts.
+   `overflow: clip` clips at the *padding* box, so the next spread's leading
+   column shows through the side gutter as a sliver of the following page. On
+   desktop that bleed is deliberate: the gutters are wide, the peek at the
+   adjacent page keeps a big window from feeling claustrophobic, and it's
+   genuinely useful when glossing a selection that runs across a page boundary.
+   On phones and tablets the gutters are near the 4.5rem floor, so the same
+   bleed reads as a rendering fault rather than an affordance — clipped to the
+   content box under .is-mobile only (see the rule further down). */
 .tmr-spread {
 	flex: 1;
-	overflow: clip;              /* clip at content box, not padding box */
+	overflow: clip;
 	position: relative;
 	min-height: 0;
 	/* Horizontal padding grows on wide displays so neither column exceeds
@@ -271,12 +312,181 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	box-sizing: border-box;
 }
 
+/* Touch layouts drop the adjacent-page bleed described on .tmr-spread above.
+   A phone or a tablet in portrait sits at the 4.5rem padding floor, so the
+   neighbouring column lands a few px off the text edge and reads as a bug
+   rather than a peek; there's also no cursor to make "glance at the next page"
+   a deliberate act. Desktop keeps the bleed. */
+body.is-mobile .tmr-spread {
+	overflow-clip-margin: content-box;
+	/* `overflow: clip` alone is a *paint-time* clip, and the multicol inside is
+	   a promoted compositing layer (see .tmr-content) — so on iOS the clip is
+	   the compositor's job and can land a frame late, painting the next page's
+	   columns outside the reading area. Device-reported: text flashing down by
+	   the progress bar when tapping a paragraph that continues onto the next
+	   page. `contain: paint` states the clip as a containment guarantee the
+	   compositor honours up front, rather than a paint the raster has to undo. */
+	contain: paint;
+}
+
+/* iOS memory, not style. `will-change: transform` on .tmr-content promotes the
+   *whole book section* — measured at 15,909 × 617 CSS px, 88M device pixels at
+   DPR 3, ~337MB rasterised — into one permanent layer. iOS tiles it and evicts
+   tiles under pressure, which is the whole-reader flicker on tap. Desktop has
+   the memory to spare and keeps the hint; mobile lets WebKit promote for the
+   duration of the transform transition and drop the layer afterwards, which is
+   the same promotion where it actually pays and none of the standing cost. */
+body.is-mobile .tmr-content {
+	will-change: auto;
+}
+
 /* True narrow-layout mode: center one readable-width page in the viewport
    rather than insisting on a two-page spread with implausibly skinny columns.
    The class is mirrored onto .tmr-root (see syncSpreadLayoutMode) so the footer
    tracks the same inset — the token is declared there, not here. */
 .tmr-root.tmr-layout-single {
-	--tmr-side-pad: max(4.5rem, calc((100% - var(--tmr-line-width)) / 2));
+	--tmr-side-pad: max(var(--tmr-side-pad-min), calc((100% - var(--tmr-line-width)) / 2));
+}
+
+/* Obsidian's mobile navbar is `position: fixed` and floats over the bottom of
+   every view, and Obsidian's own editor reserves room for it. The reader
+   deliberately doesn't: the navbar auto-hides while reading (see
+   `is-hidden-nav` and `app.mobileNavbar` — Obsidian drops it on scroll-down and
+   restores it on any tap), so reserving its 52px permanently costs every page a
+   band that is empty most of the time. It overlays the bottom of the reader the
+   same way the corner controls overlay the top, and for the same reason.
+
+   The reserve is dropped *unconditionally* rather than keyed off
+   `body.is-hidden-nav`. Tying it to the class is the obvious move and the wrong
+   one: the reading area would then grow and shrink by 52px every time the
+   chrome came and went, repaginating the book underneath the reader. One fixed
+   geometry in both states is worth more than the 52px.
+
+   On tablet this is pure gain with no overlay to trade against — Obsidian sets
+   `body.is-tablet .mobile-navbar { display: none }`, so iPad was reserving
+   space for an element that is never rendered (verified at 1180x820:
+   `display: "none"`, `padding-bottom: "86px"`). Same bug as the dead top band
+   on phones, opposite end of the screen.
+
+   Horizontal insets are 0 in portrait but real in landscape on a notched
+   phone, where the camera housing eats one edge of the reading column. */
+/* Immersive reading: the navbar slides out of the way while the chrome is down.
+   Deliberately NOT Obsidian's `is-hidden-nav` — that class is the precondition
+   its own `restoreNavigation()` checks, and a window-level mousedown listener
+   calls that on every single tap, so driving it meant the navbar (and a native
+   status-bar fade) came back on every page turn and had to be pushed down again.
+   Owning the class means Obsidian's listener still fires and correctly does
+   nothing. See ReaderView.syncMobileChrome().
+
+   The transform mirrors Obsidian's own hidden-nav rule, so the navbar's existing
+   `transition: transform 0.3s ease-out` animates it for free and the two states
+   look identical. Not scoped to a width query: a phone in landscape is wider
+   than the phone breakpoint, and it still has a navbar to get out of the way.
+
+   `getNavbarSlot()` reads offsetTop/offsetHeight precisely because they ignore
+   this transform — the docked GlossBar has to know where the slot *is* while the
+   navbar is parked off-screen. */
+body.tmr-immersive .mobile-navbar {
+	transform: translateY(calc(var(--navbar-height) + var(--navbar-bottom-offset)));
+	opacity: 0;
+	pointer-events: none;
+}
+
+body.is-mobile .tmr-root {
+	padding-bottom: var(--safe-area-inset-bottom, 0px);
+	padding-left: var(--safe-area-inset-left, 0px);
+	padding-right: var(--safe-area-inset-right, 0px);
+	/* Obsidian's own 12px .view-content top padding is breathing room for a
+	   scrolling note. The reader owns its vertical rhythm — the spread's top
+	   gutter is computed to clear the corner buttons exactly — so leaving this
+	   in stacks a second, invisible gutter on top of a deliberate one. It's the
+	   only reason the corner buttons cleared the first line by 19px instead of
+	   the 6.75px they were told to. Absolute children are unaffected either way
+	   (they resolve against the padding box), so this moves only the text. */
+	padding-top: 0;
+
+	/* iOS paints a translucent plate over the nearest block element on tap, so
+	   long-pressing to select flashed the whole paragraph dark — the darkening
+	   is the platform's, not ours, and it reads as a bug against body text.
+	   Selection itself keeps its own (::selection) styling. */
+	-webkit-tap-highlight-color: transparent;
+}
+
+/* Hold the reading column's geometry across a keyboard open.
+   `.tmr-content` is `height: 100%` of a `flex: 1` spread, so when the layout
+   viewport shrinks the multicol box shrinks with it and the browser re-flows
+   the text into more columns — entirely on its own, with no JS involved —
+   while the translateX that selects the visible spread still points at the old
+   ones. Device-reported as the page going blank behind the annotation input
+   and the search results.
+
+   Pinning the height means the column box never changes size, so there is
+   nothing to reflow; the shorter root simply clips the bottom, which is where
+   the keyboard is anyway. `flex: none` is required — the spread is a flex item
+   and `flex: 1` would otherwise override the height. */
+body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
+	flex: none;
+	height: var(--tmr-frozen-h);
+}
+
+/* Phones: 4.5rem is a *proportion* borrowed from desktop, where it's a modest
+   slice of a wide pane. On a 393pt phone the same figure eats 162pt — 41% of
+   the screen — leaving a ~207px column of seven words a line and turning a
+   284-page book into 973. Gutters on a phone should be a thumb's clearance,
+   not a design margin; the page is the whole screen. Width-based rather than
+   `.is-phone` because that class is assigned once at launch and never
+   re-evaluated, so it misses an iPad in Split View or Slide Over. */
+@media (max-width: 550px) {
+	.tmr-root {
+		--tmr-side-pad-min: 1.25rem;
+	}
+
+	/* 44px is the iOS HIG floor. The corner controls are the only route to the
+	   ToC, search and highlights on a phone, so they're worth the extra pixels
+	   as painted buttons rather than an invisible hit area — and because their
+	   neighbours derive from the token, the cluster stays spaced correctly.
+	   The inset tightens at the same time: with the reserved view-header band
+	   reclaimed above, the reader now starts directly under the status bar, so
+	   the buttons sit at the top edge of the screen the way a phone app's
+	   toolbar does. */
+	/* 39px is what reads right at phone scale — 44 looked like furniture over
+	   the text. The finger still gets its 44 via the hit-area rule further
+	   down; painted size and touch size are separate concerns. */
+	.tmr-root {
+		--tmr-chrome-btn: 39px;
+		--tmr-chrome-inset: 0.375rem;
+	}
+
+	/* Reserve a band for the corner controls instead of overlaying them.
+	   This reverses the earlier call to let the chrome float over the text
+	   (Apple Books / Kindle style) — on glass the buttons landed squarely on
+	   the first line and a half of every page: text began at y=68, the buttons
+	   ran 66→105, so 37px of a 24.75px line-height overlapped. An opaque fill
+	   made the buttons legible but did nothing for the sentence underneath them.
+
+	   The gutter is affordable only because the navbar reserve at the bottom
+	   was dropped (see `body.is-mobile .tmr-root` above): text moves down 44px
+	   and gains 52px of run-off, so the reading area is 664px → 672px — the
+	   band shifts rather than shrinks.
+
+	   Derived from the chrome tokens, not hardcoded to 53px: inset above the
+	   button, the button, the same inset again below. Resizing the controls
+	   moves the text with them instead of needing a second edit that gets
+	   forgotten — and the top bar is about to grow a title. */
+	.tmr-spread {
+		padding-top: calc(var(--tmr-chrome-inset) * 2 + var(--tmr-chrome-btn));
+		/* Lift the last line clear of Obsidian's navbar. The navbar overlays the
+		   bottom of the reader rather than being reserved against (see
+		   `body.is-mobile .tmr-root`), and it intrudes 34px into the spread —
+		   without this the final line sat underneath it whenever the chrome was
+		   up. Padding by the navbar's own height, less the standard inset,
+		   leaves 11px of daylight between the text and its top edge.
+
+		   Phone-only, inside the 550px block: iPad has no navbar at all
+		   (`body.is-tablet .mobile-navbar { display: none }`), so it keeps the
+		   1rem bottom padding and takes the reclaimed space as reading area. */
+		padding-bottom: calc(var(--mobile-toolbar-height, 52px) - var(--tmr-chrome-inset));
+	}
 }
 
 /* Content fills the spread height exactly, then overflows RIGHT into more columns.
@@ -840,6 +1050,70 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 .tmr-gloss-bar:not(.tmr-3c-mode) .tmr-gloss-tile[data-gloss-mode="enquiry"]   { color: var(--tmr-c-enquiry); }
 .tmr-gloss-bar:not(.tmr-3c-mode) .tmr-gloss-tile:hover { background: var(--background-modifier-hover, rgba(127, 127, 127, 0.15)) !important; }
 
+/* ── Docked GlossBar (phone) — Mobile/GlossBarActive ───────────────────────
+   On a phone the bar takes Obsidian's navbar slot instead of floating over the
+   selection: iOS puts its own selection menu wherever it finds room (above the
+   text on iPad, straddling it on iPhone), so a selection-anchored bar is always
+   competing for those pixels. The slot is measured by `getNavbarSlot()` and
+   written as inline left/top/width/height — this rule carries only treatment.
+
+   Padding is horizontal-only with the tiles centred, rather than the design's
+   even 9px: 9 + 39 + 9 is 57 against a 52px slot, so an even inset would push
+   the tiles out of the band they're meant to sit in. */
+.tmr-gloss-bar.tmr-gloss-docked {
+	box-sizing: border-box;
+	/* The design's Icons row is `space_between` inside a fill-container frame, so
+	   the tiles span the bar rather than clustering mid-way. Our DOM is flat —
+	   tiles and separator are siblings of the bar — so the same distribution goes
+	   straight on the bar. `gap` survives as the floor for the crowded case (the
+	   Extend control adds two more items). */
+	gap: 6px;
+	padding: 0 9px;
+	align-items: center;
+	justify-content: space-between;
+	border-radius: 18px; /* --radius-L; body-scoped, so it can't read the token */
+	box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.35);
+}
+
+/* Lite mode leaves one or two live tiles. Spreading two items across a 313px
+   bar reads as a layout fault rather than a distribution, so the short bar
+   centres instead. */
+.tmr-gloss-bar.tmr-gloss-docked.tmr-gloss-lite {
+	justify-content: center;
+}
+
+.tmr-gloss-bar.tmr-gloss-docked .tmr-gloss-tile {
+	position: relative;
+	width: 39px;
+	height: 39px;
+	flex-shrink: 0;
+}
+
+.tmr-gloss-bar.tmr-gloss-docked .tmr-gloss-tile .svg-icon {
+	width: 24px;
+	height: 24px;
+}
+
+/* 44px of reach on a 39px painted tile — the Phase B pattern. The 6px gap puts
+   tile centres 45px apart, so the reaches tile edge-to-edge rather than
+   overlapping and stealing each other's taps (the Library-strip trap). */
+.tmr-gloss-bar.tmr-gloss-docked .tmr-gloss-tile::after {
+	content: "";
+	position: absolute;
+	top: 50%;
+	left: 50%;
+	width: 44px;
+	height: 44px;
+	transform: translate(-50%, -50%);
+}
+
+/* Hover lift belongs to a pointer. On touch the tile is under a fingertip and
+   the transform just makes it flicker on the tap that opens the input. */
+.tmr-gloss-bar.tmr-gloss-docked .tmr-gloss-tile:hover {
+	filter: none;
+	transform: none;
+}
+
 /* Separator stroke between the Emphasise tile and the AI tiles. */
 .tmr-gloss-sep {
 	flex-shrink: 0;
@@ -947,6 +1221,52 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	--input-border-width-focus: 0px;
 	--input-radius: 0;
 	--input-padding: 4px 2px;
+}
+
+/* Docked annotation input (Mobile/Glossbar/Input): pinned 16px above the
+   keyboard. The layout viewport does NOT shrink for the keyboard here, so this
+   `bottom: 16px` is only the no-keyboard resting place; `layoutDockedInput()`
+   overrides it inline with the keyboard's height + 16 off `visualViewport`.
+   Only `bottom` is computed — width and centring are static, so a keyboard
+   resize moves one property instead of re-measuring a layout.
+
+   `min-width: 0` has to be explicit: the base rule's 320px floor is wider than
+   the design's 289 and would push the panel off-centre on a 393pt phone.
+   `top: auto` is load-bearing too — the shared floater code sets an inline
+   `top` for the desktop case, and that inline value would outrank this. */
+.tmr-gloss-input.tmr-gloss-input-docked {
+	left: 50%;
+	top: auto;
+	bottom: 16px;
+	transform: translateX(-50%) translateY(28px);
+	min-width: 0;
+	/* 377, matching the toolbar plate rather than the mock's 289 — the extra
+	   88px is all typing room before the field starts truncating. */
+	width: min(377px, calc(100vw - 2rem));
+	max-width: none;
+	border-radius: 12px;
+	/* Hidden until placed, then rises out from behind the keyboard. The
+	   keyboard reports its height ~1s late on device, and the resting `bottom`
+	   is *under* the keys until it does, so the panel must not be shown there
+	   first — the motion covers the wait instead of exposing it. */
+	opacity: 0;
+	transition:
+		opacity 160ms ease,
+		transform 280ms cubic-bezier(0.22, 1, 0.36, 1),
+		bottom 280ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.tmr-gloss-input.tmr-gloss-input-docked.tmr-gloss-input-ready {
+	opacity: 1;
+	transform: translateX(-50%) translateY(0);
+}
+
+/* Last-resort placement: nothing reported a keyboard within 700ms of the input
+   opening, so rather than leave it buried, dock it to the top of the screen —
+   where the search bar lives, and the one region the keyboard never covers. */
+.tmr-gloss-input.tmr-gloss-input-docked.tmr-gloss-input-top {
+	top: calc(var(--safe-area-inset-top, 0px) + 12px);
+	bottom: auto;
 }
 
 .tmr-gloss-input.tmr-3c-mode:not([data-tmr-theme="light"]) {
@@ -1092,23 +1412,11 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	right: 0.75rem;
 }
 
-.tmr-root:hover .tmr-global-page,
-.tmr-root:hover .tmr-page-info {
+/* `.tmr-chrome-visible` is the touch stand-in for pointer hover — see the
+   reader chrome note by the .tmr-toc-toggle reveal below. */
+.tmr-root.tmr-chrome-visible .tmr-global-page,
+.tmr-root.tmr-chrome-visible .tmr-page-info {
 	opacity: 1;
-}
-
-/* Hover directly on a counter reveals its progress-bar connection via colour. */
-.tmr-root:hover .tmr-page-info:hover {
-	color: var(--primary);
-}
-
-.tmr-root:hover .tmr-global-page:hover {
-	color: var(--color-success);
-}
-
-/* Chapter counter at max (e.g. 10/10) — Examine teal micro-celebration. */
-.tmr-root:hover .tmr-page-info.tmr-page-info-max {
-	color: var(--tmr-c-examine);
 }
 
 /* `flex: 1 1 0` with a hairline floor: segments must always *fit* the column.
@@ -1317,11 +1625,11 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 .tmr-help-toggle,
 .tmr-page-nav {
 	position: absolute;
-	top: 0.5rem;
-	left: 0.5rem;
+	top: var(--tmr-chrome-inset);
+	left: var(--tmr-chrome-inset);
 	z-index: 25;
-	width: 2.0625rem;
-	height: 2.0625rem;
+	width: var(--tmr-chrome-btn);
+	height: var(--tmr-chrome-btn);
 	border-radius: 0.5625rem !important;
 	background: transparent !important;
 	border: 1px solid transparent !important;
@@ -1337,24 +1645,88 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 	--icon-size: 1rem;
 }
 
-.tmr-root:hover .tmr-toc-toggle,
-.tmr-root:hover .tmr-help-toggle,
-.tmr-root:hover .tmr-page-nav,
+/* Reader chrome reveal. `.tmr-chrome-visible` is the single mechanism —
+   ReaderView.revealChrome() sets it on tap, and the pointer-hover block further
+   down adds `:hover` as a second trigger on devices that actually have a
+   pointer. Every reveal family declares the same `opacity: 1`, which is why the
+   hover half consolidates into one guarded block instead of being duplicated
+   four times.
+
+   The guard is not cosmetic. Touch platforms latch `:hover` onto the tapped
+   element *and its ancestors* until something else is tapped, and .tmr-root is
+   an ancestor of the whole reader — so one tap anywhere pinned every control
+   visible for the rest of the session, and dismissing the chrome did nothing. */
+.tmr-root.tmr-chrome-visible .tmr-toc-toggle,
+.tmr-root.tmr-chrome-visible .tmr-help-toggle,
+.tmr-root.tmr-chrome-visible .tmr-page-nav,
 .tmr-toc-toggle:focus-visible,
 .tmr-help-toggle:focus-visible,
 .tmr-page-nav:focus-visible {
 	opacity: 1;
 }
 
-/* Help button sits just right of the ToC toggle, sharing its hover-reveal. */
+/* ── Pointer-hover reveal (mouse and trackpad only) ─────────────────────────
+   The desktop half of every reveal family above, gathered here so the whole
+   set is gated by one `hover: hover` query. A touch device never matches it,
+   so on a phone `.tmr-chrome-visible` is the only thing that can show a
+   control — which is what makes dismissing the chrome actually dismiss it.
+
+   Note this is the CSS mechanism, not the look: the filled "hover" styling the
+   controls wear when summoned comes from `.tmr-chrome-visible` and applies on
+   touch exactly as designed. */
+@media (hover: hover) {
+	.tmr-root:hover .tmr-toc-toggle,
+	.tmr-root:hover .tmr-help-toggle,
+	.tmr-root:hover .tmr-page-nav,
+	.tmr-root:hover .tmr-highlights-toggle,
+	.tmr-root:hover .tmr-search-bar,
+	.tmr-root:hover .tmr-global-page,
+	.tmr-root:hover .tmr-page-info {
+		opacity: 1;
+	}
+
+	/* Hovering a counter directly reveals its progress-bar connection via
+	   colour. Order preserved from the original block: the max-value rule
+	   matches the plain hover rule's specificity and must stay last to win. */
+	.tmr-root:hover .tmr-page-info:hover {
+		color: var(--primary);
+	}
+
+	.tmr-root:hover .tmr-global-page:hover {
+		color: var(--color-success);
+	}
+
+	/* Chapter counter at max (e.g. 10/10) — Examine teal micro-celebration. */
+	.tmr-root:hover .tmr-page-info.tmr-page-info-max {
+		color: var(--tmr-c-examine);
+	}
+}
+
+/* Help button sits just right of the ToC toggle, sharing its reveal:
+   left edge + button + a 0.375rem gap. */
 .tmr-help-toggle {
-	left: 2.9375rem;
+	left: calc(var(--tmr-chrome-inset) + var(--tmr-chrome-btn) + 0.375rem);
 }
 
 .tmr-toc-toggle.tmr-toc-toggle-hidden,
 .tmr-help-toggle.tmr-toc-toggle-hidden {
 	opacity: 0 !important;
 	pointer-events: none;
+}
+
+/* Toolbar plate — phone only. Nothing on desktop or iPad, where the four
+   corner controls read fine as separate ghost buttons against a wide page.
+   The whole definition lives in the @media (max-width: 550px) block below. */
+.tmr-toolbar {
+	display: none;
+}
+
+/* Phone progress bar and its caption, likewise — both are switched on by
+   `.tmr-navbar-tracked`, which ReaderView only sets once it has actually
+   measured Obsidian's navbar. */
+.tmr-mobile-progress,
+.tmr-mobile-pages {
+	display: none;
 }
 
 .tmr-toc-toggle:hover,
@@ -1383,11 +1755,11 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 }
 
 .tmr-page-nav-prev {
-	left: 0.5rem;
+	left: var(--tmr-chrome-inset);
 }
 
 .tmr-page-nav-next {
-	right: 0.5rem;
+	right: var(--tmr-chrome-inset);
 }
 
 /* ── Help modal (How to use the Reader) ──────────────────────────────────── */
@@ -1967,11 +2339,11 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 
 .tmr-highlights-toggle {
 	position: absolute;
-	top: 0.5rem;
-	right: 0.5rem;
+	top: var(--tmr-chrome-inset);
+	right: var(--tmr-chrome-inset);
 	z-index: 25;
-	width: 2.0625rem;
-	height: 2.0625rem;
+	width: var(--tmr-chrome-btn);
+	height: var(--tmr-chrome-btn);
 	border-radius: 0.5625rem !important;
 	background: transparent !important;
 	border: 1px solid transparent !important;
@@ -1987,7 +2359,7 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	--icon-size: 1rem;
 }
 
-.tmr-root:hover .tmr-highlights-toggle,
+.tmr-root.tmr-chrome-visible .tmr-highlights-toggle,
 .tmr-highlights-toggle:focus-visible {
 	opacity: 1;
 }
@@ -2012,18 +2384,18 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
    width transition expands leftward. ─────────────────────────────────── */
 
 /* Collapsed: ghost toggle seated one button-width left of the Highlights
-   toggle (0.5rem edge + 2.0625rem button + 0.5rem gap). Fixed left padding
-   keeps the icon put while the width animates (library-search trick). */
+   toggle (0.5rem edge + button + 0.5rem gap). Fixed left padding keeps the
+   icon put while the width animates (library-search trick). */
 .tmr-search-bar {
 	position: absolute;
-	top: 0.5rem;
-	right: 3.0625rem;
+	top: var(--tmr-chrome-inset);
+	right: calc(var(--tmr-chrome-inset) + var(--tmr-chrome-btn) + 0.5rem);
 	z-index: 25;
 	display: flex;
 	align-items: center;
 	gap: 0.375rem;
-	width: 2.0625rem;
-	height: 2.0625rem;
+	width: var(--tmr-chrome-btn);
+	height: var(--tmr-chrome-btn);
 	box-sizing: border-box;
 	padding: 0 0.5rem;
 	border-radius: 0.5625rem;
@@ -2039,7 +2411,7 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	--icon-size: 1rem;
 }
 
-.tmr-root:hover .tmr-search-bar,
+.tmr-root.tmr-chrome-visible .tmr-search-bar,
 .tmr-search-bar:focus-within {
 	opacity: 1;
 }
@@ -2082,8 +2454,8 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
    itself whenever there's nothing to show (pre-query state). */
 .tmr-book-search {
 	position: absolute;
-	top: 2.875rem;
-	right: 3.0625rem;
+	top: calc(var(--tmr-chrome-inset) + var(--tmr-chrome-btn) + 0.3125rem);
+	right: calc(var(--tmr-chrome-inset) + var(--tmr-chrome-btn) + 0.5rem);
 	z-index: 24;
 	width: 21.25rem;
 	max-width: calc(100% - 4rem);
@@ -2281,6 +2653,104 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 
 .tmr-highlights-panel.tmr-highlights-open {
 	transform: translateX(0);
+}
+
+/* ── Slide-in panels on touch ───────────────────────────────────────────────
+   Both panels are handled here, after both definitions, so plain-class
+   selectors win on source order — the ToC hangs off `.tmr-root` but the
+   highlights pane also mounts into `.tmr-pdf-pane-host` in the PDF view, so
+   there's no single ancestor to raise specificity with.
+
+   Panels are absolutely positioned against their host's *padding* box, so the
+   navbar clearance on `.tmr-root` doesn't reach them: `bottom: 0` puts the
+   ToC's scroll end and the pane's chat box under the floating navbar. Give
+   them the same clearance directly. */
+body.is-mobile .tmr-toc,
+body.is-mobile .tmr-highlights-panel {
+	bottom: calc(var(--safe-area-inset-bottom, 0px) + var(--mobile-toolbar-height, 52px));
+}
+
+/* Phones: a 340px pane over a 393pt screen leaves a 53pt sliver of reader —
+   too narrow to read, wide enough to invite a mis-tap on the text underneath.
+   The panel takes the screen, as Obsidian's own sidebars do; the backdrop and
+   the close button are still the way out. Square off the outer corners, since
+   there's no longer a page edge for them to sit against. */
+@media (max-width: 550px) {
+	.tmr-toc,
+	.tmr-highlights-panel {
+		width: 100%;
+		max-width: 100%;
+	}
+
+	/* Full-bleed to the bottom of the screen (Mobile/ToC, Mobile/Annotations).
+	   The `body.is-mobile` rule directly above stops both panes short of the
+	   navbar, which left a strip of reader showing under a sheet that is
+	   otherwise covering the whole phone — the design calls that out
+	   explicitly. Same specificity, later in the sheet, so it wins.
+
+	   The clearance itself is still needed, or the ToC's last row and the
+	   pane's chat box sit under the floating navbar. It moves from the box to
+	   padding: the background runs to the screen edge, the content stops
+	   above the navbar. */
+	body.is-mobile .tmr-toc,
+	body.is-mobile .tmr-highlights-panel {
+		bottom: 0;
+		padding-bottom: calc(
+			var(--safe-area-inset-bottom, 0px) + var(--mobile-toolbar-height, 52px)
+		);
+		transition: transform 300ms ease, padding-bottom 240ms ease;
+	}
+
+	/* …but only while the navbar is actually there. `tmr-immersive` is the
+	   navbar's own visibility (ReaderView.syncMobileChrome sets both), and a
+	   pane spends most of its life with the chrome down — so the clearance was
+	   holding 86px of dead space under a navbar that wasn't on screen, and the
+	   list appeared to cut off early with room to spare. Device-reported.
+
+	   The two states that *do* show the navbar are the moment a pane opens and
+	   whenever the chat box has focus, which are exactly the moments the
+	   clearance is wanted. The padding transition above matches the navbar's
+	   own animation so the list doesn't jump.
+
+	   Zero, not the safe-area inset: the home indicator is never painted over
+	   the app on this platform, so reserving for it only shortened the list. */
+	body.is-mobile.tmr-immersive .tmr-toc,
+	body.is-mobile.tmr-immersive .tmr-highlights-panel {
+		padding-bottom: 0;
+	}
+
+	/* The row is [icon | body | delete] with an even 1rem padding, which reads
+	   even on a wide desktop rail and lopsided on a full-width phone sheet: the
+	   icon gutter pushes the text 47.8px off the left edge while the right edge
+	   keeps its bare 18px, and the absolutely-positioned delete button then
+	   overlaps the last 13px of the text column. Mirroring the icon gutter on
+	   the right centres the text block and clears the button in one move.
+
+	   `body.is-mobile` for specificity, not scope: the base rule sets `padding`
+	   as a shorthand and is defined *later* in this sheet, so a bare
+	   `.tmr-highlights-item` here loses the longhand on source order. */
+	body.is-mobile .tmr-highlights-item {
+		padding-right: calc(1rem + 16px + 0.6rem);
+	}
+
+	/* Rounded on the inner edge only — the edge facing the reader it slid over.
+	   The outer edge is the screen edge and has nothing to round against. 33px
+	   is a physical curve taken from the mock, in the same spirit as the phone's
+	   own corner radius; it doesn't scale with the type size, so px is right. */
+	.tmr-toc {
+		border-radius: 0 33px 33px 0;
+	}
+
+	.tmr-highlights-panel {
+		border-radius: 33px 0 0 33px;
+	}
+
+	/* Drag-to-resize is meaningless at full width, and the grip strip sits
+	   exactly where a thumb reaches to fling the list — a swipe that should
+	   scroll would resize instead. Hiding it also kills its pointer handler. */
+	.tmr-pane-resize-edge {
+		display: none;
+	}
 }
 
 .tmr-highlights-header {
@@ -3169,6 +3639,15 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	font-size: 0.8125rem;
 }
 
+/* Queued for a desktop session (Mobile spec, Tier 1). Deliberately quieter
+   than both the animated pending indicator and the error: nothing is wrong and
+   nothing is happening — it is a note about when the answer will arrive. */
+.tmr-conv-turn-ai-bubble.tmr-turn-queued {
+	color: var(--muted-foreground);
+	font-size: 0.8125rem;
+	font-style: italic;
+}
+
 /* ── Chat box (DLS "Chat box" component) ─────────────────────────────────── */
 
 .tmr-conv-chatbox {
@@ -3394,6 +3873,14 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 
 .tmr-settings-provider > .setting-item {
 	border-top: 1px solid var(--background-modifier-border);
+}
+
+/* "Your data leaves this device" note under a remote provider's fields. Sits
+   between settings rows rather than inside one, so it reads as a statement
+   about the provider rather than help text for whichever field it follows. */
+.tmr-settings-privacy {
+	padding: 0.5rem 0 0.25rem;
+	line-height: 1.4;
 }
 
 .tmr-settings-provider-actions {
@@ -4150,3 +4637,604 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 .tmr-lib-tab-dragover {
 	box-shadow: inset 2px 0 0 0 var(--primary);
 }
+
+/* ── Touch targets ──────────────────────────────────────────────────────────
+   Every control the reader offers was sized for a mouse pointer: measured on a
+   393pt phone, the panel toggles came out 37px, the pane tabs 31.5px, the
+   per-highlight delete 22px and the chat send button 28px — all under the 44px
+   iOS HIG floor, several of them badly.
+
+   Deliberately at the end of the file: several of these override rules that
+   live hundreds of lines apart, and the pane classes are shared between the
+   reader (`.tmr-root`) and the PDF view (`.tmr-pdf-pane-host`), so there is no
+   common ancestor to raise specificity with. Source order is the only lever
+   that reaches both hosts.
+
+   Two mechanisms, picked per control:
+     1. Grow the box, where the element is in normal flow and a taller row is
+        an improvement anyway (list rows, tabs, section headers).
+     2. Leave the painted box alone and extend the *hit* area with a centred
+        pseudo-element, where growing would reflow a row or shift an overlay.
+   Both are phone-only; a tablet has a large enough screen and a more precise
+   grip that the desktop sizes hold up. */
+@media (max-width: 550px) {
+	/* px, not rem, and this is the one place in the sheet where that's the
+	   right call: 44 is a fingertip, an ergonomic constant. A reader who drops
+	   Obsidian's base font to 14px wants smaller *text*, not a smaller target —
+	   rem here would quietly slide these back under the floor at 38.5px.
+
+	   (1) Flow elements — grow the box. min-height rather than padding: the
+	   ToC item's padding is set by `.tmr-3c-mode .tmr-toc-item`, which outranks
+	   a bare class selector, and these rows are all centred flex containers so
+	   a floor lands the text correctly without touching the cascade. */
+	.tmr-toc-item,
+	.tmr-pane-tab,
+	.tmr-highlights-section-header,
+	.tmr-conv-sort-btn {
+		min-height: 44px;
+	}
+
+	/* …and let the segmented control grow to hold them. Its `height: 2.25rem`
+	   (40.5px) leaves 31.5px between its 0.25rem paddings, so a 44px tab burst
+	   straight out of the track — the active pill sat proud of the container on
+	   every edge, which is the "broken tab bar". Device-reported. `auto` keeps
+	   the desktop height derived from the same tokens as before. */
+	.tmr-pane-tabs {
+		height: auto;
+	}
+
+	.tmr-pane-hdr-btn,
+	.tmr-conv-filter-btn {
+		width: 44px;
+		height: 44px;
+	}
+
+	/* The corner controls are ghost buttons: transparent until hovered, which
+	   is what keeps them legible when they overlap text. Since the chrome
+	   overlays the reading column, they need that legibility whenever they're
+	   revealed — so on touch the hover state simply *is* the resting state.
+	   Hover is not a thing here, so there's nothing left for it to say.
+
+	   The fill itself comes from the toolbar plate behind them, NOT from each
+	   button. Both used `--hover-popover`, which looked right only because the
+	   3C palettes define it opaque (#262626 / #e1dee0): identical opaque fills
+	   stacked are indistinguishable from one. Outside 3C mode the token falls
+	   through to Obsidian's `--background-modifier-hover`, which is *alpha* —
+	   so button-over-plate composited to roughly double the tint and each
+	   control read as a darker patch on its own plate. Same token, two results,
+	   because one branch is opaque and the other isn't.
+
+	   The plate spans exactly the strip these four occupy and is hidden in
+	   lockstep with them (`.tmr-search-open`, `.tmr-pane-open`), so there is no
+	   state where a control is visible without it. One fill, from one element —
+	   which is also what the design specifies. */
+	.tmr-root.tmr-chrome-visible .tmr-toc-toggle,
+	.tmr-root.tmr-chrome-visible .tmr-help-toggle,
+	.tmr-root.tmr-chrome-visible .tmr-highlights-toggle,
+	.tmr-root.tmr-chrome-visible .tmr-page-nav,
+	.tmr-root.tmr-chrome-visible .tmr-search-bar:not(.tmr-search-bar-open) {
+		background: transparent !important;
+		color: var(--muted-foreground);
+	}
+
+	/* (2) Small controls — keep the visual, extend the reach. Each sits inside
+	   an `overflow: visible` parent (checked), so the overspill isn't clipped,
+	   and `pointer-events` is inherited from the control, so the enlarged area
+	   is live without any JS. Purely additive: none of these elements uses
+	   ::after for anything else. */
+	.tmr-highlights-item-delete::after,
+	.tmr-conv-send::after,
+	.tmr-conv-settings-btn::after,
+	.tmr-conv-back::after,
+	.tmr-toc-toggle::after,
+	.tmr-help-toggle::after,
+	.tmr-highlights-toggle::after,
+	.tmr-page-nav::after,
+	/* Collapsed only. Expanded, the bar is 289px of input and this pseudo-element
+	   would stretch over all of it — painting a transparent lid above the field
+	   and the × that eats every tap inside. Device-reported: the × could not be
+	   tapped at all and the bar could only be dismissed by tapping outside it.
+	   Open, the bar is far past the 44px floor anyway; its × gets its own box
+	   below. */
+	.tmr-search-bar:not(.tmr-search-bar-open)::after {
+		content: "";
+		position: absolute;
+		top: 50%;
+		left: 50%;
+		transform: translate(-50%, -50%);
+		min-width: 44px;
+		min-height: 44px;
+		width: 100%;
+		height: 100%;
+	}
+
+	/* An absolutely-positioned pseudo-element resolves against the nearest
+	   *positioned* ancestor, so a statically-positioned button would centre its
+	   hit area on the whole card instead of itself. `.tmr-highlights-item-
+	   delete` and `.tmr-conv-back` are already absolute and must keep that;
+	   these two are the ones that need pinning. */
+	.tmr-conv-send,
+	.tmr-conv-settings-btn {
+		position: relative;
+	}
+
+	/* ── Library ────────────────────────────────────────────────────────────
+	   The Library lays itself out on a hardcoded 64px horizontal inset, which
+	   is a fine desktop proportion and a third of a 393pt phone. It left a
+	   265px content column: book titles wrapped to four lines, cards ran 237px
+	   tall, and 27 of them made the shelf unreadable. Same gutter as the
+	   reader gives 348px back. */
+	.tmr-lib-header {
+		padding: 24px 1.25rem 16px;
+	}
+
+	.tmr-lib-body {
+		padding: 20px 1.25rem 32px;
+	}
+
+	.tmr-lib-strip {
+		margin: 0 1.25rem;
+	}
+
+	.tmr-lib-title {
+		font-size: 28px;
+	}
+
+	/* The 168px floor exists so cards in a multi-column grid line up. A phone
+	   shows one column, so it buys nothing and costs a dead band under every
+	   short title — `justify-content: space-between` pushes the progress row
+	   to the bottom of a card that has nothing to fill the middle with. */
+	.tmr-lib-card {
+		padding: 16px;
+		min-height: 0;
+	}
+
+	/* The collection tabs are a fixed-width segmented control sitting in a flex
+	   row. Past three collections the group is wider than the phone, and since
+	   nothing was allowed to shrink it pushed the *whole view* sideways —
+	   scrollWidth 567 against a 393 viewport, which is why the last tab was
+	   cut off screen with no way to reach it. Let the group take the leftover
+	   width and scroll within itself instead; the sliding indicator is
+	   positioned against the group, so it rides along. The spacer that pushed
+	   the icon buttons right has nothing left to push with. */
+	.tmr-lib-tabs {
+		flex: 1 1 auto;
+		min-width: 0;
+		overflow-x: auto;
+		scrollbar-width: none;
+	}
+
+	.tmr-lib-tabs::-webkit-scrollbar {
+		display: none;
+	}
+
+	.tmr-lib-tab {
+		flex: 0 0 auto;
+	}
+
+	.tmr-lib-strip-spacer {
+		display: none;
+	}
+
+	/* Library controls, same 44px rule as the reader's. The card menu is
+	   already absolute; the rest need pinning so their hit area centres on
+	   themselves rather than on the row. */
+	.tmr-lib-icon-btn::after,
+	/* Collapsed only — see the reader's search bar for why an expanded one must
+	   not carry a full-size hit lid. */
+	.tmr-lib-search:not(.tmr-lib-search-open)::after,
+	.tmr-lib-card-menu::after,
+	.tmr-lib-nudge-dismiss::after {
+		content: "";
+		position: absolute;
+		top: 50%;
+		left: 50%;
+		transform: translate(-50%, -50%);
+		min-width: 44px;
+		min-height: 44px;
+		width: 100%;
+		height: 100%;
+	}
+
+	.tmr-lib-icon-btn,
+	.tmr-lib-search,
+	.tmr-lib-nudge-dismiss {
+		position: relative;
+	}
+
+	/* 44px hit areas only work if the controls are far enough apart to own
+	   them. The strip's four icon buttons were ~20px wide with 6px gaps, so
+	   each one's reach ran straight over its neighbour's and whichever came
+	   last in the DOM won the tap. 36px boxes with 8px gaps puts the centres
+	   exactly 44px apart, so the hit areas tile edge to edge instead of
+	   fighting — every control ends up with a full, exclusive 44px. */
+	.tmr-lib-strip {
+		gap: 8px;
+	}
+
+	.tmr-lib-icon-btn,
+	.tmr-lib-search:not(.tmr-lib-search-open) {
+		min-width: 36px;
+		justify-content: center;
+	}
+
+	/* The search bar clips its children so the input can't spill during the
+	   width animation — which would also clip the hit area above. It only
+	   needs that while it's open or animating open: collapsed, the input and
+	   the clear button are already `width: 0; opacity: 0` in their own rules,
+	   so there is nothing to spill. Unclip the collapsed state and the 44px
+	   reach applies to the search toggle like every other control. */
+	.tmr-search-bar:not(.tmr-search-bar-open),
+	.tmr-lib-search:not(.tmr-lib-search-open) {
+		overflow: visible;
+	}
+
+	/* The page-turn chevrons are gone on a phone (Mobile/UIActive): tap zones
+	   *replace* them rather than supplementing them, and two buttons parked over
+	   the text to duplicate a gesture people already have is the visual clutter
+	   the mobile design set out to remove.
+
+	   ⚠ They stay in the DOM at opacity 0 rather than `display: none`, and that
+	   is load-bearing: `tapZoneEdges()` derives the left/right strips from these
+	   two elements' bounding rects, so the zones track --tmr-chrome-btn through
+	   this breakpoint instead of restating it in TypeScript. Collapse the box and
+	   page turns stop working, silently and only on phones. `pointer-events` off
+	   so an invisible button can never take a tap the zone should own. */
+	.tmr-root .tmr-page-nav,
+	.tmr-root.tmr-chrome-visible .tmr-page-nav {
+		opacity: 0;
+		pointer-events: none;
+	}
+
+	/* Expanded book search spans from the Help button's left edge to the search
+	   button's own right edge (Mobile/BookSearch). Derived rather than measured,
+	   so it holds at any phone width: the bar's `right` already puts its right
+	   edge one button + 0.5rem in from the edge, and the Help toggle's `left` is
+	   one button + 0.375rem in from the other, so subtracting both offsets from
+	   the containing block lands the left edge exactly on Help.
+
+	   The old `21.25rem` capped by `100% - 4rem` was a generic cap with no
+	   relationship to the buttons — on a 393pt phone it resolved to 321px and
+	   overhung Help by 35px, which is the left-heavy look. The results card
+	   shares the value: the pair is meant to read as one assembly, so a width
+	   they don't agree on is worse than either width alone. */
+	.tmr-root {
+		--tmr-search-open-w: calc(
+			100% - 2 * var(--tmr-chrome-inset) - 2 * var(--tmr-chrome-btn) - 0.75rem
+		);
+	}
+
+	.tmr-search-bar.tmr-search-bar-open,
+	.tmr-book-search {
+		width: var(--tmr-search-open-w);
+		max-width: none;
+	}
+
+	/* Results run from under the bar to just above the keyboard
+	   (Mobile/BookSearch). `60vh` was a desktop-shaped cap — 511px on this
+	   screen, which put the last two rows behind the keyboard.
+
+	   `100%` resolves against `.tmr-root`, and Obsidian's on-screen keyboard
+	   shrinks the *layout* viewport (established in C1b — it's why the reader
+	   repaginated on focus), so the root shrinks with it and this cap follows
+	   the keyboard without any JS. Deliberately CSS-only for that reason: the
+	   `--tmr-nav-*` properties would go stale here, since queueResize() is
+	   gated off while the keyboard is up. */
+	.tmr-root .tmr-book-search {
+		max-height: calc(
+			100% - var(--tmr-chrome-inset) - var(--tmr-chrome-btn) - 0.8125rem
+		);
+	}
+
+	/* An open search owns the screen (Mobile/BookSearch shows the bar and
+	   nothing else). The scrim already dims the page behind it; these are the
+	   controls that sit *above* the scrim and would otherwise float over it. */
+	.tmr-root.tmr-search-open .tmr-toolbar,
+	.tmr-root.tmr-search-open .tmr-toc-toggle,
+	.tmr-root.tmr-search-open .tmr-help-toggle,
+	.tmr-root.tmr-search-open .tmr-highlights-toggle {
+		opacity: 0 !important;
+		pointer-events: none;
+	}
+
+	/* Both inner gaps are one token in the design (`--radius-miniscule`), and
+	   they need to be: the toolbar plate makes the two pairs read as one row,
+	   where the desktop sheet's 0.375rem on the left and 0.5rem on the right
+	   showed up as a 2.25px lean. The open-search width above is derived from
+	   this value — change one and the bar stops landing on the Help button. */
+	.tmr-search-bar {
+		right: calc(var(--tmr-chrome-inset) + var(--tmr-chrome-btn) + 0.375rem);
+	}
+
+	.tmr-book-search {
+		right: calc(var(--tmr-chrome-inset) + var(--tmr-chrome-btn) + 0.375rem);
+	}
+
+	/* ── Toolbar (Toolbar component, Mobile/UIActive) ────────────────────────
+	   Background and one label — never a tap target, hence `pointer-events:
+	   none` and z-index 24 under the controls' 25. The controls keep their own
+	   absolute positions and simply sit on top of it, which is what "the same
+	   size and position they were before" means in practice: the plate is the
+	   only new box, so nothing about the search bar's morph or the panes'
+	   toggle mounting has to move.
+
+	   Fill fades in with the rest of the chrome and vanishes with it, so the
+	   resting page is still just text and a chapter name. */
+	.tmr-toolbar {
+		display: flex;
+		position: absolute;
+		top: var(--tmr-chrome-inset);
+		left: var(--tmr-chrome-inset);
+		right: var(--tmr-chrome-inset);
+		height: var(--tmr-chrome-btn);
+		z-index: 24;
+		align-items: center;
+		justify-content: center;
+		box-sizing: border-box;
+		border-radius: 0.5625rem;
+		background: transparent;
+		pointer-events: none;
+		transition: background 200ms ease, opacity 200ms ease;
+	}
+
+	.tmr-root.tmr-chrome-visible .tmr-toolbar {
+		background: var(--hover-popover);
+	}
+
+	/* The centre pill is the one piece of new information on the phone, and it
+	   holds the same 174×30 rect in both states (Mobile/Default's chapter name
+	   and Mobile/UIActive's book title are the same box) — which is why the two
+	   labels are grid-stacked and cross-faded rather than one element whose
+	   text is swapped. A text swap would snap halfway through the plate's fade.
+
+	   Capped rather than fixed at 174px: a long chapter name should ellipsize,
+	   but a short one shouldn't drag an empty plate across the page. */
+	.tmr-toolbar-title {
+		display: grid;
+		align-items: center;
+		max-width: 174px;
+		height: 30px;
+		padding: 0 6px;
+		box-sizing: border-box;
+		border-radius: var(--radius-min);
+		background: var(--background);
+		overflow: hidden;
+	}
+
+	.tmr-toolbar-title > span {
+		grid-area: 1 / 1;
+		min-width: 0;
+		font-family: var(--font-secondary);
+		font-size: 0.8125rem;
+		line-height: 1.2;
+		color: var(--muted-foreground);
+		text-align: center;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		transition: opacity 200ms ease;
+	}
+
+	.tmr-toolbar-book {
+		opacity: 0;
+	}
+
+	.tmr-root.tmr-chrome-visible .tmr-toolbar-chapter {
+		opacity: 0;
+	}
+
+	.tmr-root.tmr-chrome-visible .tmr-toolbar-book {
+		opacity: 1;
+	}
+
+	/* ── Toolbar retires while a pane owns the screen ────────────────────────
+	   A full-width pane covers the toolbar, but the controls underneath keep
+	   their 44px hit areas *above* it — the pseudo-element is painted by the
+	   button, and the button outranks the pane on z-index. Device-reported:
+	   tapping the ToC's close button also toggled the Highlights pane, because
+	   the invisible Highlights hit area sat right on top of it.
+
+	   `.tmr-pane-open` is set by both panes (ReaderView.syncPaneOpen), so this
+	   one rule replaces what would otherwise be a fourth per-button
+	   hidden-state family threaded through two files. */
+	.tmr-root.tmr-pane-open .tmr-toolbar,
+	.tmr-root.tmr-pane-open .tmr-toc-toggle,
+	.tmr-root.tmr-pane-open .tmr-help-toggle,
+	.tmr-root.tmr-pane-open .tmr-highlights-toggle,
+	.tmr-root.tmr-pane-open .tmr-search-bar,
+	/* The bar and its caption outrank the pane on z-index (they have to clear
+	   the spread), so a full-width sheet would otherwise have a progress bar
+	   floating on top of it. */
+	.tmr-root.tmr-pane-open .tmr-footer,
+	.tmr-root.tmr-pane-open .tmr-mobile-pages {
+		opacity: 0 !important;
+		pointer-events: none;
+	}
+
+	/* ── Progress bar (Mobile/Default + ProgressBar/Mobile/*) ────────────────
+	   Every number here comes from the four `--tmr-nav-*` properties that
+	   ReaderView.layoutMobileProgress() measures off Obsidian's own navbar, so
+	   the bar tracks the navbar across devices and across the floating-nav
+	   setting instead of restating its metrics in CSS.
+
+	   `.tmr-navbar-tracked` means "the navbar was found and measured". Without
+	   it — iPad, which has no navbar — none of this applies and the footer
+	   keeps its in-flow layout. */
+
+	/* How long the bar waits for Obsidian's navbar to slide in before expanding
+	   behind it. One token because three elements have to move together: the
+	   bar, its dim, and the caption. */
+	.tmr-root.tmr-navbar-tracked {
+		--tmr-chrome-delay: 150ms;
+	}
+
+	/* Whole-book position is explicitly demoted in the mobile design, and a
+	   45-section segmented bar in 274px is a row of dashes rather than a
+	   readable scale. The two marginal counters go with it: the phone shows
+	   one number, under the bar, where the eye already is. */
+	.tmr-root.tmr-navbar-tracked .tmr-progress-segment,
+	.tmr-root.tmr-navbar-tracked .tmr-global-page,
+	.tmr-root.tmr-navbar-tracked .tmr-page-info {
+		display: none;
+	}
+
+	/* The footer *is* the bar here, so it takes the bar's rect directly and the
+	   back pill and its marker keep working in the coordinate space they
+	   already use. At rest that rect is the navbar's straight run — the span
+	   between the pill's two round caps, hence `width − height` — seated on the
+	   navbar's bottom edge. */
+	.tmr-root.tmr-navbar-tracked .tmr-footer {
+		position: absolute;
+		padding: 0;
+		z-index: 22;
+		left: calc(var(--tmr-nav-l) + var(--tmr-nav-h) / 2);
+		width: calc(var(--tmr-nav-w) - var(--tmr-nav-h));
+		top: calc(var(--tmr-nav-t) + var(--tmr-nav-h) - 6px);
+		height: 6px;
+		transition: left 240ms ease, width 240ms ease, top 240ms ease,
+			height 240ms ease, opacity 200ms ease;
+	}
+
+	/* Chrome up: grow into the navbar's full rect. Obsidian paints the navbar
+	   above the reader and it is translucent and blurred, so the bar shows
+	   through it and the navbar itself reads as chapter progress.
+	   The delay lets Obsidian's navbar finish sliding in first — the bar is
+	   meant to be read *through* the navbar, so expanding ahead of it showed
+	   the growth against bare page and gave away the trick (device-reported).
+	   Declared on the expanded state only, so collapsing snaps back with the
+	   navbar rather than lingering after it. */
+	.tmr-root.tmr-navbar-tracked.tmr-chrome-visible .tmr-footer {
+		left: var(--tmr-nav-l);
+		width: var(--tmr-nav-w);
+		top: var(--tmr-nav-t);
+		height: var(--tmr-nav-h);
+		transition-delay: var(--tmr-chrome-delay);
+	}
+
+	.tmr-root.tmr-navbar-tracked .tmr-progress-bar {
+		padding: 0;
+		height: 100%;
+		cursor: default;
+	}
+
+	.tmr-root.tmr-navbar-tracked .tmr-mobile-progress {
+		display: block;
+		position: absolute;
+		inset: 0;
+		background: var(--secondary);
+		border-radius: var(--radius-pill);
+		overflow: hidden;
+		transition: opacity 240ms ease;
+	}
+
+	/* Expanded, the bar is behind Obsidian's navbar and the navbar's icons have
+	   to stay readable on top of it — at full strength the fill swallowed them
+	   (device-reported, worst on the completed-chapter olive). Dropping the
+	   whole track rather than the fill alone keeps the two in proportion, so it
+	   still reads as one bar and not a fill on a brighter rail.
+
+	   This one number is the whole legibility trade: raise it and the progress
+	   reads better, lower it and the navbar does. */
+	.tmr-root.tmr-navbar-tracked.tmr-chrome-visible .tmr-mobile-progress {
+		opacity: 0.4;
+		/* Dims in step with the expansion, not ahead of it — the dim only makes
+		   sense once the navbar is over the bar. */
+		transition-delay: var(--tmr-chrome-delay);
+	}
+
+	.tmr-mobile-progress-fill {
+		height: 100%;
+		width: 0%;
+		background: var(--primary);
+		transition: width 300ms ease, background 200ms ease;
+	}
+
+	/* Chapter finished (ProgressBar/Mobile/NavbarActive/Full). Same token the
+	   desktop bar already uses for a completed segment, so the two surfaces
+	   agree on what "done" looks like. */
+	.tmr-mobile-progress-fill.tmr-mobile-progress-full {
+		background: var(--color-success);
+	}
+
+	/* Caption: centred, above the bar while reading, below the navbar once it
+	   is up (Mobile/Default y=788 vs Mobile/UIActive y=824, both measured from
+	   the navbar's own top). */
+	.tmr-root.tmr-navbar-tracked .tmr-mobile-pages {
+		display: block;
+		position: absolute;
+		left: 0;
+		right: 0;
+		top: calc(var(--tmr-nav-t) + 20px);
+		z-index: 22;
+		text-align: center;
+		font-family: var(--font-mono);
+		font-size: 0.8125rem;
+		line-height: 1.2;
+		color: var(--muted-foreground);
+		pointer-events: none;
+		transition: top 240ms ease, opacity 200ms ease;
+	}
+
+	.tmr-root.tmr-navbar-tracked.tmr-chrome-visible .tmr-mobile-pages {
+		top: calc(var(--tmr-nav-t) + var(--tmr-nav-h) + 4px);
+		/* Travels with the bar it captions. */
+		transition-delay: var(--tmr-chrome-delay);
+	}
+
+	/* The footer has left the flow, so the spread has to reserve the bottom
+	   band itself — down to the navbar's top, plus a little daylight. This
+	   supersedes the flat navbar-height padding set at the top of the sheet,
+	   which only cleared the navbar and not the caption sitting above it. */
+	.tmr-root.tmr-navbar-tracked .tmr-spread {
+		padding-bottom: calc(var(--tmr-nav-band) + 6px);
+	}
+
+	/* Keyboard-bearing surfaces dim the page behind them — Mobile/Glossbar/Input
+	   and Mobile/BookSearch both specify --background at 66%. A pseudo-element
+	   rather than a real node: it has to land above the reading column (z 0–1)
+	   and the corner chrome (15–20) but below the search bar (25) and its results
+	   card (24), and a layer that exists only in CSS can't drift out of that band
+	   as the shell gains elements. The gloss input is body-scoped at 9998 and
+	   clears it outright.
+
+	   `pointer-events: none` is not a way to let taps through — a pseudo-element
+	   never becomes an event target, its host does — it just keeps the host's own
+	   hit behaviour unchanged. The tap that lands here is dismissal, handled in
+	   `handleReaderTap`, which bails while either surface is up. */
+	/* The preview is a hover floater on desktop and never needs to be hit; on
+	   touch it's the second half of the tap-to-open two-step, so it has to be
+	   tappable. */
+	.tmr-annotation-preview {
+		pointer-events: auto;
+	}
+
+	.tmr-root.tmr-scrim::after {
+		content: "";
+		position: absolute;
+		inset: 0;
+		z-index: 23;
+		background: var(--background);
+		opacity: 0.66;
+		pointer-events: none;
+	}
+
+	/* The × is 22.5px square — under the floor, and the one control that has to
+	   work while the keyboard is up. It grows its *box* rather than gaining a
+	   `::after`: the open bar clips its children, so an overspilling pseudo-
+	   element would be trimmed back to roughly the size it started at. The icon
+	   is sized independently (`--icon-size`), so nothing looks bigger. */
+	.tmr-search-bar-open .tmr-book-search-clear,
+	.tmr-lib-search-open .tmr-lib-search-clear {
+		width: 2rem;
+		height: 100% !important;
+		border-radius: 0 !important;
+	}
+}
+
+/* The progress bar is deliberately absent from the block above. It's a 16px
+   scrub strip, so it fails the 44px rule, but the fix depends on an
+   interaction that doesn't exist yet: Phase C decides whether it's a tap
+   target at all, alongside tap-zone page turns. Padding it out now would cost
+   ~33px of the phone's vertical budget for a gesture we may not ship, and an
+   overlay pseudo-element would sit on top of the segment children. Revisit
+   with the pointer-event scrub work. */

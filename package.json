@@ -1,11 +1,12 @@
 {
   "name": "third-mind-reader",
-  "version": "0.5.8-beta",
+  "version": "0.5.9-beta",
   "description": "Third Mind Reader — Obsidian Plugin",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "build:mobile": "npm run build && node scripts/stage-mobile.mjs",
     "lint": "eslint . --quiet"
   },
   "keywords": [],
