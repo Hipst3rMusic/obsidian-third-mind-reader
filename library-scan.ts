@@ -2,9 +2,10 @@ import { type Vault, TFile, TFolder, normalizePath } from "obsidian";
 import { readEpubMeta } from "./epub";
 
 /** Minimal shape the scan needs from `settings.bookPositions[path]`: the cached
- *  reading fraction the reader writes on each position-save. */
+ *  reading fraction and timestamp the reader writes on each position-save. */
 export interface BookProgress {
 	pct?: number;
+	lastRead?: number;
 }
 
 /** A per-book display override. The epub file is never modified; these values
@@ -14,10 +15,16 @@ export interface LibraryOverride {
 	author?: string;
 }
 
+/** What the reader opens a book *with*: the plugin's own reader for epubs,
+ *  Obsidian's native viewer (augmented by PDF Gloss) for PDFs. */
+export type BookKind = "epub" | "pdf";
+
 /** A single book as surfaced in the Library grid. */
 export interface LibraryBook {
-	/** Vault-relative path to the single-file .epub. */
+	/** Vault-relative path to the single-file .epub or .pdf. */
 	path: string;
+	/** Which viewer this book opens in, and which format label the card shows. */
+	kind: BookKind;
 	/** Display title: the override if present, else OPF <dc:title> (or filename). */
 	title: string;
 	/** Display author: the override if present, else OPF <dc:creator> (may be ""). */
@@ -30,6 +37,9 @@ export interface LibraryBook {
 	collection: string;
 	/** 0..1 reading fraction, from `settings.bookPositions[path].pct` (0 if unread). */
 	progress: number;
+	/** Epoch ms of last reading activity; 0 for never-opened books. Sort key for
+	 *  the shelf — see `sortForShelf` in library-view.ts. */
+	lastRead: number;
 	/** Annotation count — `> [!mode]-` callout headers in the companion doc. */
 	marks: number;
 	/** Whether a companion doc exists for this book (independent of mark count). */
@@ -46,8 +56,8 @@ interface MetaCacheEntry {
 }
 
 /** Module-level cache keyed by path, validated against file mtime, so re-opening
- *  the Library within a session doesn't re-unzip every OPF. Phase D's vault
- *  rename/modify handlers call `invalidateMetaCache` to keep it honest. */
+ *  the Library within a session doesn't re-unzip every OPF. Vault rename/modify
+ *  handlers call `invalidateMetaCache` to keep it honest. */
 const metaCache = new Map<string, MetaCacheEntry>();
 
 export function invalidateMetaCache(path?: string): void {
@@ -102,17 +112,14 @@ async function readMarks(vault: Vault, rawTitle: string): Promise<{ marks: numbe
 }
 
 /**
- * Enumerate single-file `.epub` books under `Library/` and resolve their
- * title/author via the cheap `readEpubMeta` path. Excludes the annotations
- * folder. Exploded `.epub` directories are intentionally not returned here —
- * they're surfaced as an import nudge in Phase C.
+ * Enumerate single-file `.epub` and `.pdf` books under `Library/`, excluding the
+ * annotations folder. Exploded `.epub` directories are deliberately not returned
+ * — they surface as an import nudge instead.
  *
  * `overrides` (keyed by path) replace the displayed title/author without
- * touching the epub; the raw OPF values are retained on the book for the editor.
- *
- * `positions` (keyed by path, = `settings.bookPositions`) supplies the cached
- * reading fraction; `marks`/`hasCompanion` are resolved from each book's
- * companion doc (keyed by raw OPF title).
+ * touching the epub; the raw OPF values are retained for the editor.
+ * `positions` (= `settings.bookPositions`) supplies the cached reading fraction;
+ * `marks`/`hasCompanion` resolve from the companion doc, keyed by raw OPF title.
  */
 export async function scanLibrary(
 	vault: Vault,
@@ -122,18 +129,26 @@ export async function scanLibrary(
 	const prefix = LIBRARY_ROOT + "/";
 	const files = vault.getFiles().filter(
 		(f) =>
-			f.extension === "epub" &&
+			(f.extension === "epub" || f.extension === "pdf") &&
 			f.path.startsWith(prefix) &&
 			!f.path.startsWith(ANNOTATIONS_PREFIX)
 	);
 
 	const books: LibraryBook[] = [];
 	for (const file of files) {
+		const kind: BookKind = file.extension === "pdf" ? "pdf" : "epub";
 		let title: string;
 		let author: string;
 
 		const cached = metaCache.get(file.path);
-		if (cached && cached.mtime === file.stat.mtime) {
+		if (kind === "pdf") {
+			// No OPF to read: the filename is the title, and the author stays empty
+			// until someone sets one in Edit details. The filename is also what PDF
+			// Gloss keys its companion doc by (`companionDocPath(file.basename)`),
+			// so marks resolve here without inventing a second convention.
+			title = file.basename;
+			author = "";
+		} else if (cached && cached.mtime === file.stat.mtime) {
 			title = cached.title;
 			author = cached.author;
 		} else {
@@ -145,8 +160,7 @@ export async function scanLibrary(
 				metaCache.set(file.path, { mtime: file.stat.mtime, title, author });
 			} catch {
 				// Malformed / unreadable epub — fall back to the filename so one bad
-				// book never breaks the whole scan. Dedicated broken-card treatment
-				// is R5 (owned by Rohan).
+				// book never breaks the whole scan.
 				title = file.basename;
 				author = "";
 			}
@@ -155,20 +169,24 @@ export async function scanLibrary(
 		const ov = overrides[file.path];
 		const { marks, hasCompanion } = await readMarks(vault, title);
 		const pct = positions[file.path]?.pct;
+		const lastRead = positions[file.path]?.lastRead;
 		books.push({
 			path: file.path,
+			kind,
 			title: ov?.title ?? title,
 			author: ov?.author ?? author,
 			rawTitle: title,
 			rawAuthor: author,
 			collection: collectionOf(file.path),
 			progress: typeof pct === "number" ? Math.max(0, Math.min(1, pct)) : 0,
+			lastRead: typeof lastRead === "number" ? lastRead : 0,
 			marks,
 			hasCompanion,
 		});
 	}
 
-	// Stable alphabetical order for now; recency-based sort is a Phase D/E concern.
+	// Alphabetical baseline only — display order is the view's call
+	// (`sortForShelf`). This is the recency sort's stable tie-break.
 	books.sort((a, b) => a.title.localeCompare(b.title));
 	return books;
 }
@@ -181,15 +199,13 @@ function collectionOf(path: string): string {
 }
 
 /**
- * The collection tabs to show — a **pure mirror of the live `Library/` folder
- * tree**: every immediate subfolder (including empty ones; `Annotations/` always
- * excluded), read straight from the vault so a folder dropped in appears and a
- * folder deleted disappears, with nothing persisted deciding a tab's existence.
- * "Everything" is prepended by the view and is not part of this list.
+ * The collection tabs to show — a pure mirror of the live `Library/` folder tree:
+ * every immediate subfolder including empty ones, `Annotations/` excluded, with
+ * nothing persisted deciding a tab's existence. "Everything" is prepended by the
+ * view and is not part of this list.
  *
- * `order` is only an **ordering hint** (from drag-to-reorder): live folders named
- * in it come first in that order, the rest follow alphabetically. Entries for
- * folders that no longer exist are ignored here (and pruned by the view).
+ * `order` is only an ordering hint (from drag-to-reorder): folders named in it
+ * come first, the rest alphabetically. Names of dead folders are ignored.
  */
 export function computeCollections(vault: Vault, order: string[]): string[] {
 	const root = vault.getAbstractFileByPath(LIBRARY_ROOT);
@@ -210,10 +226,9 @@ export function computeCollections(vault: Vault, order: string[]): string[] {
 
 /**
  * Find exploded `.epub` directories under `Library/` — unzipped book folders the
- * reader can't open in place (the Apple Books shape). Detected cheaply by probing
- * each folder for the epub signature (`META-INF/container.xml` or `mimetype`).
- * Recurses into ordinary collection folders but never into a detected epub's
- * internals; `Annotations/` is skipped. Returns the folder paths.
+ * reader can't open in place (the Apple Books shape), detected by probing for
+ * `META-INF/container.xml` or `mimetype`. Recurses into collection folders but
+ * never into a detected epub's internals; `Annotations/` is skipped.
  */
 export async function detectExplodedEpubs(vault: Vault): Promise<string[]> {
 	const adapter = vault.adapter;

@@ -5,8 +5,8 @@
  * data.json, which is per-vault state (API keys, reading positions, library
  * overrides) and would clobber the target vault's on drag-and-drop.
  *
- * The staged manifest gets `isDesktopOnly: false` so mobile will load it; the
- * repo's manifest stays `true` until the mobile beta ships (Phase E).
+ * The staged manifest pins `isDesktopOnly: false` so mobile loads it whatever
+ * the repo manifest says.
  *
  * The inner folder is named for the plugin id so the dragged folder matches
  * what Obsidian expects, even though it keys off manifest.id rather than the

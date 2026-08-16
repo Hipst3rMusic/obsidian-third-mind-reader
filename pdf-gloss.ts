@@ -12,7 +12,7 @@
  *  gloss", never to a broken PDF.
  */
 
-import { App, Component, Notice, TAbstractFile, TFile, View, WorkspaceLeaf, setIcon, setTooltip } from "obsidian";
+import { App, Component, Notice, Platform, TAbstractFile, TFile, View, setIcon, setTooltip } from "obsidian";
 import {
 	ANCHOR_PREFIX_LEN,
 	AnnotationPreview,
@@ -28,6 +28,7 @@ import {
 	hitTestHighlightRects,
 	isTextInputFocused,
 	parseSavedHighlights,
+	registerTouchSelectionRaise,
 } from "./gloss";
 import {
 	HighlightsPane,
@@ -54,7 +55,7 @@ interface PdfEventBus {
 }
 
 /** The slice of Obsidian's `PDFViewerChild` we depend on. Signatures
- *  cross-checked against PDF++'s `typings.d.ts` and live-probed 2026-07-22. */
+ *  cross-checked against PDF++'s `typings.d.ts`. */
 interface PdfViewerChild {
 	containerEl: HTMLElement;
 	file: TFile | null;
@@ -64,7 +65,7 @@ interface PdfViewerChild {
 	 *  no `container` of its own. */
 	pdfViewer: {
 		eventBus: PdfEventBus;
-		pdfViewer?: { container?: HTMLElement };
+		pdfViewer?: { container?: HTMLElement; pagesCount?: number };
 	};
 	/** Four comma-separated ints over the page's text divs —
 	 *  `beginIndex,beginOffset,endIndex,endOffset`. Null when the current
@@ -93,6 +94,10 @@ interface PdfViewerComponent {
 
 interface PdfView extends View {
 	viewer?: PdfViewerComponent;
+	/** `.view-content`, and the same element as `child.containerEl`. Declared here
+	 *  because it lives on `ItemView`, not `View`. Stable across viewer rebuilds,
+	 *  which `child` is not — so it's what we watch for one. */
+	contentEl: HTMLElement;
 }
 
 /** Every internal the controller touches, across all PDF Gloss phases. One
@@ -128,11 +133,22 @@ export class PdfGlossManager extends Component {
 	/** Views with a `viewer.then` callback already queued. `then` accumulates
 	 *  callbacks, so without this a scan storm would register dozens. */
 	private awaiting = new WeakSet<View>();
+	/** One per PDF view, watching `contentEl`'s direct children. A plugin that
+	 *  patches `PDFViewerChild` applies its patches by reloading every open viewer
+	 *  (PDF++ does `viewer.unload(); viewer.load(); viewer.loadFile()`), which
+	 *  discards the child and empties `contentEl` while firing no workspace event
+	 *  — leaving us bound to a dead child. `contentEl` survives and holds only
+	 *  four direct children, so childList on it is a precise "viewer rebuilt"
+	 *  signal. */
+	private observers = new Map<View, MutationObserver>();
 
 	constructor(
 		private app: App,
 		private settings: () => HighlightsPaneSettings,
 		private saveSettings: () => Promise<void>,
+		/** Report a page-based reading fraction for a PDF, so its Library card
+		 *  tracks progress the way an epub's does. */
+		private onProgress: (path: string, pct: number) => void,
 	) {
 		super();
 	}
@@ -163,6 +179,8 @@ export class PdfGlossManager extends Component {
 		// second controller stacked on top when the new instance attaches.
 		for (const [view, controller] of this.controllers) view.removeChild(controller);
 		this.controllers.clear();
+		for (const observer of this.observers.values()) observer.disconnect();
+		this.observers.clear();
 	}
 
 	private scan(): void {
@@ -170,12 +188,29 @@ export class PdfGlossManager extends Component {
 		for (const view of Array.from(this.controllers.keys())) {
 			if (!live.has(view)) this.controllers.delete(view);
 		}
-		for (const leaf of this.app.workspace.getLeavesOfType("pdf")) this.consider(leaf);
+		for (const [view, observer] of Array.from(this.observers)) {
+			if (!live.has(view)) {
+				observer.disconnect();
+				this.observers.delete(view);
+			}
+		}
+		for (const leaf of this.app.workspace.getLeavesOfType("pdf")) this.consider(leaf.view as PdfView);
 	}
 
-	private consider(leaf: WorkspaceLeaf): void {
-		const view = leaf.view as PdfView;
-		const viewer = view?.viewer;
+	/** Re-run {@link consider} whenever the viewer's DOM is rebuilt under us.
+	 *  Idempotent; the observer outlives any individual controller, which is the
+	 *  point — the controller is what gets orphaned. */
+	private watch(view: PdfView): void {
+		if (this.observers.has(view) || !(view.contentEl instanceof HTMLElement)) return;
+		const observer = new MutationObserver(() => this.consider(view));
+		observer.observe(view.contentEl, { childList: true });
+		this.observers.set(view, observer);
+	}
+
+	private consider(view: PdfView): void {
+		if (!view) return;
+		this.watch(view);
+		const viewer = view.viewer;
 		// Deferred view (Obsidian 1.7+): the viewer doesn't exist until the leaf
 		// actually loads. Never force it — a later scan will catch it.
 		if (!viewer || typeof viewer.then !== "function") return;
@@ -195,15 +230,21 @@ export class PdfGlossManager extends Component {
 	private attach(view: PdfView, child: PdfViewerChild): void {
 		const existing = this.controllers.get(view);
 		if (existing) {
-			// Same document — already wired.
-			if (existing.child === child) return;
-			// The leaf swapped files: the old child (and its DOM) is gone.
+			// Same document, and our DOM is still in it — already wired. The button
+			// is still re-asserted: the toolbar is rebuilt on reload and can arrive
+			// after the child does, so an earlier mount may have had nowhere to put it.
+			if (existing.child === child && existing.isMounted()) {
+				existing.ensureToolbarButton();
+				return;
+			}
+			// Either the leaf swapped files, or the viewer was reloaded under us and
+			// emptied `contentEl`. Both leave the old child (and its DOM) dead.
 			view.removeChild(existing);
 			this.controllers.delete(view);
 		}
 		if (!supportsPdfGloss(child)) return;
 		const controller = new PdfGlossController(
-			this.app, this.settings, this.saveSettings, child, view,
+			this.app, this.settings, this.saveSettings, child, view, this.onProgress,
 		);
 		this.controllers.set(view, controller);
 		view.addChild(controller);
@@ -239,16 +280,17 @@ export class PdfGlossController extends Component {
 	private unloaded = false;
 	/** Non-zero while a submit is in flight. `reloadHighlights` replaces `saved`
 	 *  wholesale, and the vault `modify` from our own `appendCallout` lands mid-
-	 *  flow — swapping the array out between the reload and the pane picking the
-	 *  new entry up, so the AI exchange ends up mutating an object that is no
-	 *  longer in the list. Suppressing the reparse for the duration is enough:
-	 *  we already hold the authoritative in-memory state. */
+	 *  flow, leaving the AI exchange mutating an object no longer in the list.
+	 *  Suppressing the reparse is safe — in-memory state is authoritative. */
 	private persisting = 0;
 	/** Companion path the current `saved` list was read for. `undefined` means
 	 *  "never loaded"; `null` means "loaded, but this view has no file yet".
 	 *  Distinguishing the two is what lets the first render trigger a load. */
 	private loadedPath: string | null | undefined = undefined;
 	private onTextLayerRendered = (e: { pageNumber?: number }): void => {
+		// A rendered page proves the toolbar exists, which it may not have when the
+		// child was handed to us. Cheap to re-assert; a no-op once the button is up.
+		this.ensureToolbarButton();
 		// `viewer.then` can hand us a child before `child.file` is populated, so
 		// the load in `onload` may have had no path to read. The first rendered
 		// text layer is the earliest reliable point at which the file is known —
@@ -260,12 +302,31 @@ export class PdfGlossController extends Component {
 		if (typeof e.pageNumber === "number") this.paintPage(e.pageNumber);
 	};
 
+	/** Debounce for the progress write below: `pagechanging` fires on every page
+	 *  boundary a scroll crosses, and each write persists data.json. */
+	private progressTimer: number | null = null;
+	private onPageChanging = (e: { pageNumber?: number }): void => {
+		const path = this.child.file?.path;
+		const total = this.child.pdfViewer.pdfViewer?.pagesCount;
+		if (!path || typeof e.pageNumber !== "number" || typeof total !== "number") return;
+		// Same convention as the reader's spread fraction, so both formats mean the
+		// same thing on a Library card: page 1 of many is 0 ("Unread"), the last
+		// page is 1. A single-page document is wholly visible, so it reports 1.
+		const pct = total > 1 ? Math.max(0, Math.min(1, (e.pageNumber - 1) / (total - 1))) : 1;
+		if (this.progressTimer !== null) window.clearTimeout(this.progressTimer);
+		this.progressTimer = window.setTimeout(() => {
+			this.progressTimer = null;
+			this.onProgress(path, pct);
+		}, 800);
+	};
+
 	constructor(
 		private app: App,
 		private settings: () => HighlightsPaneSettings,
 		private saveSettings: () => Promise<void>,
 		readonly child: PdfViewerChild,
 		private view: View,
+		private onProgress: (path: string, pct: number) => void,
 	) {
 		super();
 	}
@@ -286,11 +347,33 @@ export class PdfGlossController extends Component {
 		this.addChild(this.preview);
 		this.mountPane();
 
-		this.registerDomEvent(this.child.containerEl, "mouseup", () => this.onMouseUp());
+		this.registerDomEvent(this.child.containerEl, "mouseup", () => this.raiseForSelection());
 		this.registerDomEvent(this.child.containerEl, "click", (e: MouseEvent) => this.onClick(e));
-		this.registerDomEvent(this.child.containerEl, "mousemove", (e: MouseEvent) => this.onMouseMove(e));
-		this.registerDomEvent(this.child.containerEl, "mouseleave", () => this.preview?.hide());
+		// Pointer only. Touch synthesises mousemove on tap, which would raise the
+		// preview under the finger and strand it there — mouseleave never fires
+		// without a pointer to leave with. The tap grammar replaces it (onClick).
+		if (!Platform.isMobile) {
+			this.registerDomEvent(this.child.containerEl, "mousemove", (e: MouseEvent) => this.onMouseMove(e));
+			this.registerDomEvent(this.child.containerEl, "mouseleave", () => this.preview?.hide());
+		}
 		this.registerDomEvent(document, "mousedown", (e: MouseEvent) => this.onDocMouseDown(e));
+		// Touch has no usable mouseup; the bar rises off a settled selection.
+		registerTouchSelectionRaise(this, this.surface, () => this.raiseForSelection());
+		// Second half of the touch two-step: a tap on the preview itself opens the
+		// conversation. The preview is body-scoped, so this can't live on the
+		// container. `defaultPrevented` is what stops the tap that *raised* the
+		// preview from immediately hiding it again — `onClick` marks it handled.
+		if (Platform.isMobile) {
+			this.registerDomEvent(document, "click", (e: MouseEvent) => {
+				const preview = this.preview;
+				if (e.defaultPrevented || !preview) return;
+				const onPreview = (e.target as Element | null)?.closest(".tmr-annotation-preview");
+				const idx = preview.hoveredIdx;
+				const saved = onPreview && idx !== -1 ? this.saved[idx] : null;
+				preview.hide();
+				if (saved) this.openConversationFor(idx, saved);
+			});
+		}
 		this.registerDomEvent(document, "keydown", (e: KeyboardEvent) => this.onKeyDown(e));
 		// A fixed-position floater over text that just scrolled away is worse
 		// than no floater. The scroll container is pdf.js's own viewer wrapper.
@@ -308,16 +391,18 @@ export class PdfGlossController extends Component {
 		// repainting here is all the upkeep the overlays need.
 		this.child.pdfViewer.eventBus.on("textlayerrendered", this.onTextLayerRendered);
 
+		// Reading position for the Library card. pdf.js announces the current page
+		// (not the rendered one) on `pagechanging`, which is the only signal that
+		// means "the reader is here now" — scroll, deep link and page box alike.
+		this.child.pdfViewer.eventBus.on("pagechanging", this.onPageChanging);
+
 		// Keep the overlays honest when the companion doc is edited directly —
 		// in another pane, on another device, or by our own writes.
 		this.registerEvent(this.app.vault.on("modify", (file: TAbstractFile) => {
 			if (file.path !== this.companionPath()) return;
-			// An open chat holds a live reference to its `SavedHighlight`, and an
-			// AI exchange mutates that object as it streams — while also writing
-			// the doc on every turn, which is what fired this event. Re-parsing
-			// here would swap the whole list out from under the exchange, leaving
-			// it appending into an object no longer in `saved`. In-memory state is
-			// already current for our own writes; skip until the chat closes.
+			// A streaming AI exchange writes the doc on every turn — the event
+			// firing here. Re-parsing would swap the list out from under it, so
+			// skip until the chat closes; in-memory state is already current.
 			if (this.persisting > 0) return;
 			if (this.pane && this.pane.activeConversationIdx !== -1) return;
 			void this.reloadHighlights();
@@ -329,6 +414,8 @@ export class PdfGlossController extends Component {
 	onunload(): void {
 		this.unloaded = true;
 		this.child.pdfViewer.eventBus.off?.("textlayerrendered", this.onTextLayerRendered);
+		this.child.pdfViewer.eventBus.off?.("pagechanging", this.onPageChanging);
+		if (this.progressTimer !== null) window.clearTimeout(this.progressTimer);
 		this.clearOverlays();
 		// Everything we grafted onto Obsidian's own DOM comes back off: the pane
 		// host class, the pane itself, and the toolbar button.
@@ -364,17 +451,29 @@ export class PdfGlossController extends Component {
 		pane.applyAiFeaturesState();
 		pane.syncTheme();
 		applyGlossTheme(host, this.settings());
+		this.ensureToolbarButton();
+	}
 
+	/** True while the DOM we grafted onto the viewer is still there. A viewer
+	 *  reload empties `containerEl`, so a controller can be bound to a live child
+	 *  and still have nothing on screen. */
+	isMounted(): boolean {
+		return !!this.child.containerEl.querySelector(".tmr-highlights-panel");
+	}
+
+	/** Put the Highlights toggle in the native toolbar's right strip unless it's
+	 *  already there. Re-runnable by design: the toolbar is rebuilt on every viewer
+	 *  reload and can lag the child, so mount time isn't always the right moment. */
+	ensureToolbarButton(): void {
 		const strip = this.child.toolbar?.toolbarRightEl;
-		if (strip) {
-			const btn = strip.createEl("button", { cls: "clickable-icon tmr-pdf-pane-toggle" });
-			setIcon(btn, "pencil-line");
-			setTooltip(btn, "Highlights & annotations");
-			this.registerDomEvent(btn, "click", (e: MouseEvent) => {
-				e.stopPropagation();
-				pane.toggle();
-			});
-		}
+		if (!strip || strip.querySelector(".tmr-pdf-pane-toggle")) return;
+		const btn = strip.createEl("button", { cls: "clickable-icon tmr-pdf-pane-toggle" });
+		setIcon(btn, "pencil-line");
+		setTooltip(btn, "Highlights & annotations");
+		this.registerDomEvent(btn, "click", (e: MouseEvent) => {
+			e.stopPropagation();
+			this.pane?.toggle();
+		});
 	}
 
 	/** Toggle the pane. Public so the plugin's command can reach it. */
@@ -486,7 +585,10 @@ export class PdfGlossController extends Component {
 
 	// ── Selection ───────────────────────────────────────────────────────────
 
-	private onMouseUp(): void {
+	/** Resolve the live selection into a pending anchor and raise the GlossBar
+	 *  over it. Reached from mouseup on a pointer, and from a settled
+	 *  `selectionchange` on touch. */
+	private raiseForSelection(): void {
 		const sel = window.getSelection();
 		if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
 			this.dismiss();
@@ -586,12 +688,29 @@ export class PdfGlossController extends Component {
 	 *  highlight opens the pane's Conversations tab and expands that card —
 	 *  EPUB parity. Non-AI highlights stay inert. */
 	private onClick(e: MouseEvent): void {
-		const pane = this.pane;
-		if (!pane || this.saved.length === 0) return;
+		if (!this.pane || this.saved.length === 0) return;
 		const idx = hitTestHighlightRects(this.child.containerEl, e.clientX, e.clientY);
 		if (idx === -1) return;
 		const saved = this.saved[idx];
-		if (!saved || !GLOSS_AI_MODES.has(saved.mode)) return;
+		if (!saved) return;
+		// Touch has no hover, so the preview needs a tap of its own, and the pane
+		// sits behind a second tap — opening it on the first would hijack the read
+		// every time a thumb landed on an old highlight. Emphasise highlights get
+		// the preview too: on a phone it's the only way to read their note.
+		if (Platform.isMobile) {
+			e.preventDefault();
+			this.preview?.showFor(idx, saved, e.clientX, e.clientY);
+			return;
+		}
+		this.openConversationFor(idx, saved);
+	}
+
+	/** Open the pane's Conversations tab on a highlight's card — EPUB parity.
+	 *  Non-AI highlights stay inert. Reached from a pointer click, and from the
+	 *  second tap of the touch two-step. */
+	private openConversationFor(idx: number, saved: SavedHighlight): void {
+		const pane = this.pane;
+		if (!pane || !GLOSS_AI_MODES.has(saved.mode)) return;
 		// Bare-flagged callouts only appear in the list when the quick-settings
 		// toggle is on; expanding a card nobody can see would be a dead end.
 		if (pane.isBareFlagged(saved) && !this.settings().showBareFlaggedConversations) return;

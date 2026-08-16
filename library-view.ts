@@ -5,8 +5,7 @@ import { scanLibrary, computeCollections, detectExplodedEpubs, type LibraryBook 
 
 export const LIBRARY_VIEW_TYPE = "tmr-library";
 
-/** Rotating subtitle greetings. Cosmetic — one is picked at random per mount.
- *  Copy set owned by Rohan (spec R4); this is the seed. */
+/** Rotating subtitle greetings. Cosmetic — one is picked at random per mount. */
 const GREETINGS = [
 	"Pick something to read.",
 	"What are you in the mood for?",
@@ -15,16 +14,25 @@ const GREETINGS = [
 	"Something old, or something new?",
 ];
 
+/** Shelf order: most recently read first, never-opened books after them in the
+ *  scan's alphabetical order. Applied at render rather than in `scanLibrary` so
+ *  every surface that draws a grid (shelf, collection tab, search group) gets it
+ *  from one place and no re-order ever costs a vault re-scan.
+ *
+ *  Sorts a copy and relies on `Array.sort` being stable, so books sharing a
+ *  `lastRead` of 0 keep the alphabetical order they arrived in.
+ *
+ *  `updateBookProgress` depends on the newest book landing at index 0 to decide
+ *  whether a page turn changed the order — a sort that isn't purely `lastRead`
+ *  desc needs that check rewritten. */
+function sortForShelf(books: LibraryBook[]): LibraryBook[] {
+	return [...books].sort((a, b) => b.lastRead - a.lastRead);
+}
+
 /**
  * The plugin's home surface: a grid of every book in the vault's `Library/`
- * folder. This is the destination the ribbon and command palette open by
- * default, replacing the empty "Opening…" reader tab (bug B1).
- *
- * Phase C added the collection strip (folder-derived tabs + Everything), tab
- * filtering, Add-Folder, Import, drag-reorder, global search, and the
- * exploded-epub import nudge. Phase D wires real reading progress + annotation
- * marks onto the cards and live-refreshes on vault changes (see
- * `Feature Docs/Library View - Feature Spec.md`).
+ * folder, and what the ribbon and command palette open by default.
+ * See `Feature Docs/Library View - Feature Spec.md`.
  */
 export class LibraryView extends ItemView {
 	/** Full scan result; the strip/grid filter this in memory (no re-scan on
@@ -102,14 +110,34 @@ export class LibraryView extends ItemView {
 
 	/** Live, in-place update of a single card's progress (fill bar + label) — no
 	 *  re-scan — called from the reader on each position-save. The cached book is
-	 *  updated too so a later full repaint keeps the value. */
+	 *  updated too so a later full repaint keeps the value.
+	 *
+	 *  Also re-sorts when the turn changed the shelf order, so a Library open in
+	 *  a background tab surfaces the book being read. Stamping `lastRead` makes
+	 *  this book the newest, so the order changed iff its card isn't already
+	 *  first — true on the session's first turn, false after, so this repaints
+	 *  once rather than on every page. */
 	updateBookProgress(path: string, pct: number): void {
 		const book = this.books.find((b) => b.path === path);
-		if (book) book.progress = pct;
+		if (book) {
+			book.progress = pct;
+			book.lastRead = Date.now();
+		}
 		if (!this.bodyEl) return;
 		const cards = Array.from(this.bodyEl.querySelectorAll<HTMLElement>(".tmr-lib-card"));
 		const card = cards.find((c) => c.dataset.path === path);
+		// Not on screen at all (filtered out by the active collection or search) —
+		// nothing to move and nothing to repaint.
 		if (!card) return;
+		if (book && card.previousElementSibling) {
+			// Preserved across the repaint: the shelf can be scrolled a long way
+			// down, and resetting it to the top mid-read is worse than the stale
+			// order this is fixing.
+			const scroll = this.bodyEl.scrollTop;
+			this.paintBody();
+			this.bodyEl.scrollTop = scroll;
+			return;
+		}
 		const fill = card.querySelector<HTMLElement>(".tmr-lib-card-track-fill");
 		const pctEl = card.querySelector<HTMLElement>(".tmr-lib-card-pct");
 		if (fill) fill.style.width = `${Math.round(pct * 100)}%`;
@@ -150,7 +178,7 @@ export class LibraryView extends ItemView {
 		this.bodyEl = root.createEl("div", { cls: "tmr-lib-body" });
 
 		// Header/strip paint synchronously above; the grid fills in once the scan
-		// resolves. Empty/loading skeleton refinement is R6 (owned by Rohan).
+		// resolves.
 		this.books = await scanLibrary(
 			this.app.vault,
 			this.plugin.settings.libraryOverrides,
@@ -214,7 +242,10 @@ export class LibraryView extends ItemView {
 		this.tabResizeObserver.observe(tabs);
 
 		// Add-Folder sits with the tabs; the action cluster pins to the right.
+		// Its own class because on a phone it retires with the tabs when search
+		// opens, while 3C and Settings stay — see the mobile block in styles.css.
 		const addFolder = this.iconButton(strip, "folder-plus", "New collection");
+		addFolder.addClass("tmr-lib-add-btn");
 		this.registerDomEvent(addFolder, "click", () => this.promptAddFolder());
 
 		strip.createEl("div", { cls: "tmr-lib-strip-spacer" });
@@ -239,7 +270,7 @@ export class LibraryView extends ItemView {
 	private renderSearchControl(strip: HTMLElement): void {
 		const wrap = strip.createEl("div", { cls: "tmr-lib-search" });
 		this.searchEl = wrap;
-		wrap.toggleClass("tmr-lib-search-open", this.searchOpen);
+		this.syncSearchOpen();
 		setTooltip(wrap, "Search");
 
 		setIcon(wrap.createEl("span", { cls: "tmr-lib-search-icon" }), "search");
@@ -275,9 +306,18 @@ export class LibraryView extends ItemView {
 		});
 	}
 
+	/** Both halves of the open state: the bar's own class, and a root-level twin
+	 *  so the strip's other children can stand down. On a phone the row can't
+	 *  hold the tabs, three icon buttons and an open field at once — see the
+	 *  mobile block in styles.css. */
+	private syncSearchOpen(): void {
+		this.searchEl?.toggleClass("tmr-lib-search-open", this.searchOpen);
+		this.contentEl.toggleClass("tmr-lib-searching", this.searchOpen);
+	}
+
 	private openSearch(): void {
 		this.searchOpen = true;
-		this.searchEl?.addClass("tmr-lib-search-open");
+		this.syncSearchOpen();
 		const input = this.searchInputEl;
 		if (input) {
 			input.tabIndex = 0;
@@ -291,7 +331,7 @@ export class LibraryView extends ItemView {
 	private collapseSearch(): void {
 		this.searchOpen = false;
 		this.searchQuery = "";
-		this.searchEl?.removeClass("tmr-lib-search-open");
+		this.syncSearchOpen();
 		if (this.searchInputEl) {
 			this.searchInputEl.value = "";
 			this.searchInputEl.tabIndex = -1;
@@ -306,8 +346,7 @@ export class LibraryView extends ItemView {
 		tab.toggleClass("tmr-lib-tab-active", this.activeCollection === value);
 		this.registerDomEvent(tab, "click", () => this.selectCollection(value));
 
-		// "Everything" is pinned leftmost; the rest are drag-reorderable. (R9 owns
-		// the richer drop affordance; this is the functional baseline.)
+		// "Everything" is pinned leftmost; the rest are drag-reorderable.
 		if (value) this.wireTabDrag(tab, value);
 	}
 
@@ -357,7 +396,7 @@ export class LibraryView extends ItemView {
 		if (wasSearching) {
 			this.searchOpen = false;
 			this.searchQuery = "";
-			this.searchEl?.removeClass("tmr-lib-search-open");
+			this.syncSearchOpen();
 			if (this.searchInputEl) {
 				this.searchInputEl.value = "";
 				this.searchInputEl.tabIndex = -1;
@@ -467,8 +506,6 @@ export class LibraryView extends ItemView {
 		setTooltip(btn, label);
 	}
 
-	/** Open (or reveal) the importer. Interim: surfaces the importer in the
-	 *  settings tab; a dedicated in-Library import modal is deferred. */
 	/** Opens the plugin's settings tab (where the book importer lives), not a
 	 *  standalone importer — every "import" entry point routes here. */
 	private openSettings(): void {
@@ -614,8 +651,7 @@ export class LibraryView extends ItemView {
 	}
 
 	/** Global search results, grouped by collection with a separator + label so a
-	 *  match's collection is always legible. Visual layout is R2 (owned by Rohan);
-	 *  this is the functional baseline. */
+	 *  match's collection is always legible. */
 	private renderSearchResults(body: HTMLElement, query: string): void {
 		const q = query.toLowerCase();
 		const matches = this.books.filter(
@@ -653,7 +689,7 @@ export class LibraryView extends ItemView {
 
 	private renderGrid(parent: HTMLElement, books: LibraryBook[]): void {
 		const grid = parent.createEl("div", { cls: "tmr-lib-grid" });
-		for (const book of books) this.renderCard(grid, book);
+		for (const book of sortForShelf(books)) this.renderCard(grid, book);
 	}
 
 	private renderCard(grid: HTMLElement, book: LibraryBook): void {
@@ -691,11 +727,18 @@ export class LibraryView extends ItemView {
 		fill.style.width = `${Math.round(book.progress * 100)}%`;
 
 		const stats = foot.createEl("div", { cls: "tmr-lib-card-stats" });
-		stats.createEl("span", {
+		// Progress and format read as one left-hand group so the marks count keeps
+		// the right edge to itself (the row is `space-between`).
+		const left = stats.createEl("div", { cls: "tmr-lib-card-stats-left" });
+		left.createEl("span", {
 			cls: "tmr-lib-card-pct",
 			// progress = the reader's cached `pct`; 0 (or never-opened) reads "Unread".
 			text: book.progress > 0 ? `${Math.round(book.progress * 100)}%` : "Unread",
 		});
+		// Epub is the shelf's default, so only the exception is labelled.
+		if (book.kind === "pdf") {
+			left.createEl("span", { cls: "tmr-lib-card-format", text: "PDF" });
+		}
 		// Marks hidden at zero per spec.
 		if (book.marks > 0) {
 			const marks = stats.createEl("span", { cls: "tmr-lib-card-marks" });
@@ -703,7 +746,7 @@ export class LibraryView extends ItemView {
 			marks.createEl("span", { text: String(book.marks) });
 		}
 
-		const open = () => void this.plugin.openEpubInNewTab(book.path);
+		const open = () => void this.plugin.openBookInNewTab(book.path);
 		this.registerDomEvent(card, "click", open);
 		this.registerDomEvent(card, "keydown", (e: KeyboardEvent) => {
 			if (e.key === "Enter" || e.key === " ") {
@@ -717,15 +760,14 @@ export class LibraryView extends ItemView {
 		});
 	}
 
-	/** Card right-click menu. Minimal for now (open + edit details); the fuller
-	 *  context-menu pattern is R8 (owned by Rohan). */
+	/** Card right-click menu: open + edit details. */
 	private showCardMenu(e: MouseEvent, book: LibraryBook): void {
 		const menu = new Menu();
 		menu.addItem((item) =>
 			item
 				.setTitle("Open book")
 				.setIcon("book-open")
-				.onClick(() => void this.plugin.openEpubInNewTab(book.path))
+				.onClick(() => void this.plugin.openBookInNewTab(book.path))
 		);
 		menu.addItem((item) =>
 			item
@@ -769,7 +811,7 @@ export class LibraryView extends ItemView {
 		empty.createEl("div", { cls: "tmr-lib-empty-title", text: "Your library is empty" });
 		empty.createEl("div", {
 			cls: "tmr-lib-empty-hint",
-			text: "Import a book, or drop .epub files into your Library folder.",
+			text: "Import a book, or drop .epub and .pdf files into your Library folder.",
 		});
 		const importBtn = empty.createEl("button", {
 			cls: "tmr-lib-empty-import",
@@ -803,7 +845,7 @@ class EditBookDetailsModal extends Modal {
 		this.setTitle("Edit book details");
 		contentEl.createEl("p", {
 			cls: "tmr-lib-edit-note",
-			text: "Display only — your epub file is never modified.",
+			text: "Display only — your book file is never modified.",
 		});
 
 		let titleInput: TextComponent;
@@ -819,7 +861,9 @@ class EditBookDetailsModal extends Modal {
 			.setDesc(
 				this.book.rawAuthor
 					? `Original: ${this.book.rawAuthor}`
-					: "No author in the epub metadata."
+					: this.book.kind === "pdf"
+						? "A PDF carries no author metadata — set one here."
+						: "No author in the epub metadata."
 			)
 			.addText((t) => {
 				authorInput = t;

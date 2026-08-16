@@ -35,8 +35,9 @@ import {
 	type ChatMessage,
 } from "./ai-client";
 import {
+	ANNOTATION_MODES,
+	BOOKMARK_MODE,
 	GLOSS_AI_MODES,
-	GLOSS_MODES,
 	GLOSS_PLACEHOLDERS,
 	applyGlossTheme,
 	existingSourceLink,
@@ -394,13 +395,9 @@ export class HighlightsPane extends Component {
 		// against a closed panel and the next toggle is swallowed closing it.
 		this.open = false;
 		this.toggleEl = null;
-		// Highlights navigation panel — mirrors the TOC shell but slides in from
-		// the right. Populated from `savedHighlights` on every open, grouped by
-		// section. Click-to-jump mounts the hosting unit and scrolls the
-		// paragraph into view.
-		//
-		// The floating hover-reveal toggle is the reader's affordance; the PDF
-		// host opts out of it and puts a button in the native PDF toolbar.
+		// Mirrors the TOC shell but slides in from the right. The floating
+		// hover-reveal toggle is the reader's affordance; the PDF host opts out
+		// and puts a button in the native PDF toolbar instead.
 		if (opts.floatingToggle !== false) {
 			const hlToggle = root.createEl("button", { cls: "tmr-highlights-toggle" });
 			setIcon(hlToggle, "pencil-line");
@@ -476,11 +473,11 @@ export class HighlightsPane extends Component {
 			this.refreshCompanionDocButton();
 			panel?.addClass("tmr-highlights-open");
 			this.backdropEl?.addClass("tmr-highlights-backdrop-visible");
-			this.toggleEl?.addClass("tmr-highlights-toggle-hidden");
+			this.toggleEl?.addClass("tmr-chrome-btn-hidden");
 		} else {
 			panel?.removeClass("tmr-highlights-open");
 			this.backdropEl?.removeClass("tmr-highlights-backdrop-visible");
-			this.toggleEl?.removeClass("tmr-highlights-toggle-hidden");
+			this.toggleEl?.removeClass("tmr-chrome-btn-hidden");
 			// Clear active-highlight styling when the panel is dismissed.
 			if (this.activeConvIdx !== -1) {
 				this.activeConvIdx = -1;
@@ -646,8 +643,6 @@ export class HighlightsPane extends Component {
 		const sectionCounts = new Map<string, number>();
 		for (const o of ordered) sectionCounts.set(o.sectionId, (sectionCounts.get(o.sectionId) ?? 0) + 1);
 
-		// Once the whole list is long (>10 marks), every chapter becomes
-		// collapsible so even sparse ones can be folded away to navigate.
 		const manyTotal = ordered.length > 10;
 
 		let lastSectionId = "";
@@ -656,9 +651,9 @@ export class HighlightsPane extends Component {
 			if (sectionId !== lastSectionId) {
 				lastSectionId = sectionId;
 				const count = sectionCounts.get(sectionId) ?? 0;
-				// Collapse earns its UI past a few annotations per chapter, or
-				// once the book as a whole is heavily annotated. Sparse chapters
-				// in a short list stay as plain, always-open headers.
+				// Collapse earns its UI past a few marks per chapter, or once the
+				// book is heavily annotated — sparse chapters in a short list stay
+				// plain and always-open.
 				const collapsible = count > 3 || manyTotal;
 				itemsParent = this.renderSection(
 					list, sectionId, sectionLabel, count, collapsible,
@@ -717,7 +712,9 @@ export class HighlightsPane extends Component {
 		item.dataset.highlightIdx = String(idx);
 
 		const iconEl = item.createEl("span", { cls: "tmr-highlights-item-icon" });
-		const modeMeta = GLOSS_MODES.find((m) => m.id === saved.mode);
+		// ANNOTATION_MODES, not GLOSS_MODES: bookmarks appear in this list but
+		// never as a GlossBar tile, so they're absent from the tile array.
+		const modeMeta = ANNOTATION_MODES.find((m) => m.id === saved.mode);
 		if (modeMeta) setIcon(iconEl, modeMeta.icon);
 
 		const body = item.createEl("div", { cls: "tmr-highlights-item-body" });
@@ -726,17 +723,17 @@ export class HighlightsPane extends Component {
 			cls: "tmr-highlights-item-quote",
 			text: quote.length > 0 ? quote : "(no quote)",
 		});
-		// Note slot. Emphasise notes are free text the reader owns, so they
-		// are click-to-edit and empty ones offer a "+ Add a note" prompt.
-		// Other modes' "note" is the AI query — shown, but not editable here
-		// (that belongs to the Conversations chat surface).
+		// Emphasise and Bookmark notes are the reader's own free text, so they're
+		// click-to-edit here; other modes' "note" is the AI query, editable only
+		// in the chat surface. A bookmark fires from the reader chrome with no
+		// gloss input, so this pane is the only place to write its note.
 		const note = saved.userText.trim();
-		const isEmphasise = saved.mode === "emphasise";
-		if (this.editingNoteIdx === idx && isEmphasise) {
+		const noteEditable = saved.mode === "emphasise" || saved.mode === BOOKMARK_MODE.id;
+		if (this.editingNoteIdx === idx && noteEditable) {
 			this.renderNoteEditor(body, idx, saved.userText);
 		} else if (note.length > 0) {
 			const noteEl = body.createEl("div", { cls: "tmr-highlights-item-note", text: note });
-			if (isEmphasise) {
+			if (noteEditable) {
 				noteEl.addClass("tmr-highlights-item-note-editable");
 				noteEl.setAttr("title", "Click to edit");
 				this.registerDomEvent(noteEl, "click", (e) => {
@@ -745,7 +742,7 @@ export class HighlightsPane extends Component {
 					this.renderHighlightsList();
 				});
 			}
-		} else if (isEmphasise) {
+		} else if (noteEditable) {
 			const addEl = body.createEl("div", {
 				cls: "tmr-highlights-item-add-note",
 				text: "+ Add a note",
@@ -835,14 +832,19 @@ export class HighlightsPane extends Component {
 
 	/** Delete an annotation: excise its callout from the companion doc, drop it
 	 *  from the in-memory list, and repaint overlays + pane. Confirmation-gated
-	 *  because the callout (and any AI conversation it holds) is removed. */
-	private async deleteHighlightAt(idx: number): Promise<void> {
+	 *  by default because the callout (and any AI conversation it holds) is
+	 *  removed.
+	 *
+	 *  `confirmFirst: false` is for un-bookmarking, where the same button that
+	 *  made the bookmark unmakes it: a modal to undo a one-tap action nobody can
+	 *  lose work to would be noise. Public for that caller — the pane owns the
+	 *  companion-doc writers, so removal has to happen here. */
+	async deleteHighlightAt(idx: number, confirmFirst = true): Promise<void> {
 		const saved = this.saved[idx];
 		if (!saved) return;
-		const ok = window.confirm(
+		if (confirmFirst && !window.confirm(
 			"Delete this annotation? It will be removed from the companion doc. This cannot be undone (the doc remains in vault history).",
-		);
-		if (!ok) return;
+		)) return;
 
 		const path = this.host.companionDocPath();
 		const file = path ? this.app.vault.getFileByPath(path) : null;
@@ -861,7 +863,9 @@ export class HighlightsPane extends Component {
 		this.host.repaintHighlights();
 		this.renderHighlightsList();
 		if (this.paneTab === "conversations") this.renderConversationsList();
-		new Notice("Annotation deleted");
+		// Only the confirmed path announces itself. Un-bookmarking already has a
+		// visual answer — the button goes inactive under the finger.
+		if (confirmFirst) new Notice("Annotation deleted");
 	}
 
 	// ─── Conversations tab ──────────────────────────────────────────────────
@@ -1319,11 +1323,10 @@ export class HighlightsPane extends Component {
 	private shouldQueueAi(provider: AiProvider | null): boolean {
 		if (!Platform.isMobile) return false;
 		if (this.host.settings().deferAiToDesktop) return true;
-		// Only "there is nothing to call". A provider that exists but resolves
-		// no model is *misconfigured*, not absent — queueing that would answer a
-		// settings mistake with "Queued — processes on desktop" and the user
-		// would never learn what was wrong. It falls through to the explicit
-		// "No model configured" error instead, same as desktop.
+		// Only "there is nothing to call". A provider that resolves no model is
+		// *misconfigured*, not absent: queueing would answer a settings mistake
+		// with "Queued — processes on desktop" and hide it. That case falls
+		// through to the explicit "No model configured" error, as on desktop.
 		return !provider;
 	}
 
@@ -1363,13 +1366,11 @@ export class HighlightsPane extends Component {
 
 		const provider = this.getActiveProvider();
 
-		// Tier 1 deferred queue. The callout has just been written with the user
-		// turn and a pending marker, which *is* the queue entry — so queueing is
-		// the absence of a call, not an extra write. One branch here covers both
-		// entry points (opener and follow-up) because they both funnel through
-		// this method, and the transcript parser reconstructs turn history either
-		// way, so a queued continuation is indistinguishable from a queued
-		// opener when the desktop picks it up.
+		// Tier 1 deferred queue. The callout already carries the user turn and a
+		// pending marker, which *is* the queue entry — queueing is the absence
+		// of a call, not an extra write. Openers and follow-ups both funnel
+		// through here, and the transcript parser rebuilds turn history either
+		// way, so the desktop can't tell them apart.
 		if (this.shouldQueueAi(provider)) {
 			saved.aiState = "pending";
 			delete saved.livePhase; delete saved.streamingText;

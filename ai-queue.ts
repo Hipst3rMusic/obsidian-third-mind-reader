@@ -5,10 +5,9 @@
  *  The companion doc *is* the queue: no new storage, and Obsidian Sync is the
  *  transport. This module answers those markers from a desktop session.
  *
- *  Deliberately headless — it takes a `TFile` and never a view. That is what
+ *  Deliberately headless — it takes a `TFile` and never a view, which is what
  *  lets the palette command drain every flagged doc in the vault without
- *  opening a single book, and it is why the callout rewriters live in
- *  `gloss.ts` rather than inside the Highlights pane.
+ *  opening a single book.
  */
 
 import { App, TFile } from "obsidian";
@@ -102,11 +101,9 @@ export async function processPendingInFile(
 			resolved++;
 		} catch (err) {
 			const msg = (err as Error).message ?? "Unknown error";
-			// A rate limit is not this exchange's fault, and it will hit every
-			// remaining one in the batch. Stop the drain and leave them pending
-			// rather than burning the queue down into a column of identical
-			// errors the user then has to retry by hand. Free tiers (OpenRouter)
-			// make this the common failure, not an exotic one.
+			// A rate limit will hit every remaining exchange in the batch, so stop
+			// and leave them pending rather than burning the queue down into a
+			// column of identical errors. Common on free tiers, not exotic.
 			if (/\b429\b|rate limit/i.test(msg)) {
 				return { resolved, failed, rateLimited: true };
 			}
@@ -124,13 +121,10 @@ export async function processPendingInFile(
 }
 
 /** The turns to send for one entry, seeding the opener from `userText` when the
- *  callout carries no `User:` prefix.
- *
- *  Phase 2 callouts wrote the user's line bare, so the parser files it under
- *  `userText` and leaves `turns` empty. The pane already seeds the same way at
- *  the top of `doAiExchange`; without the mirror here a queued exchange in that
- *  format was filtered out as "nothing pending" and then had its frontmatter
- *  flag cleared — silently dropping the request. */
+ *  callout carries no `User:` prefix. Phase 2 callouts wrote the user's line
+ *  bare, so the parser leaves `turns` empty; `doAiExchange` seeds the same way,
+ *  and without the mirror here such an exchange is filtered out as "nothing
+ *  pending" and has its flag cleared, silently dropping the request. */
 function conversationTurns(saved: SavedHighlight): ConversationTurn[] {
 	if (saved.turns.length > 0) return saved.turns;
 	const opener = saved.userText.trim();

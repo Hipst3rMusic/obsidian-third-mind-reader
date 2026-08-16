@@ -33,12 +33,8 @@ export interface ChatRequest {
 	 *  bill hidden reasoning to the same budget add `reasoningTokens` on top, so
 	 *  a caller asking for 512 always gets 512 tokens of prose to spend. */
 	maxTokens?: number;
-	/** Headroom for hidden reasoning, on top of `maxTokens`. Reasoning models
-	 *  emit their chain of thought into the same completion budget as the
-	 *  answer, so a single cap makes brevity and deliberation compete: the model
-	 *  thinks, runs out, and returns a truncated answer — or none at all. This
-	 *  splits them: an allowance added on top, with how hard to think left to
-	 *  the model. See `applyTokenBudget` for why it isn't capped explicitly. */
+	/** Headroom for hidden reasoning, added on top of `maxTokens` rather than
+	 *  shared with it. See `applyTokenBudget`. */
 	reasoningTokens?: number;
 	/** Request a token-by-token stream. Only honoured for openai-compatible
 	 *  providers (local servers like LM Studio / Ollama, which permit a direct
@@ -308,22 +304,16 @@ async function chatAnthropic(
 /** Write `max_tokens` (and, where supported, an explicit reasoning cap) onto an
  *  OpenAI-shaped request body.
  *
- *  Every provider in this file bills hidden reasoning tokens against the same
- *  completion budget as the answer — Anthropic's `budget_tokens` must fit
- *  inside `max_tokens`, and OpenAI/OpenRouter count reasoning as completion
- *  tokens — so a single cap is not a length control, it's a race between
- *  thinking and answering that the answer loses. The budget is therefore
- *  additive here, and brevity is left to the system prompts, which ask for it
- *  directly and can shorten prose instead of truncating it mid-sentence.
+ *  Every provider here bills hidden reasoning against the same completion budget
+ *  as the answer, so a single cap is a race between thinking and answering that
+ *  the answer loses. The budget is additive instead, and brevity is left to the
+ *  system prompts — a prompt shortens prose where a low ceiling truncates it.
  *
- *  Deliberately does NOT send OpenRouter's `reasoning.max_tokens`. Models that
- *  expose effort levels rather than a token budget (gpt-oss, and most of the
- *  open-weight reasoning set) have it mapped onto an effort level, and measured
- *  against gpt-oss-20b a 1024-token budget mapped *below* the model's own
- *  default — 60 reasoning tokens against 98 unconstrained. Capping reasoning
- *  bought nothing and quietly made the model think less than it would have on
- *  its own. The headroom alone is the whole fix: leave effort to the model and
- *  make sure there are tokens left for the answer afterwards. */
+ *  Deliberately does NOT send OpenRouter's `reasoning.max_tokens`: models that
+ *  expose effort levels rather than a token budget have it mapped onto an
+ *  effort level, and a 1024-token budget can map *below* the model's own
+ *  default (60 reasoning tokens against 98 unconstrained), making it think less
+ *  than it would unconstrained. Headroom alone is the fix. */
 function applyTokenBudget(req: ChatRequest, body: Record<string, any>): void {
 	if (!req.maxTokens) return;
 	body.max_tokens = req.maxTokens + (req.reasoningTokens ?? 0);
@@ -473,16 +463,14 @@ async function chatOpenAILikeStreaming(
  *  a hosted service?
  *
  *  `openai-compatible` names a *wire format*, not a location — LM Studio, a LAN
- *  desktop, OpenRouter and Groq all speak it. Several behaviours only make sense
- *  for a server you control (probing which model is resident, expecting no auth),
- *  and they used to key off the kind, which quietly assumed local. Derive it from
- *  the URL instead: no extra state to persist, and it stays correct for a LAN
- *  address, which is equally "yours" and equally not localhost.
+ *  desktop, OpenRouter and Groq all speak it. Behaviours that only make sense
+ *  for a server you control (probing which model is resident, expecting no auth)
+ *  must key off the URL, not the kind, which stays correct for a LAN address.
  *
- *  Private-network ranges per RFC 1918 + loopback + `.local` mDNS names. A
- *  hostname we can't parse is treated as remote: the conservative direction,
- *  since the cost of being wrong is a skipped optimisation rather than a
- *  pointless request to somebody else's server. */
+ *  Private-network ranges per RFC 1918 + loopback + `.local` mDNS names. An
+ *  unparseable hostname is treated as remote — being wrong that way costs a
+ *  skipped optimisation rather than a pointless request to someone else's
+ *  server. */
 export function isLocalEndpoint(endpoint: string | undefined): boolean {
 	if (!endpoint) return false;
 	let host: string;
@@ -500,17 +488,10 @@ export function isLocalEndpoint(endpoint: string | undefined): boolean {
 	return /^172\.(1[6-9]|2\d|3[01])\./.test(host);
 }
 
-/** Pick a model ID for the given provider + mode, falling back to sensible
- *  per-kind defaults when `provider.defaultModel` is unset. Lives beside the
- *  client because the Highlights pane and the deferred-queue processor both
- *  resolve models, and a second copy would drift from these defaults. */
-/** The answer-length and thinking allowances for one gloss mode.
- *
- *  Explain is the terse one by design; the others are given room for prose.
- *  These are ceilings that stop a runaway, not the lever for brevity — the
- *  system prompts do that, and a prompt shortens an answer where a low ceiling
- *  merely cuts it off. The reasoning allowance is uniform: how hard a question
- *  is to think about has little to do with how long its answer should be. */
+/** The answer-length and thinking allowances for one gloss mode. Ceilings that
+ *  stop a runaway, not the lever for brevity — the system prompts do that. The
+ *  reasoning allowance is uniform: how hard a question is to think about has
+ *  little to do with how long its answer should be. */
 export function tokenBudget(mode: string): { maxTokens: number; reasoningTokens: number } {
 	return { maxTokens: mode === "explain" ? 512 : 1024, reasoningTokens: 1024 };
 }

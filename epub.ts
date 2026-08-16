@@ -337,6 +337,39 @@ export async function extractLinkPreview(
 	return buildTextPreview(target, resolved.path);
 }
 
+/** Elements the HTML parser closes for you. Everything else that arrives
+ *  self-closed has to be rewritten — see expandSelfClosingTags. */
+const VOID_ELEMENTS = new Set([
+	"area", "base", "br", "col", "embed", "hr", "img", "input",
+	"link", "meta", "param", "source", "track", "wbr",
+]);
+
+/** Rewrite `<tag …/>` into `<tag …></tag>` for non-void elements.
+ *
+ *  Epub spine files are XHTML, where `<a id="page8"/>` is a legal empty element.
+ *  We parse them with the *HTML* parser (deliberately — XML parsing dies on the
+ *  undeclared `&nbsp;` that half the corpus contains), and the HTML parser
+ *  ignores that trailing slash. The tag stays open, so everything after it up to
+ *  the enclosing block's end becomes the anchor's content.
+ *
+ *  Print-page markers are the common case, and the damage is invisible on
+ *  desktop: the anchor has no href, so it renders identically. On mobile it is
+ *  not — Obsidian marks a touched anchor with `.mobile-tap { opacity: 0.5 }`
+ *  over a `transition: opacity`, so pressing anywhere in an affected paragraph
+ *  fades that whole swallowed run of text out and back.
+ *
+ *  Done on the source text rather than by repairing anchors after the fact,
+ *  because the parse is what is wrong: the author wrote an empty element and we
+ *  should read one. Quoted attribute values are stepped over so a `/>` inside an
+ *  href or a style can't be mistaken for a tag end. */
+export function expandSelfClosingTags(html: string): string {
+	return html.replace(
+		/<([a-zA-Z][a-zA-Z0-9-]*)((?:"[^"]*"|'[^']*'|[^>"'])*?)\/>/g,
+		(whole, tag: string, attrs: string) =>
+			VOID_ELEMENTS.has(tag.toLowerCase()) ? whole : `<${tag}${attrs}></${tag}>`,
+	);
+}
+
 export async function renderSpineRange(
 	book: EpubBook,
 	startSpine: number,
@@ -360,7 +393,7 @@ export async function renderSpineRange(
 		const raw = await book.zip.file(filePath)!.async("string");
 
 		const parser = new DOMParser();
-		const doc = parser.parseFromString(raw, "text/html");
+		const doc = parser.parseFromString(expandSelfClosingTags(raw), "text/html");
 		const body = doc.querySelector("body");
 		if (!body) continue;
 
@@ -945,8 +978,37 @@ function sanitizeEpubBody(body: Element): void {
 
 // ─── Internal parsers ─────────────────────────────────────────────────────────
 
+/** Parse XML, separating *damaged input* from *valid input we didn't expect*.
+ *
+ *  DOMParser never throws — on malformed input it returns a document whose
+ *  content is a `<parsererror>` element, which undetected makes a half-synced
+ *  file look like a malformed book. Nothing upstream catches it either: jszip
+ *  does not verify CRC32 unless asked, so a partial file whose central
+ *  directory survives inflates to nonsense and comes back as a plain string.
+ *
+ *  The distinction is the point: "no rootfile element" reads as a permanent
+ *  property of the book, so a reader gives up on it. "Still syncing" tells
+ *  them to wait. */
+function parseXmlOrThrow(xml: string, label: string): Document {
+	// Strip a leading BOM before parsing: an XML declaration must be the first
+	// thing in the document, and the engines disagree on enforcing that —
+	// Chromium accepts a leading U+FEFF, WebKit rejects it, so a BOM'd epub opens
+	// on desktop and fails on iOS. jszip hands the BOM back as a character,
+	// because `async("string")` decodes the UTF-8 bytes without stripping it.
+	// Leading whitespace is equally illegal and equally common, so it goes too.
+	const doc = new DOMParser().parseFromString(xml.replace(/^\uFEFF/, "").trimStart(), "application/xml");
+	// Engines disagree on the parsererror element's namespace, so try both
+	// lookups rather than trusting either to match on local name alone.
+	if (doc.querySelector("parsererror") ?? doc.getElementsByTagName("parsererror")[0]) {
+		throw new Error(
+			`${label} could not be read. The copy of this book on this device may be incomplete — if it is syncing (iCloud, Obsidian Sync), give it a moment and try again.`,
+		);
+	}
+	return doc;
+}
+
 function parseContainerXml(xml: string): string {
-	const doc = new DOMParser().parseFromString(xml, "application/xml");
+	const doc = parseXmlOrThrow(xml, "container.xml");
 	const rootfile = doc.querySelector("rootfile");
 	if (!rootfile) throw new Error("container.xml: no rootfile element found");
 	return rootfile.getAttribute("full-path") ?? "";
@@ -958,7 +1020,10 @@ function parseOpf(xml: string, _opfDir: string): {
 	spine: EpubManifestItem[];
 	manifest: Record<string, EpubManifestItem>;
 } {
-	const doc = new DOMParser().parseFromString(xml, "application/xml");
+	// Same guard as container.xml. A damaged OPF is worse than a damaged
+	// container: nothing here throws on missing elements, so it would open as an
+	// "Untitled" book with an empty spine rather than reporting anything.
+	const doc = parseXmlOrThrow(xml, "The book's package file (.opf)");
 
 	const title = doc.querySelector("metadata > title, metadata *|title")?.textContent?.trim() ?? "Untitled";
 	// First dc:creator only; multi-author handling deferred.

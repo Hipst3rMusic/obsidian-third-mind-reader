@@ -65,13 +65,11 @@ export class OffsetMap {
 				const paraId = `s${spineIndex}-p${paraCount}`;
 				el.dataset.paraId = paraId;
 
-				// Only genuine prose <p> gets a drop cap (never an <li>). ToC entries,
-				// dedications, epigraphs, and chapter-number-only pages all pass
-				// findChapterOpenerIndex (heading → first <p>) but are too short to
-				// warrant decoration. A source paragraph carrying its own explicit
-				// drop-cap markup counts as an opener even when heading detection
-				// fails — some books (e.g. Out of Your Mind) style every "heading"
-				// as a classed <p>, leaving no h1–h3 for the heuristic to anchor on.
+				// Only genuine prose <p> gets a drop cap (never an <li>): ToC entries,
+				// dedications and epigraphs pass findChapterOpenerIndex but are too
+				// short to decorate. Explicit source drop-cap markup counts as an
+				// opener on its own, for books that style every "heading" as a
+				// classed <p> and leave no h1–h3 for the heuristic to anchor on.
 				const explicitDrop = el.tagName === "P" && hasExplicitDropCap(el);
 				const isChapterOpener =
 					el.tagName === "P" &&
@@ -136,7 +134,6 @@ export class OffsetMap {
 		const endParaId = endP.dataset.paraId;
 		if (!endParaId) return null;
 
-		// Single-paragraph case
 		if (endParaId === paraId) {
 			const endOffset = getCharOffsetInParagraph(endP, range.endContainer, range.endOffset);
 			if (endOffset < 0) return null;
@@ -145,7 +142,6 @@ export class OffsetMap {
 			return { paraId, start, end };
 		}
 
-		// Cross-paragraph case
 		const endEntry = this.entries.get(endParaId);
 		if (!endEntry) return null;
 		const endOffset = getCharOffsetInParagraph(endP, range.endContainer, range.endOffset);
@@ -188,7 +184,6 @@ export class OffsetMap {
 	 *  a single spanning Range would produce a full-block-width rect for every
 	 *  fully-enclosed middle paragraph. */
 	cursorsToRanges(cursorRange: CursorRange): Range[] {
-		// Single-paragraph: delegate to the existing method
 		if (!cursorRange.endParaId || cursorRange.endParaId === cursorRange.paraId) {
 			const r = this.cursorsToRange(cursorRange);
 			return r ? [r] : [];
@@ -311,14 +306,11 @@ export class OffsetMap {
 const HEADING_SELECTOR = "h1, h2, h3, [epub\\:type='title'], [data-epub-type='title']";
 
 /**
- * Source epubs sometimes ship their own drop-cap styling by wrapping the first
- * glyph in a styled span (e.g. `<p><span class="dropcap">W</span>hen ...</p>`).
- * That wrapper's font-size/float collides with our `::first-letter` rule —
- * the wrapper gets one treatment, our rule targets the *next* letter, and the
- * result is the "first letter as superscript, second letter enlarged" bug.
- *
- * Flatten the leading wrapper so the paragraph begins with a plain text node
- * and `::first-letter` lands on the intended glyph.
+ * Flatten a source epub's own drop-cap markup (`<p><span class="dropcap">W</span>
+ * hen ...</p>`) so the paragraph begins with a plain text node and
+ * `::first-letter` lands on the intended glyph. Left in place, the wrapper's
+ * font-size/float collides with our rule — which then targets the *next* letter,
+ * giving the "first letter as superscript, second letter enlarged" bug.
  */
 function normalizeLeadingWrapper(p: HTMLElement): void {
 	const first = p.firstElementChild as HTMLElement | null;
@@ -336,12 +328,11 @@ function normalizeLeadingWrapper(p: HTMLElement): void {
 }
 
 /**
- * True when the paragraph opens with the source epub's own drop-cap markup:
- * a leading inline wrapper (no text before it) whose class says drop-cap-ish
- * and whose content is a single grapheme or two. The class match is the
- * load-bearing part — a bare `<i>I</i> think…` opener must NOT count, so the
- * shape-only fallback normalizeLeadingWrapper uses stays gated behind
- * heading-based opener detection.
+ * True when the paragraph opens with the source epub's own drop-cap markup: a
+ * leading inline wrapper whose class says drop-cap-ish and whose content is a
+ * grapheme or two. The class match is load-bearing — a bare `<i>I</i> think…`
+ * opener must NOT count, which is why the shape-only fallback that
+ * normalizeLeadingWrapper accepts stays gated behind heading-based detection.
  */
 function hasExplicitDropCap(p: HTMLElement): boolean {
 	const first = p.firstElementChild as HTMLElement | null;
@@ -352,42 +343,45 @@ function hasExplicitDropCap(p: HTMLElement): boolean {
 	);
 }
 
-/**
- * Find the index (among non-empty <p> elements) of the first paragraph
- * that follows a heading in this spine item. Returns -1 if no heading exists
- * (title pages, copyright pages, dedications don't get drop caps).
- */
 /** The blocks prepareUnit registers as paragraphs. Every walk that predicts
  *  paraIds (prepareUnit, findChapterOpenerIndex, the book-search index) must
  *  query this same selector or the counts drift. */
-export const REGISTERABLE_BLOCK_SELECTOR = "p, li, blockquote";
+export const REGISTERABLE_BLOCK_SELECTOR = "p, li, blockquote, div";
+
+/** Block elements that make a candidate a *container* rather than a paragraph.
+ *  A container is skipped so its inner blocks register individually instead of
+ *  the text being counted twice. */
+const NESTED_BLOCK_SELECTOR = "p, ul, ol, li, blockquote, div, table, h1, h2, h3, h4, h5, h6";
 
 /** A block is annotatable if it holds inline prose: any non-empty <p>, or a
- *  leaf <li>/<blockquote> (no nested block element). Containers are skipped so
- *  their inner blocks register individually instead of double-counting.
- *  Blockquotes matter more than they sound: Calibre-converted epubs exist
- *  whose entire body prose is nested blockquotes with barely a <p> in sight
- *  (e.g. The Treasury of Knowledge) — without this branch that text gets no
- *  paraIds, so no search hits and no highlights.
+ *  leaf <li>/<blockquote>/<div> (no nested block element).
+ *
+ *  The non-<p> branches carry real books: Calibre conversions whose body prose
+ *  is nested blockquotes, and publisher epubs marking every paragraph as
+ *  `<div class="indent">` with zero <p> in the whole book. An unregistered
+ *  paragraph has no paraId, which silently costs it highlights, bookmarks,
+ *  gloss and search hits at once.
+ *
  *  Exported: the book-search index walks raw spine XHTML with this same
  *  filter so its predicted paraIds match what prepareUnit stamps at mount. */
 export function isRegisterableBlock(el: HTMLElement): boolean {
 	if (!(el.textContent ?? "").trim()) return false;
 	if (el.tagName === "P") return true;
-	if (el.tagName === "LI") return !el.querySelector("p, ul, ol, li");
-	if (el.tagName === "BLOCKQUOTE") return !el.querySelector("p, ul, ol, li, blockquote, div");
+	if (el.tagName === "LI") return !el.querySelector("p, ul, ol, li, div");
+	if (el.tagName === "BLOCKQUOTE" || el.tagName === "DIV") return !el.querySelector(NESTED_BLOCK_SELECTOR);
 	return false;
 }
 
+/** Index (among registerable blocks) of the first paragraph following a heading
+ *  in this spine item, or -1 when there is no heading — title, copyright and
+ *  dedication pages don't get drop caps. */
 function findChapterOpenerIndex(spineItem: HTMLElement): number {
 	const headings = spineItem.querySelectorAll(HEADING_SELECTOR);
 	if (headings.length === 0) return -1;
 
-	// Find the last heading, then the first <p> after it
 	const lastHeading = headings[headings.length - 1];
 	let node: Element | null = lastHeading;
 
-	// Walk forward through siblings and descendants to find the first <p>
 	while (node) {
 		const nextP = walkToNextParagraph(node, spineItem);
 		if (nextP) {
@@ -412,7 +406,6 @@ function findChapterOpenerIndex(spineItem: HTMLElement): number {
 function walkToNextParagraph(start: Element, boundary: HTMLElement): HTMLElement | null {
 	let current: Node | null = start;
 	while (current) {
-		// Check next sibling and its descendants
 		if (current.nextSibling) {
 			current = current.nextSibling;
 			if (current.nodeType === Node.ELEMENT_NODE) {
@@ -422,7 +415,6 @@ function walkToNextParagraph(start: Element, boundary: HTMLElement): HTMLElement
 				if (inner && (inner.textContent ?? "").trim()) return inner;
 			}
 		} else {
-			// Move up to parent's next sibling
 			current = current.parentElement;
 			if (!current || current === boundary) return null;
 		}

@@ -24,6 +24,7 @@ import {
 import {
 	parseEpub,
 	renderSpineRange,
+	expandSelfClosingTags,
 	revokeImageUrls,
 	extractLinkPreview,
 	resolveEpubHref,
@@ -43,11 +44,13 @@ import { type LibraryOverride, invalidateMetaCache, LIBRARY_ROOT, companionDocPa
 import {
 	ANCHOR_PREFIX_LEN,
 	AnnotationPreview,
+	BOOKMARK_MODE,
 	GLOSS_AI_MODES,
 	GLOSS_MODES,
 	GlossSurface,
 	appendCallout,
 	applyGlossTheme,
+	type GlossHostSettings,
 	buildCallout,
 	calloutHeader,
 	ensureCompanionDoc,
@@ -56,6 +59,7 @@ import {
 	hitTestHighlightRects,
 	isTextInputFocused,
 	parseSavedHighlights,
+	registerTouchSelectionRaise,
 	type SavedHighlight,
 } from "./gloss";
 // The right-rail Highlights pane (Annotations / Conversations / AI chat). Owns
@@ -106,7 +110,10 @@ interface AiDefaults {
 interface ThirdMindReaderSettings {
 	tmrMode: "obsidian" | "3c";
 	tmrTheme: "light" | "dark";
-	bookPositions: Record<string, ReaderPosition>;
+	/** Per-book memory, keyed by vault path. `Partial` because a PDF's entry has
+	 *  no epub position to store — only the page fraction (`pct`) and the
+	 *  right-rail tab; every reader read of a field already falls back. */
+	bookPositions: Record<string, Partial<ReaderPosition>>;
 	aiProviders: AiProvider[];
 	aiDefaults: AiDefaults;
 	/** Master switch for the AI surface. When off, the GlossBar shows only the
@@ -146,6 +153,12 @@ interface ThirdMindReaderSettings {
 	 *  time a book is opened, then sets this so it never auto-opens again. The
 	 *  help button (next to the ToC toggle) re-opens it on demand. */
 	helpShown: boolean;
+	/** Reader body text size in px, or `null` to follow Obsidian's own
+	 *  Appearance → Font size (the default). A sentinel rather than a number
+	 *  that happens to match: someone who sets 20 here and later moves the app
+	 *  to 22 should be able to get back to tracking without remembering what
+	 *  the app's value used to be. */
+	readerFontSize: number | null;
 }
 
 const DEFAULT_SETTINGS: ThirdMindReaderSettings = {
@@ -163,18 +176,39 @@ const DEFAULT_SETTINGS: ThirdMindReaderSettings = {
 	libraryCollectionOrder: [],
 	feedbackHintShown: false,
 	helpShown: false,
+	readerFontSize: null,
 };
 
-/** Consecutive forward page-turns (with no backward turn) after a large jump
- *  before the "Back" pill decays. The return-point dot on the bar persists; the
- *  pill is the obtrusive part, so it recedes once the reader has committed to
- *  the destination. A backward turn = peeking, and resets the count. */
+/** Bounds of the reader text-size override. Wider than Obsidian's own slider at
+ *  the top end: a two-page spread at 28px is a legitimate large-print layout,
+ *  and single-page mode catches it when the columns get too narrow. */
+const READER_FONT_MIN = 12;
+const READER_FONT_MAX = 28;
+
+/** Obsidian's Appearance → Font size, in px, clamped to the override's range.
+ *  Read from the live CSS variable rather than `appearance.json` so it tracks
+ *  pinch-to-zoom and Ctrl+scroll, which change it without touching the file. */
+function appTextSize(): number {
+	const raw = getComputedStyle(document.body).getPropertyValue("--font-text-size");
+	const size = parseFloat(raw);
+	const px = Number.isFinite(size) && size > 0 ? Math.round(size) : 16;
+	return Math.min(READER_FONT_MAX, Math.max(READER_FONT_MIN, px));
+}
+
+/** Page-turns after a large jump before the return anchor expires and the
+ *  "Back" pill and its dot both go. Counted in either direction — see
+ *  `registerReadingTurn` for why. */
 const BACK_PILL_COMMIT_TURNS = 3;
 
 /** Inline SVG for the 3C logo (from Hipst3r-DLS/3CLibrary.pen, node 0goli).
  *  Exported so the Library's 3C-mode toggle reuses the exact same mark. */
 export const LOGO_3C_SVG =
-	'<svg viewBox="0 0 116 106" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">' +
+	// width/height as well as viewBox: WebKit (iPad, iPhone — Obsidian mobile is
+	// a WKWebView, not Chromium) gives a viewBox-only inline SVG no intrinsic
+	// size, so as a flex item it can collapse instead of taking the size CSS
+	// asked for. Desktop Electron sizes it from the viewBox alone and never
+	// showed the problem. CSS still decides the rendered size.
+	'<svg viewBox="0 0 116 106" width="116" height="106" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">' +
 	'<path d="M93.18848 28.23926c13.49923 6.5209 22.81152 20.33795 22.81152 36.3291-0.00023 22.27106-18.06232 40.32514-40.34277 40.32519-8.60221 0-16.57421-2.69321-23.12207-7.27929 15.27594-1.13094 28.59509-9.2851 36.74804-21.24317-3.99014 4.82665-10.02286 7.90332-16.77441 7.90332-12.01438-0.00017-21.75391-9.74046-21.75391-21.75488 0.00017-12.01427 9.73963-21.75373 21.75391-21.7539 12.01442 0 21.75471 9.73953 21.75488 21.7539 0 2.69022-0.48997 5.26622-1.38281 7.64453 3.11907-6.43531 4.86914-13.65764 4.86914-21.28906-0.00001-7.37464-1.63689-14.36607-4.56152-20.63574z m-44.31348-28.23926c19.61829 0 36.53326 11.56047 44.31348 28.23926-5.30147-2.56091-11.24851-3.99705-17.53125-3.99707-22.28064 0-40.34277 18.05488-40.34278 40.32617 0.00014 13.67252 6.80903 25.75362 17.22071 33.0459-1.20835 0.08946-2.42894 0.13574-3.66016 0.13574-26.99292-0.00004-48.875-21.88206-48.875-48.875 0.00004-26.9929 21.8821-48.87496 48.875-48.875z"/>' +
 	'</svg>';
 
@@ -228,6 +262,11 @@ interface ReaderPosition {
 	 *  Optional for backward compat — books last read before Phase D lack it
 	 *  (the Library treats absent as "Unread"). */
 	pct?: number;
+	/** Epoch ms of the last position change, written alongside `pct`. Sorts the
+	 *  Library shelf most-recent-first. Absent on books never opened *and* on
+	 *  everything read before this shipped — both sort to the alphabetical tail,
+	 *  which is the pre-existing order, so no backfill is needed. */
+	lastRead?: number;
 }
 
 type LayoutMode = "spread" | "single";
@@ -244,60 +283,112 @@ interface ReaderViewState extends Record<string, unknown> {
 
 /** A cheat-sheet row: a keycap, an optional colour-flagged mode label, and a
  *  description. Recreated from the `HelpPopoup` component in the 3C Pencil DLS. */
+/** A row's leading chip is either a keycap (desktop) or the icon of the control
+ *  that does the same job (touch), never both — there are no keys to press on a
+ *  phone, and the icon is what the reader actually shows. */
 interface HelpRow {
-	key: string;
+	key?: string;
+	icon?: string;
 	label?: { text: string; color: string };
 	desc: string;
 }
 
-const HELP_GROUPS: { heading: string; rows: HelpRow[] }[] = [
-	{
-		heading: "Reading",
-		rows: [
-			{ key: "← / →", desc: "Previous / Next Page" },
-			{ key: "t", desc: "Table Of Contents" },
-			{ key: "h", desc: "Highlights & Annotations" },
-			{ key: "s", desc: "Search in book" },
-			{ key: "Esc", desc: "Close a panel or dismiss the Gloss toolbar" },
-		],
-	},
-	{
-		heading: "Annotating – Select Text, Then Press",
-		rows: [
-			{ key: "Select Text", desc: "Surfaces the Gloss toolbar over your selection" },
-			{ key: "1", label: { text: "Emphasise", color: "#50805c" }, desc: "Plain highlight with annotation" },
-			{ key: "2", label: { text: "Exclaim", color: "#af4d4d" }, desc: "Capture a reaction as first AI turn" },
-			{ key: "3", label: { text: "Explain", color: "#ac9c5d" }, desc: "Ask AI to clarify" },
-			{ key: "4", label: { text: "Examine", color: "#6396a2" }, desc: "Ask the AI to explore, with citations" },
-			{ key: "5", label: { text: "Enquiry", color: "#a7a3a5" }, desc: "Open back-and-forth conversation with AI" },
-		],
-	},
-];
+const GLOSS_HELP_DESC: Record<string, string> = {
+	emphasise: "Plain highlight with annotation",
+	exclaim: "Capture a reaction as first AI turn",
+	explain: "Ask AI to clarify",
+	examine: "Ask the AI to explore, with citations",
+	enquiry: "Open back-and-forth conversation with AI",
+};
+
+/** Built from `GLOSS_MODES` rather than restated, so the help sheet cannot list
+ *  a mode, colour, icon or order the GlossBar doesn't have. The numeric keys are
+ *  positional for the same reason — `1`–`5` are bound by tile index. */
+function glossHelpRows(touch: boolean): HelpRow[] {
+	return [
+		{ key: "Select Text", desc: "Surfaces the Gloss toolbar over your selection" },
+		...GLOSS_MODES.map((m, i) => ({
+			...(touch ? { icon: m.icon } : { key: String(i + 1) }),
+			// Exclaim's tile fill (#7d2e2e) is a dark maroon meant to sit *behind*
+			// white text; as a label colour on the dark sheet it reads as a smudge,
+			// so it borrows the brighter icon token instead.
+			label: { text: m.label, color: `var(--tmr-c-${m.id === "exclaim" ? "exclaim-icon" : m.id})` },
+			desc: GLOSS_HELP_DESC[m.id],
+		})),
+	];
+}
+
+/** Touch drops the keycaps entirely: page turns are tap zones (covered by the
+ *  intro copy), Escape has no equivalent, and the four remaining actions are
+ *  chrome buttons — so each row shows that button's own icon. Icon names come
+ *  from the controls themselves (`table-of-contents`, `tmr-icon-book-search`,
+ *  `BOOKMARK_MODE.icon`, `pencil-line`). */
+function helpGroups(touch: boolean): { heading: string; rows: HelpRow[] }[] {
+	return [
+		{
+			heading: "Reading",
+			rows: touch
+				? [
+					{ icon: "table-of-contents", desc: "Table Of Contents" },
+					{ icon: "tmr-icon-book-search", desc: "Search in book" },
+					{ icon: BOOKMARK_MODE.icon, desc: "Bookmark Current Page" },
+					{ icon: "pencil-line", desc: "Highlights & Annotations" },
+				]
+				: [
+					{ key: "← / →", desc: "Previous / Next Page" },
+					{ key: "t", desc: "Table Of Contents" },
+					{ key: "h", desc: "Highlights & Annotations" },
+					{ key: "b", desc: "Create or Remove Bookmark" },
+					{ key: "s", desc: "Search in book" },
+					{ key: "Esc", desc: "Close a panel or dismiss the Gloss toolbar" },
+				],
+		},
+		{ heading: "Annotating – Select Text, Then Press", rows: glossHelpRows(touch) },
+	];
+}
 
 /** "How to use the Reader" — a keyboard/action cheat sheet recreated from the
  *  3C DLS `HelpPopoup` component. Auto-opens once on first book open (gated by
  *  `settings.helpShown`); re-openable any time from the help button beside the
  *  ToC toggle. Pure presentation — reads no plugin state. */
 class HelpModal extends Modal {
+	constructor(app: App, private glossSettings: GlossHostSettings) { super(app); }
+
 	onOpen(): void {
 		const { modalEl, contentEl } = this;
 		modalEl.addClass("tmr-help-modal");
+		// Body-scoped like the gloss floaters, so it needs the same stamp to reach
+		// the DLS mode colours rather than Obsidian's theme reds and greens.
+		applyGlossTheme(modalEl, this.glossSettings);
 		contentEl.empty();
+
+		const touch = Platform.isMobile;
+		modalEl.toggleClass("tmr-help-modal-touch", touch);
 
 		const header = contentEl.createDiv({ cls: "tmr-help-header" });
 		header.createEl("h2", { cls: "tmr-help-title", text: "How to use the Reader" });
 		header.createEl("p", {
 			cls: "tmr-help-intro",
-			text: "Third Mind Reader is keyboard-first. Hover over the page to reveal the panel buttons, everything else is a keystroke away.",
+			text: touch
+				? "Third Mind Reader has been adapted to work on Mobile & Tablet Devices. Tap on either side to navigate, and the centre to reveal the panel buttons."
+				: "Third Mind Reader is keyboard-first. Hover over the page to reveal the panel buttons, everything else is a keystroke away.",
 		});
 
-		for (const group of HELP_GROUPS) {
+		for (const group of helpGroups(touch)) {
 			const section = contentEl.createDiv({ cls: "tmr-help-section" });
 			section.createDiv({ cls: "tmr-help-group", text: group.heading });
 			for (const row of group.rows) {
 				const rowEl = section.createDiv({ cls: "tmr-help-row" });
-				rowEl.createDiv({ cls: "tmr-help-keycol" })
-					.createSpan({ cls: "tmr-help-keycap", text: row.key });
+				const keycol = rowEl.createDiv({ cls: "tmr-help-keycol" });
+				if (row.icon) {
+					const chip = keycol.createSpan({ cls: "tmr-help-iconcap" });
+					setIcon(chip, row.icon);
+					// Mode rows tint the glyph; chrome rows stay muted, matching the
+					// buttons they stand for.
+					if (row.label) chip.style.color = row.label.color;
+				} else {
+					keycol.createSpan({ cls: "tmr-help-keycap", text: row.key });
+				}
 				const desc = rowEl.createDiv({ cls: "tmr-help-desc" });
 				if (row.label) {
 					const lbl = desc.createSpan({ cls: "tmr-help-mode", text: row.label.text });
@@ -309,7 +400,9 @@ class HelpModal extends Modal {
 
 		contentEl.createEl("p", {
 			cls: "tmr-help-foot",
-			text: "Gloss shortcuts (1-5) only trigger while text is selected and toolbar is showing. AI modes need a provider configured in settings.",
+			text: touch
+				? "AI modes are opt-in and need a provider configured in settings."
+				: "Gloss shortcuts (1-5) only trigger while text is selected and toolbar is showing. AI modes need a provider configured in settings.",
 		});
 	}
 
@@ -358,16 +451,25 @@ export class ReaderView extends ItemView {
 	private posAnchor: { sectionIdx: number; offset: number; count: number } | null = null;
 	private tocAnchorPageMap: Array<{ spreadOffset: number; href: string }> = [];
 
+	/** Last text size `applyReaderFontSize` resolved, in px; 0 before the first
+	 *  call. Guards the repaginate so unrelated settings saves are free. */
+	private appliedFontSize = 0;
+
 	private tocOpen = false;
 
 	private resizeObserver: ResizeObserver | null = null;
 	private statusBarObserver: ResizeObserver | null = null;
 	private resizeTimer: number | null = null;
 	private chromeHideTimer: number | null = null;
+	/** Holds the phone caption's wording change until it has finished travelling
+	 *  — see `renderMobilePages`. */
+	private mobilePagesTimer: number | null = null;
+	/** Chrome state the caption's *current wording* was written for, which lags
+	 *  the class during the move. */
+	private mobilePagesChromeUp = false;
 	/** Where the current pointer gesture began, so the click that ends it can be
 	 *  classified as a tap or discarded as a drag. Null between gestures. */
 	private tapStart: { x: number; y: number; t: number } | null = null;
-	private selectionSettleTimer: number | null = null;
 	/** The footnote or citation whose floater a first tap has raised, so the next
 	 *  tap on it is understood as "follow it" rather than "show it again". Null
 	 *  whenever no reference floater is up. Touch only. */
@@ -381,14 +483,9 @@ export class ReaderView extends ItemView {
 	private linkPreviewPending = new Map<string, Promise<EpubLinkPreview | null>>();
 	private hoveredLinkPreviewKey: string | null = null;
 	private previousPosition: ReaderPosition | null = null;
-	/** Forward page-turns since the current anchor was set; reset by a backward
-	 *  turn. Drives the pill decay — see {@link BACK_PILL_COMMIT_TURNS}. */
-	private backForwardTurns = 0;
-	/** True once the reader has committed to the jump destination: the pill has
-	 *  receded, leaving only the return-point dot. The anchor itself lives on. */
-	private backPillDismissed = false;
-	/** Transiently re-summons a dismissed pill while the dot is hovered. */
-	private backPillHovering = false;
+	/** Page-turns since the current anchor was set, in either direction — see
+	 *  {@link BACK_PILL_COMMIT_TURNS}. */
+	private turnsSinceAnchor = 0;
 
 	private spreadEl: HTMLElement | null = null;
 	private contentNode: HTMLElement | null = null;
@@ -450,7 +547,7 @@ export class ReaderView extends ItemView {
 	 *  layout viewport. See freezeSpreadHeight. */
 	private frozenSpreadH = 0;
 	/** Serializes geometry passes (initial load + resize rebuilds) so they never
-	 *  interleave on the shared pagination model / measurement DOM (Case File 08). */
+	 *  interleave on the shared pagination model / measurement DOM. */
 	private layoutChain: Promise<void> = Promise.resolve();
 	private offsetMap = new OffsetMap();
 	private layoutMode: LayoutMode = "spread";
@@ -464,6 +561,11 @@ export class ReaderView extends ItemView {
 	 *  in-flight AI stream die with the view. */
 	private pane!: HighlightsPane;
 	private highlightOverlayEl: HTMLElement | null = null;
+	private bookmarkToggleEl: HTMLElement | null = null;
+	/** Does the current spread carry a bookmark. Cached by `updateBookmarkButton`
+	 *  so the phone caption can read the answer rather than re-measuring every
+	 *  bookmark's rect a second time per navigation. */
+	private spreadBookmarked = false;
 	// Book search (see In-Book Search feature spec). The index promise is the
 	// lazy cache: built on first use per book, dropped in resetViewState.
 	private searchOpen = false;
@@ -500,46 +602,51 @@ export class ReaderView extends ItemView {
 
 	private static readonly GAP = 48;
 	private static readonly SINGLE_PAGE_HYSTERESIS = 32;
-	/** Mobile has no drag-resize — width changes only in one discrete jump, on
-	 *  rotation — so the anti-flap band that desktop needs becomes a liability:
-	 *  an iPad Air landscape (candidate 1045) sits inside the desktop band
-	 *  [1024, 1088], so opening a book in landscape gave a spread but *rotating*
-	 *  into landscape did not. Same device, two layouts, depending on how you
-	 *  got there. A narrow band keeps orientation deterministic. */
+	/** Mobile width changes only in one discrete jump, on rotation, so desktop's
+	 *  anti-flap band becomes a liability: an iPad Air landscape (candidate 1045)
+	 *  sits inside the desktop band [1024, 1088], making the layout depend on
+	 *  whether you opened in landscape or rotated into it. A narrow band keeps
+	 *  orientation deterministic. */
 	private static readonly SINGLE_PAGE_MOBILE_HYSTERESIS = 8;
 	private static readonly SINGLE_PAGE_BREAK_RATIO = 0.72;
-	/** Minimum column measure for a mobile spread, in **em** — i.e. scaled by
-	 *  Obsidian's text-size setting, which flows through to the spread's
-	 *  computed font size.
-	 *  The desktop breakpoint derives from `--file-line-width`, a *width*
-	 *  preference; on a device the question isn't "how wide does this user like
-	 *  their lines" but "do two columns of readable measure fit at the text size
-	 *  they've actually chosen". Those come apart: a reader on large type should
-	 *  get a single column exactly where a reader on small type gets two, on the
-	 *  same hardware. An em threshold says that directly — 25.5em is roughly 50
-	 *  characters — a paperback measure, and the point below which columns start
-	 *  fighting the text rather than framing it.
-	 *  At 18px this gives iPad Mini landscape two 448px columns (~35% more text
-	 *  per page than the single 700px column it used to get) while keeping the
-	 *  Mini in portrait, and every iPhone, on a single column. Raise it toward
-	 *  25.5 to push the Mini back to single-page. */
+	/** Minimum column measure for a mobile spread, in **em**, so it scales with
+	 *  Obsidian's text-size setting. Deliberately not the desktop breakpoint's
+	 *  `--file-line-width`, which is a *width* preference: on a device the
+	 *  question is whether two columns of readable measure fit at the text size
+	 *  chosen, so a reader on large type should get one column exactly where a
+	 *  reader on small type gets two. 25.5em is roughly 50 characters, a
+	 *  paperback measure; raise it toward that to push the iPad Mini back to
+	 *  single-page. */
 	private static readonly SINGLE_PAGE_MOBILE_MIN_COL_EM = 24;
 	private static readonly SINGLE_PAGE_MIN_SPREAD_COL = 420;
 	private static readonly SINGLE_PAGE_MAX_SPREAD_COL = 560;
 	/** How long the touch chrome reveal lingers before fading back out. Long
 	 *  enough to read the page counters and find a toggle, short enough that
-	 *  the buttons don't become permanent furniture over the text. */
-	private static readonly CHROME_AUTOHIDE_MS = 3000;
+	 *  the buttons don't become permanent furniture over the text.
+	 *
+	 *  Held open for as long as a pane or the search bar is up — see
+	 *  `syncChromeHold`. */
+	private static readonly CHROME_AUTOHIDE_MS = 6000;
+	/** Mirrors `--tmr-chrome-delay` and the two `--tmr-chrome-move` values in
+	 *  styles.css, which own the phone progress bar's reveal. Summon and dismiss
+	 *  run at different lengths on purpose — see the note on the tokens.
+	 *
+	 *  Duplicated rather than read back from the computed style: this fires on
+	 *  every chrome toggle and the read would cost a style resolve to learn a
+	 *  constant. If the caption's wording changes before it lands, they've
+	 *  drifted. */
+	private static readonly MOBILE_CAPTION_DELAY_MS = 100;
+	private static readonly MOBILE_CAPTION_MOVE_IN_MS = 140;
+	private static readonly MOBILE_CAPTION_MOVE_OUT_MS = 240;
 	/** How far a finger may travel and how long it may rest before the gesture
 	 *  stops counting as a tap. Generous on both axes: a thumb reaching the far
 	 *  edge of a phone rolls several px, and a tap that misses becomes a page
 	 *  turn the reader didn't ask for. Drags fall through to selection. */
 	private static readonly TAP_SLOP_PX = 12;
 	private static readonly TAP_MAX_MS = 600;
-	/** How long `selectionchange` must go quiet before a touch selection counts
-	 *  as settled. Long enough to sit out a drag-handle adjustment, short enough
-	 *  that the bar doesn't feel like it's lagging the finger. */
-	private static readonly SELECTION_SETTLE_MS = 250;
+	/** Share of the reader's width each page-turn strip owns, leaving the middle
+	 *  third for the chrome toggle. See `tapZoneEdges`. */
+	private static readonly TAP_ZONE_SHARE = 1 / 3;
 	private static readonly TOOLTIP_MAX_CHARS = 900;
 	private static readonly TOOLTIP_MARGIN = 16;
 	private static readonly TOOLTIP_OFFSET_X = 14;
@@ -594,9 +701,16 @@ export class ReaderView extends ItemView {
 			showCitationTooltip: (text, e) => this.renderTooltip({ kind: "text", text }, e),
 			hideCitationTooltip: () => this.hideTooltip(),
 			onPanelToggle: (open) => {
-				// The panel slides over the search corner — hide the bar the same
-				// way and fold the results card away with it.
-				this.searchBarEl?.toggleClass("tmr-search-bar-hidden", open);
+				// The panel slides over the bookmark toggle's corner, and the
+				// toggle outranks it on z-index (25 vs 20) — so it has to be
+				// hidden explicitly, the same way the pane hides its own toggle.
+				this.bookmarkToggleEl?.toggleClass("tmr-chrome-btn-hidden", open);
+				// The bar lives in the opposite corner now and stays put. This
+				// covers the one route that opens the pane without a click:
+				// the palette command driven purely by keyboard, which leaves an
+				// open results card (z-index 24) floating over the panel (20).
+				// Every other route goes through a click, and the document
+				// mousedown handler has already collapsed the search by then.
 				if (open && this.searchOpen) this.toggleBookSearch(false);
 				this.syncPaneOpen();
 			},
@@ -645,46 +759,34 @@ export class ReaderView extends ItemView {
 			this.isDraggingProgress = false;
 		});
 
-		// Touch selection has no usable mouseup. The range is set by long-press and
-		// then adjusted with drag handles, and iOS fires its synthetic mouse events
-		// inconsistently across that gesture — so the bar either never rises or
-		// rises against a half-made selection. `selectionchange` fires on every
-		// handle move including the last, so debounce to the end of the gesture and
-		// raise there. Desktop keeps the mouseup path: it fires once, at exactly
-		// the right moment, and needs no timer.
-		if (Platform.isMobile) {
-			this.registerDomEvent(document, "selectionchange", () => {
-				// The input owns the selection once it's open — re-raising here
-				// would close it out from under a half-typed annotation.
-				if (this.glossSurface.inputOpen) return;
-				if (this.selectionSettleTimer !== null) window.clearTimeout(this.selectionSettleTimer);
-				this.selectionSettleTimer = window.setTimeout(() => {
-					this.selectionSettleTimer = null;
-					this.raiseGlossForSelection();
-				}, ReaderView.SELECTION_SETTLE_MS);
-			});
+		// Touch selection has no usable mouseup — see `registerTouchSelectionRaise`,
+		// which owns the debounce and is shared with the PDF host.
+		registerTouchSelectionRaise(this, this.glossSurface, () => this.raiseGlossForSelection());
 
+		if (Platform.isMobile) {
 			// Anything taking text focus is about to raise the keyboard and shrink
 			// the layout viewport out from under the reading column. Freeze first:
 			// `focusin` beats the keyboard animation, whereas the resize that
 			// follows is already measuring the collapsed box.
 			this.registerDomEvent(document, "focusin", () => {
 				if (isTextInputFocused()) this.freezeSpreadHeight();
+				this.syncPaneChrome();
+			});
+			// focusout fires before focus lands anywhere, so the settled state is
+			// only readable a tick later.
+			this.registerDomEvent(document, "focusout", () => {
+				window.setTimeout(() => this.syncPaneChrome(), 0);
 			});
 		}
 
-		// Escape must beat app/plugin hotkeys (quick-peek-sidebar binds bare Esc;
-		// unbound, the app still refocuses the editor). A DOM listener can never
-		// win that race — Obsidian's keymap listens on `window` in the CAPTURE
-		// phase, registered at boot — so we go through the keymap itself: a
-		// Scope pushed while this reader is the active leaf. The handler is a
-		// CATCH-ALL (null key) on purpose: a specific-key registration would
-		// terminate the scope chain even when it declines, swallowing Esc for
-		// the whole app while reading; a catch-all that returns undefined lets
-		// the event fall through to the root scope's hotkeys untouched.
-		// Dismissal runs in transience order, one layer per press, and fires
-		// even while a panel input has focus (scope follows the active leaf,
-		// not DOM focus).
+		// Escape must beat app/plugin hotkeys, and a DOM listener can never win
+		// that race — Obsidian's keymap listens on `window` in the CAPTURE phase,
+		// registered at boot. So go through the keymap itself: a Scope pushed
+		// while this reader is the active leaf. The handler is a CATCH-ALL (null
+		// key) on purpose — a specific-key registration terminates the scope
+		// chain even when it declines, swallowing Esc app-wide while reading.
+		// Dismissal runs one layer per press, in transience order, and fires even
+		// while a panel input has focus (scope follows the leaf, not DOM focus).
 		this.escScope = new Scope(this.app.scope);
 		this.escScope.register(null, null, (_evt, ctx) => {
 			if (ctx.key !== "Escape") return;
@@ -705,12 +807,10 @@ export class ReaderView extends ItemView {
 		this.syncEscScope();
 
 		// Reader bare-key shortcuts (t / h / s / 1–5 / ← / →) are handled HERE,
-		// scoped to this view: the handler no-ops unless this reader is the active
-		// leaf, so the keys never interfere with typing in a note or any other view.
-		// They are deliberately NOT Obsidian command hotkeys — command hotkeys are
-		// global and a bare key (especially the arrows) steals the keystroke from
-		// the editor app-wide. Only modifier combos are safe as commands, so just
-		// those live in `addReaderCommands`.
+		// scoped to this view, and deliberately NOT as Obsidian commands: command
+		// hotkeys are global, so a bare key (especially an arrow) would steal the
+		// keystroke from the editor app-wide. Only modifier combos are safe as
+		// commands — those live in `addReaderCommands`.
 		this.registerDomEvent(document, "keydown", (e: KeyboardEvent) => {
 			if (this.app.workspace.getActiveViewOfType(ReaderView) !== this) return;
 			// While a text field (gloss input, note editor, chat box, search…) has
@@ -732,28 +832,25 @@ export class ReaderView extends ItemView {
 			}
 			if (!typing && e.key === "ArrowRight") void this.advance();
 			if (!typing && e.key === "ArrowLeft") void this.retreat();
-			if (!typing && (e.key === "t" || e.key === "h" || e.key === "s") && !e.ctrlKey && !e.metaKey && !e.altKey) {
+			if (!typing && (e.key === "t" || e.key === "h" || e.key === "s" || e.key === "b")
+				&& !e.ctrlKey && !e.metaKey && !e.altKey) {
 				// preventDefault matters for `s`: the toggle focuses the search
 				// input, and without it this same keystroke's default action
 				// types an "s" into the field it just opened.
 				e.preventDefault();
 				if (e.key === "t") this.toggleToc();
 				else if (e.key === "h") this.pane.toggle();
+				else if (e.key === "b") void this.toggleBookmark();
 				else this.toggleBookSearch();
 			}
 		});
 
-		// Touch two-step for saved highlights: a tap on a rect raises the preview
-		// (handleHighlightClick), a tap on the preview opens the conversation,
-		// anything else puts it away. Bound on document because the floater lives
-		// on document.body, outside the reader's tree — the spread's own click
-		// handler never sees it — and because document is the last stop in the
-		// bubble path, so `handleReaderTap` on the root has already declined.
-		//
-		// The `defaultPrevented` guard is what keeps the raise from immediately
-		// undoing itself: the tap that raises the preview lands on a paragraph,
-		// not on the preview, so without it the same event would hide what it
-		// just showed. handleHighlightClick's caller marks that tap as handled.
+		// Touch two-step for saved highlights: a tap on a rect raises the preview,
+		// a tap on the preview opens the conversation, anything else puts it away.
+		// Bound on document because the floater lives on document.body, outside
+		// the reader's tree, and document is the last stop in the bubble path.
+		// The `defaultPrevented` guard stops the raise undoing itself — the tap
+		// that raises the preview lands on a paragraph, not on the preview.
 		if (Platform.isMobile) {
 			this.registerDomEvent(document, "click", (e: MouseEvent) => {
 				if (e.defaultPrevented) return;
@@ -820,8 +917,8 @@ export class ReaderView extends ItemView {
 		if (this.resizeTimer !== null) window.clearTimeout(this.resizeTimer);
 		if (this.chromeHideTimer !== null) window.clearTimeout(this.chromeHideTimer);
 		this.chromeHideTimer = null;
-		if (this.selectionSettleTimer !== null) window.clearTimeout(this.selectionSettleTimer);
-		this.selectionSettleTimer = null;
+		if (this.mobilePagesTimer !== null) window.clearTimeout(this.mobilePagesTimer);
+		this.mobilePagesTimer = null;
 		this.tapStart = null;
 		// Leaving the reader must never strand the user in a view with no navbar —
 		// and now that the hidden state is a body class we own outright, nothing
@@ -831,6 +928,8 @@ export class ReaderView extends ItemView {
 		this.contentEl.removeClass("tmr-chrome-visible");
 		if (Platform.isMobile) {
 			document.body.removeClass("tmr-immersive");
+			// Unconditional, not phone-gated: a no-op where we never hid it, and
+			// the one place a stuck status bar could outlive the reader.
 			ReaderView.setStatusBarHidden(false);
 		}
 		if (this.book) revokeImageUrls(this.book);
@@ -912,11 +1011,10 @@ export class ReaderView extends ItemView {
 					}, 0);
 					return;
 				}
-				// Otherwise this is a fresh, history-less leaf (a Shift+Cmd+T restore or
-				// a new-tab open). There's nothing to preserve, so just load the book
-				// in place and fall through. The old redirect-and-detach left an
-				// orphaned "Opening…" tab under rapid restores — loading in place is
-				// race-free and what Obsidian does for every other file type (bug B2).
+				// Otherwise this is a fresh, history-less leaf (Shift+Cmd+T restore or
+				// new-tab open): nothing to preserve, so load in place. Redirecting
+				// to a new tab instead races under rapid restores, stranding an
+				// orphaned "Opening…" tab.
 			}
 
 			const node = this.app.vault.getAbstractFileByPath(filePath);
@@ -937,6 +1035,29 @@ export class ReaderView extends ItemView {
 	}
 
 	// ─── REGION: Theme ───────────────────────────────────────────────────────
+	/** Push the reader text-size setting onto the view root as `--tmr-font-size`,
+	 *  or clear it when following Obsidian's own size. Repaginates only when the
+	 *  *resolved* size actually moved: this runs from `saveSettings`, which fires
+	 *  for every settings change, and rebuilding a book because someone toggled
+	 *  streaming would be absurd. Measured rather than compared against the
+	 *  stored setting, so switching the override off at a value equal to the
+	 *  app's is correctly a no-op. */
+	applyReaderFontSize(): void {
+		const override = this.plugin.settings.readerFontSize;
+		if (typeof override === "number") {
+			this.contentEl.style.setProperty("--tmr-font-size", `${override}px`);
+		} else {
+			this.contentEl.style.removeProperty("--tmr-font-size");
+		}
+		const resolved = Math.round(this.getSpreadFontSize());
+		if (resolved === this.appliedFontSize) return;
+		const first = this.appliedFontSize === 0;
+		this.appliedFontSize = resolved;
+		// No book on screen yet (renderShell) — the load that follows measures at
+		// the new size anyway, so a layout pass here would be wasted work.
+		if (!first) this.queueResize();
+	}
+
 	applyThemeClasses(): void {
 		const root = this.contentEl;
 		if (!root.classList.contains("tmr-root")) return;
@@ -972,22 +1093,20 @@ export class ReaderView extends ItemView {
 		const root = this.contentEl;
 		root.empty();
 		root.addClass("tmr-root");
+		// Before the first paint, so the book is measured at its final text size
+		// rather than laid out at Obsidian's and repaginated a frame later.
+		this.applyReaderFontSize();
 		// Survive `empty()` — the controls they hide are about to be rebuilt.
 		root.removeClass("tmr-pane-open");
 		root.removeClass("tmr-search-open");
 		root.createEl("div", { cls: "tmr-loading", text: "Opening…" });
 
-		// Phone toolbar (Toolbar component / Mobile/UIActive). Deliberately not a
-		// wrapper: the four corner controls keep their own absolute positions —
-		// the design brief was "the same size and position they were before" —
-		// and this is the plate that fills the strip between them so they read as
-		// one grounded bar rather than four ghosts floating over the page. Being
-		// a sibling rather than a parent also leaves the search bar's morph and
-		// the pane's own toggle mounting untouched.
-		//
-		// Created before the controls so it sits under them in paint order as
-		// well as by z-index, and it's `pointer-events: none` — background and
-		// one label, never a tap target.
+		// Phone toolbar. Deliberately a sibling, not a wrapper: the four corner
+		// controls keep their own absolute positions, and this is only the plate
+		// filling the strip between them. Being a sibling also leaves the search
+		// bar's morph and the pane's toggle mounting untouched. Created before
+		// the controls so it sits under them in paint order as well as z-index,
+		// and it's `pointer-events: none` — never a tap target.
 		const toolbar = root.createEl("div", { cls: "tmr-toolbar" });
 		const toolbarTitle = toolbar.createEl("div", { cls: "tmr-toolbar-title" });
 		this.toolbarChapterEl = toolbarTitle.createEl("span", { cls: "tmr-toolbar-chapter" });
@@ -998,10 +1117,14 @@ export class ReaderView extends ItemView {
 		tocToggle.ariaLabel = "Table of Contents";
 		this.registerDomEvent(tocToggle, "click", () => this.toggleToc());
 
-		const helpToggle = root.createEl("button", { cls: "tmr-help-toggle" });
-		setIcon(helpToggle, "circle-help");
-		helpToggle.ariaLabel = "How to use the reader";
-		this.registerDomEvent(helpToggle, "click", () => new HelpModal(this.app).open());
+		// Paired with the Highlights toggle in the right corner: a bookmark is
+		// an annotation, so it belongs beside the annotation surface rather
+		// than beside Book search. `updateBookmarkButton` owns its active state.
+		const bookmarkToggle = root.createEl("button", { cls: "tmr-bookmark-toggle" });
+		setIcon(bookmarkToggle, BOOKMARK_MODE.icon);
+		bookmarkToggle.ariaLabel = "Bookmark this page";
+		this.registerDomEvent(bookmarkToggle, "click", () => void this.toggleBookmark());
+		this.bookmarkToggleEl = bookmarkToggle;
 
 		// Page-turn affordances: floating chevrons at the far edges, revealed on
 		// reader hover (same idiom as the panel toggles). advance()/retreat()
@@ -1031,6 +1154,12 @@ export class ReaderView extends ItemView {
 		this.tocListEl = tocPanel.createEl("div", { cls: "tmr-toc-list" });
 
 		const tocFooter = tocPanel.createEl("div", { cls: "tmr-toc-footer" });
+		// Leftmost by design: the theme button hides itself outside 3C mode, so
+		// anything to its right would shift position whenever 3C is toggled.
+		const helpBtn = tocFooter.createEl("button", { cls: "tmr-toc-help-btn" });
+		setIcon(helpBtn, "circle-help");
+		helpBtn.ariaLabel = "How to use the reader";
+		this.registerDomEvent(helpBtn, "click", () => new HelpModal(this.app, this.plugin.settings).open());
 		const modeBtn = tocFooter.createEl("button", { cls: "tmr-toc-mode-btn" });
 		// eslint-disable-next-line no-unsanitized/property -- Safe: LOGO_3C_SVG is a compile-time SVG constant.
 		modeBtn.innerHTML = LOGO_3C_SVG;
@@ -1102,12 +1231,9 @@ export class ReaderView extends ItemView {
 		this.registerDomEvent(searchClear, "click", (e: MouseEvent) => {
 			e.stopPropagation();
 			// On touch the × is the only way out of search, and clear-then-close
-			// spends the first tap on something that looks like nothing happening
-			// (device-reported: "it clears the text, then a second tap closes it
-			// without the animation"). One tap closes, always. The query survives
-			// to the next open exactly as it does on desktop, so nothing is lost
-			// but the tap. Desktop keeps clear-first: there a keyboard is right
-			// there and Escape already closes the bar.
+			// spends the first tap on something that looks like nothing happened.
+			// One tap closes, always; the query survives to the next open. Desktop
+			// keeps clear-first — Escape already closes the bar there.
 			if (Platform.isMobile || !this.searchInputEl?.value) {
 				this.toggleBookSearch(false);
 				return;
@@ -1141,10 +1267,9 @@ export class ReaderView extends ItemView {
 
 		this.resizeObserver?.disconnect();
 		// Observe the BORDER box, not the default content box. The spread's
-		// horizontal padding grows with pane width (gutters), which pins the
-		// content box at the line-width cap — a default observer is blind to
-		// the pane widening past that cap (Case File 09: sidebars closing
-		// never fired a resize, leaving the reader stuck in single-page mode).
+		// horizontal padding grows with pane width (gutters), pinning the content
+		// box at the line-width cap — a default observer is blind to the pane
+		// widening past it, and never fires when a sidebar closes.
 		if (this.spreadEl) this.resizeObserver?.observe(this.spreadEl, { box: "border-box" });
 		// The root as well, and it has to be: `tmr-kbd-frozen` pins the spread's
 		// height, so while the keyboard is up the spread reports no size change
@@ -1297,18 +1422,9 @@ export class ReaderView extends ItemView {
 		const mobileTrack = this.progressBarEl.createEl("div", { cls: "tmr-mobile-progress" });
 		this.mobileFillEl = mobileTrack.createEl("div", { cls: "tmr-mobile-progress-fill" });
 		const backMarker = this.progressBarEl.createEl("div", { cls: "tmr-progress-back-marker tmr-hidden" });
-		// The dot is the persistent re-entry point once the pill has decayed:
-		// hovering it re-summons the pill, clicking it returns directly.
-		this.registerDomEvent(backMarker, "mouseenter", () => {
-			if (!this.backPillDismissed) return;
-			this.backPillHovering = true;
-			this.updateBackMarker();
-		});
-		this.registerDomEvent(backMarker, "mouseleave", () => {
-			if (!this.backPillHovering) return;
-			this.backPillHovering = false;
-			this.updateBackMarker();
-		});
+		// The dot marks the return point on the bar and clicking it returns there.
+		// It lives and dies with the pill (see registerReadingTurn) — there is no
+		// state where one is on screen without the other.
 		this.registerDomEvent(backMarker, "click", (e) => {
 			e.stopPropagation();
 			void this.goBack();
@@ -1347,15 +1463,19 @@ export class ReaderView extends ItemView {
 		const toc = this.contentEl.querySelector<HTMLElement>(".tmr-toc");
 		const backdrop = this.contentEl.querySelector(".tmr-toc-backdrop");
 		const toggle = this.contentEl.querySelector(".tmr-toc-toggle");
-		// The help button shares the ToC toggle's corner; hide it the same way
-		// while the ToC pane is open so it doesn't float over the panel.
-		const helpToggle = this.contentEl.querySelector(".tmr-help-toggle");
 		if (toc) toc.inert = !this.tocOpen;
 		if (this.tocOpen) {
 			toc?.addClass("tmr-toc-open");
 			backdrop?.addClass("tmr-toc-backdrop-visible");
-			toggle?.addClass("tmr-toc-toggle-hidden");
-			helpToggle?.addClass("tmr-toc-toggle-hidden");
+			toggle?.addClass("tmr-chrome-btn-hidden");
+			// The search bar shares this corner and outranks the panel on
+			// z-index (25 vs 20), so it would float on top of it rather than be
+			// covered. No need to *close* an open search here as well: every
+			// route into this method either fires a document mousedown first
+			// (the three click handlers) or can't run while the search input has
+			// focus (`t` is gated on `!typing`, and Escape closes the search
+			// before it reaches the ToC).
+			this.searchBarEl?.addClass("tmr-search-bar-hidden");
 			requestAnimationFrame(() => {
 				const active = this.contentEl.querySelector(".tmr-toc-item.tmr-toc-active");
 				active?.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -1363,8 +1483,8 @@ export class ReaderView extends ItemView {
 		} else {
 			toc?.removeClass("tmr-toc-open");
 			backdrop?.removeClass("tmr-toc-backdrop-visible");
-			toggle?.removeClass("tmr-toc-toggle-hidden");
-			helpToggle?.removeClass("tmr-toc-toggle-hidden");
+			toggle?.removeClass("tmr-chrome-btn-hidden");
+			this.searchBarEl?.removeClass("tmr-search-bar-hidden");
 		}
 		this.syncPaneOpen();
 	}
@@ -1372,12 +1492,44 @@ export class ReaderView extends ItemView {
 	/** One class for "a slide-in pane owns the screen", driven by both panes.
 	 *  Phone-only in effect: a full-width pane covers the toolbar, but every
 	 *  control underneath keeps its 44px hit area *above* the pane, so the
-	 *  buttons stay tappable while invisible — device-reported as "closing the
-	 *  ToC also opens the Highlights pane". Retiring the whole bar for the
+	 *  buttons stay tappable while invisible, so closing the ToC also opens the
+	 *  Highlights pane. Retiring the whole bar for the
 	 *  duration (Mobile/ToC, Mobile/Annotations) is one rule instead of a
 	 *  fourth per-button hidden-state family. */
 	private syncPaneOpen(): void {
 		this.contentEl.toggleClass("tmr-pane-open", this.tocOpen || this.pane.isOpen);
+		this.syncChromeHold();
+	}
+
+	/** An open pane or search bar holds the chrome up for as long as it owns the
+	 *  screen, and hands it a fresh dwell on the way out.
+	 *
+	 *  Without the hold the timer keeps running underneath, so dismissing a
+	 *  long-open search finds the chrome already expired — taking the bar's own
+	 *  close animation with it. Re-revealing on close, rather than only
+	 *  re-arming, covers a chrome that expired before the pane was opened.
+	 *
+	 *  Deliberately does not *add* the visible class while held: on a phone that
+	 *  class also drives Obsidian's navbar (`syncMobileChrome`), so forcing it on
+	 *  behind a full-screen pane would pull the navbar back into view. Holding
+	 *  means "stop the clock", not "turn it on" — and for a pane, which owns the
+	 *  whole screen, `syncMobileChrome` takes the navbar and status bar down. */
+	private syncChromeHold(): void {
+		if (!Platform.isMobile) return;
+		if (this.tocOpen || this.pane.isOpen || this.searchOpen) {
+			if (this.chromeHideTimer !== null) window.clearTimeout(this.chromeHideTimer);
+			this.chromeHideTimer = null;
+			this.syncMobileChrome();
+		} else {
+			this.revealChrome();
+		}
+	}
+
+	/** Re-run the chrome sync on focus changes, but only while a pane owns the
+	 *  screen: that is the one state where the keyboard guard flips the navbar
+	 *  back over a chat box, and it has to flip back when the field blurs. */
+	private syncPaneChrome(): void {
+		if (this.tocOpen || this.pane.isOpen) this.syncMobileChrome();
 	}
 
 	private renderToc(): void {
@@ -1432,6 +1584,7 @@ export class ReaderView extends ItemView {
 			// every keystroke kept typing into the hidden field.
 			this.searchInputEl?.blur();
 		}
+		this.syncChromeHold();
 	}
 
 	private getSearchIndex(): Promise<BookSearchEntry[]> {
@@ -1459,7 +1612,12 @@ export class ReaderView extends ItemView {
 					const filePath = book.opfDir + item.href;
 					raw = await book.zip.file(filePath)!.async("string");
 				} catch { continue; }
-				const body = parser.parseFromString(raw, "text/html").querySelector("body");
+				// Same self-closing-tag repair renderSpineRange applies, for the same
+				// reason the strip below exists: this walk has to see the DOM the
+				// mounted one sees, or the predicted paraIds drift from it.
+				const body = parser
+					.parseFromString(expandSelfClosingTags(raw), "text/html")
+					.querySelector("body");
 				if (!body) continue;
 				// Mirror renderSpineRange's strip — style/script text must not
 				// leak into textContent or offsets drift from the rendered DOM.
@@ -1603,6 +1761,10 @@ export class ReaderView extends ItemView {
 			list.push({ mode, start, end });
 		};
 		for (const saved of this.savedHighlights) {
+			// A bookmark covers no characters, so it must never mark a search
+			// hit as "highlighted" — its -1 offsets would otherwise register as
+			// a range starting before the paragraph.
+			if (saved.mode === BOOKMARK_MODE.id) continue;
 			let startEntry = byId.get(saved.paraIdHint) ?? null;
 			const needle = norm(saved.prefix);
 			if (needle && (!startEntry || !norm(startEntry.text).startsWith(needle))) {
@@ -1645,7 +1807,13 @@ export class ReaderView extends ItemView {
 		const prefix = hit.entry.text.slice(0, 48);
 		const resolvedId = this.offsetMap.findParaIdByPrefix(prefix, hit.entry.paraId) ?? hit.entry.paraId;
 		const entry = this.offsetMap.get(resolvedId);
-		if (entry?.element) this.scrollToTarget(entry.element);
+		// The match's own first line box, not the paragraph's: a paragraph split
+		// across the column boundary reports the union of its fragments, whose
+		// `left` is always the page it *starts* on — so a hit in the tail landed
+		// a page before the word it had just found.
+		const rects = this.rectsForCharRange(resolvedId, hit.start, hit.end);
+		if (rects.length) this.scrollToX(rects[0].left);
+		else if (entry?.element) this.scrollToTarget(entry.element);
 		// Flash on the next frame so the rects measure against settled layout
 		// (same reason renderSavedHighlights paints in rAF after a mount).
 		requestAnimationFrame(() => this.flashSearchMatch(resolvedId, hit));
@@ -1663,22 +1831,17 @@ export class ReaderView extends ItemView {
 	private flashSearchMatch(paraId: string, hit: BookSearchHit): void {
 		if (!this.contentNode) return;
 		this.contentNode.querySelectorAll(".tmr-search-flash-overlay").forEach((n) => n.remove());
-		const cursorRange = this.offsetMap.charRangeToCursorRange(paraId, hit.start, hit.end);
-		if (!cursorRange) return;
 		const overlay = document.createElement("div");
 		overlay.className = "tmr-search-flash-overlay";
 		const contentRect = this.contentNode.getBoundingClientRect();
-		for (const range of this.offsetMap.cursorsToRanges(cursorRange)) {
-			for (const r of Array.from(range.getClientRects())) {
-				if (r.width === 0 || r.height === 0) continue;
-				const rectEl = document.createElement("div");
-				rectEl.className = "tmr-search-flash-rect";
-				rectEl.style.left = `${r.left - contentRect.left}px`;
-				rectEl.style.top = `${r.top - contentRect.top}px`;
-				rectEl.style.width = `${r.width}px`;
-				rectEl.style.height = `${r.height}px`;
-				overlay.appendChild(rectEl);
-			}
+		for (const r of this.rectsForCharRange(paraId, hit.start, hit.end)) {
+			const rectEl = document.createElement("div");
+			rectEl.className = "tmr-search-flash-rect";
+			rectEl.style.left = `${r.left - contentRect.left}px`;
+			rectEl.style.top = `${r.top - contentRect.top}px`;
+			rectEl.style.width = `${r.width}px`;
+			rectEl.style.height = `${r.height}px`;
+			overlay.appendChild(rectEl);
 		}
 		if (overlay.childElementCount === 0) return;
 		this.contentNode.appendChild(overlay);
@@ -1747,13 +1910,19 @@ export class ReaderView extends ItemView {
 		await this.mountCurrentUnit(targetUnitIdx, spreadOffset);
 
 		// After mount, resolve the paragraph by prefix (fall back to hint) and
-		// scroll the exact paragraph into the visible spread.
+		// scroll the highlight into the visible spread.
 		const resolvedId = saved.prefix
 			? this.offsetMap.findParaIdByPrefix(saved.prefix, saved.paraIdHint)
 			: saved.paraIdHint;
 		if (resolvedId) {
+			// The highlight's own first line box, not the paragraph's box: a
+			// paragraph that splits across the column boundary reports the union
+			// of its fragments, which always points at the page it *starts* on.
+			// A highlight in the tail therefore landed a page early.
+			const rects = this.savedHighlightRects(saved, resolvedId);
 			const entry = this.offsetMap.get(resolvedId);
-			if (entry?.element) this.scrollToTarget(entry.element);
+			if (rects.length) this.scrollToX(rects[0].left);
+			else if (entry?.element) this.scrollToTarget(entry.element);
 		}
 		if (closeHighlightsPanel && this.pane.isOpen) this.pane.toggle();
 	}
@@ -1828,7 +1997,7 @@ export class ReaderView extends ItemView {
 			// cached against the final width bucket and survive recovery.
 			// The initial build runs through the same serial chain as resize
 			// rebuilds, so a sidebar toggle during load queues behind it instead
-			// of interleaving with it (Case File 08's load-time variant).
+			// of interleaving with it.
 			await this.runLayoutPass(async () => {
 				await this.waitForStableGeometry();
 				// The pass can resume long after it started (rAF suspends while
@@ -1861,7 +2030,7 @@ export class ReaderView extends ItemView {
 			if (!this.plugin.settings.helpShown) {
 				this.plugin.settings.helpShown = true;
 				void this.plugin.saveSettings();
-				new HelpModal(this.app).open();
+				new HelpModal(this.app, this.plugin.settings).open();
 			}
 		} catch (err) {
 			// DRM is a known limitation, not a failure — state it plainly and skip
@@ -1942,7 +2111,18 @@ export class ReaderView extends ItemView {
 		const h = rawH - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0);
 		const mode = this.resolveLayoutMode();
 		const gap = Math.round(this.getColumnGap(mode));
-		return `${Math.max(0, Math.round(w))}x${Math.max(0, Math.round(h))}@${mode}:${gap}`;
+		// Text size belongs in the key: it changes how much fits in a column, so
+		// two different sizes at one pane size are genuinely different layouts.
+		// It used to be absent and get away with it — Obsidian's own font-size
+		// setting also drives the document root, and our gutters are rem-based,
+		// so changing it moved the padding and therefore w/h. The reader font
+		// override (settings → Reading) has no such side effect: same pane, same
+		// w/h, bigger text, and every section would have served its stale spread
+		// count from the cache. Measured off the spread rather than read from
+		// settings, so it stays right however the size arrives — app setting,
+		// override, or Obsidian's pinch-to-zoom.
+		const fs = Math.round(this.getSpreadFontSize());
+		return `${Math.max(0, Math.round(w))}x${Math.max(0, Math.round(h))}@${mode}:${gap}:${fs}`;
 	}
 
 	// Wait until the spread element's width and height remain unchanged for
@@ -2299,12 +2479,12 @@ export class ReaderView extends ItemView {
 		if (this.isGlossActive() && !this.isExtending) this.dismissGloss();
 		if (this.currentSpread < unit.spreadCount - 1) {
 			this.goToSpread(this.currentSpread + 1);
-			this.registerReadingTurn(1);
+			this.registerReadingTurn();
 			return;
 		}
 		if (this.currentUnitIndex < this.units.length - 1) {
 			await this.mountCurrentUnit(this.currentUnitIndex + 1, 0);
-			this.registerReadingTurn(1);
+			this.registerReadingTurn();
 		}
 	}
 
@@ -2312,39 +2492,34 @@ export class ReaderView extends ItemView {
 		if (this.isGlossActive() && !this.isExtending) this.dismissGloss();
 		if (this.currentSpread > 0) {
 			this.goToSpread(this.currentSpread - 1);
-			this.registerReadingTurn(-1);
+			this.registerReadingTurn();
 			return;
 		}
 		if (this.currentUnitIndex > 0) {
 			const prevUnit = this.units[this.currentUnitIndex - 1];
 			await this.mountCurrentUnit(this.currentUnitIndex - 1, Math.max(0, prevUnit.spreadCount - 1));
-			this.registerReadingTurn(-1);
+			this.registerReadingTurn();
 		}
 	}
 
-	/** Tally reader-driven page-turns toward the Back-pill decay. Turns moving
-	 *  away from the return anchor accumulate; once {@link BACK_PILL_COMMIT_TURNS}
-	 *  land with no toward-turn in between, the pill is dismissed (the dot stays).
-	 *  A turn toward the anchor means the reader is heading back to the origin —
-	 *  peeking, not committing — so the count resets and the pill stays put.
-	 *  No-op without a live anchor or once already dismissed. Seeks and jumps
-	 *  bypass this (they don't route through advance/retreat), which is
-	 *  intended — only linear reading commits. */
-	private registerReadingTurn(dir: 1 | -1): void {
-		if (!this.previousPosition || this.backPillDismissed) return;
-		const anchor = (this.unitStartSpreads[this.previousPosition.unitIndex] ?? 0)
-			+ this.previousPosition.spread;
-		// Commit/peek is relative to the return anchor, not absolute direction:
-		// after a backward jump the anchor sits ahead, so paging backward is the
-		// reader committing to the new locale. Called post-navigation, so
-		// getGlobalSpread() is already the landing spread.
-		const movingAway = (this.getGlobalSpread() - anchor) * dir >= 0;
-		if (movingAway) {
-			this.backForwardTurns++;
-			if (this.backForwardTurns >= BACK_PILL_COMMIT_TURNS) this.backPillDismissed = true;
-		} else {
-			this.backForwardTurns = 0;
-		}
+	/** Tally reader-driven page-turns and expire the return anchor after
+	 *  {@link BACK_PILL_COMMIT_TURNS} of them.
+	 *
+	 *  Direction-agnostic: counting only turns *away* and resetting on a turn
+	 *  back lets ordinary back-and-forth reading keep the pill alive
+	 *  indefinitely. Any three turns is enough evidence the reader has moved on.
+	 *
+	 *  Expiring the anchor outright, rather than just fading the pill, also
+	 *  retires the dot — which has no way to stay inside the progress bar once
+	 *  the bar expands under the mobile chrome.
+	 *
+	 *  Seeks and jumps bypass this (they don't route through advance/retreat),
+	 *  which is intended: only linear reading counts as moving on. */
+	private registerReadingTurn(): void {
+		if (!this.previousPosition) return;
+		if (++this.turnsSinceAnchor < BACK_PILL_COMMIT_TURNS) return;
+		this.previousPosition = null;
+		this.turnsSinceAnchor = 0;
 		this.updateBackMarker();
 	}
 
@@ -2416,8 +2591,8 @@ export class ReaderView extends ItemView {
 
 	/** Append a geometry pass to the serial chain. Passes never overlap — a
 	 *  rebuild in flight finishes before the next starts — which is the whole
-	 *  Case File 08 fix: concurrent passes interleaved on the shared section
-	 *  arrays, measurement caches, and measurement DOM node. */
+	 *  point: concurrent passes interleave on the shared section arrays,
+	 *  measurement caches, and measurement DOM node. */
 	private runLayoutPass(fn: () => Promise<void>): Promise<void> {
 		const run = this.layoutChain.then(fn).catch((err) => {
 			console.error("[ThirdMindReader] layout pass failed", err);
@@ -2470,7 +2645,7 @@ export class ReaderView extends ItemView {
 		// The on-screen keyboard shrinks Obsidian's own app container on mobile, so
 		// opening it fires a resize and the book repaginates into the ~130px strip
 		// left above it — the whole spread crushed into a few lines, then rebuilt
-		// again on dismissal. Device-reported against book search. Skip the pass
+		// again on dismissal. Skip the pass
 		// entirely. Dismissing the keyboard grows the container back, which fires
 		// the observer again, so the deferred pass arrives on its own. (Note the
 		// *layout* viewport does not shrink with it — a `position: fixed` floater
@@ -2546,7 +2721,7 @@ export class ReaderView extends ItemView {
 			// them strands them at their old coordinates. Same bucket means the
 			// geometry *should* be identical and the repaint a no-op — but
 			// "should" is doing the work there, and an orphaned highlight is a
-			// live suspect in Case File 10. Repainting unconditionally costs one
+			// a real risk. Repainting unconditionally costs one
 			// pass over the saved list and removes the doubt.
 			this.renderSavedHighlights();
 			return;
@@ -2628,12 +2803,22 @@ export class ReaderView extends ItemView {
 	}
 
 	private scrollToTarget(target: Element): void {
+		this.scrollToX(target.getBoundingClientRect().left);
+	}
+
+	/** Bring the spread containing viewport-x `left` into view.
+	 *
+	 *  Split out from `scrollToTarget` because an *element's* rect is the wrong
+	 *  input for anything smaller than the element: `getBoundingClientRect`
+	 *  returns the union of a fragmented paragraph's pieces, so its `left` is
+	 *  always the page the paragraph starts on. Callers that know a finer
+	 *  position — a highlight's own line boxes — pass that instead. */
+	private scrollToX(left: number): void {
 		if (!this.contentNode) return;
 		const pageWidth = this.getPageWidth();
 		if (pageWidth <= 0) return;
-		const targetRect = target.getBoundingClientRect();
 		const contentRect = this.contentNode.getBoundingClientRect();
-		const offsetX = targetRect.left - contentRect.left;
+		const offsetX = left - contentRect.left;
 		const spread = Math.floor(offsetX / this.getNavigationStride());
 		const unit = this.getCurrentUnit();
 		if (unit && spread >= 0 && spread < unit.spreadCount) this.goToSpread(spread);
@@ -2681,19 +2866,14 @@ export class ReaderView extends ItemView {
 	/** Electron UI-zoom factor (Cmd +/-): 1 at the default scale, >1 zoomed in,
 	 *  <1 zoomed out. Falls back to 1 if unavailable.
 	 *
-	 *  Gated rather than left to the catch: mobile has no `require` at all, and
-	 *  `resolveLayoutMode` calls this on every layout pass, so relying on the
-	 *  throw meant a ReferenceError raised and swallowed on every resize — plus
-	 *  an error line in Obsidian's log each time, since it flags any attempt to
-	 *  load a Node package.
+	 *  Gated rather than left to the catch: mobile has no `require`, and this
+	 *  runs on every layout pass, so the throw meant a ReferenceError plus an
+	 *  Obsidian log line on every resize.
 	 *
-	 *  isMobile, not isDesktopApp, even though reaching Electron is a
-	 *  capability question: this feeds `resolveLayoutMode`, which is gated the
-	 *  same way and for the same reason — under `emulateMobile` we want the
-	 *  mobile layout path, and a device has no webFrame zoom to read anyway, so
-	 *  1 is the correct answer there rather than a fallback. Gating on
-	 *  isDesktopApp would also leave the guard firing under emulation, where it
-	 *  stays true, so the warning could never be cleared. */
+	 *  isMobile, not isDesktopApp: this feeds `resolveLayoutMode`, gated the
+	 *  same way, and under `emulateMobile` the mobile layout path is what we
+	 *  want. A device has no webFrame zoom, so 1 is the right answer there
+	 *  rather than a fallback. */
 	private getZoomFactor(): number {
 		if (Platform.isMobile) return 1;
 		try {
@@ -2787,8 +2967,10 @@ export class ReaderView extends ItemView {
 			return cite;
 		}
 		if (anchor) {
-			this.handleLinkHover(anchor, e);
-			return anchor;
+			// Only claim the anchor if a floater actually went up. Reporting a
+			// tooltip that never rendered is what makes the touch two-step eat a
+			// tap and show nothing for it.
+			return this.handleLinkHover(anchor, e) ? anchor : null;
 		}
 		if (ridEl?.dataset.rid) {
 			const targetEl = this.findTarget(ridEl.dataset.rid);
@@ -2808,10 +2990,16 @@ export class ReaderView extends ItemView {
 	 *  no preview to show, so a two-step there would be a tax with nothing bought;
 	 *  those still open on the first tap.
 	 *
+	 *  "Inside the book" is any in-book anchor, not just a same-document one:
+	 *  books whose footnotes live in a separate notes file don't match
+	 *  `a[href^="#"]`, and would navigate on the first tap while previewing fine
+	 *  on desktop hover. Which references are previewable is
+	 *  showReferenceTooltip's call, not the selector's.
+	 *
 	 *  Returns true when the tap was spent raising the floater. */
 	private handleReferenceTap(e: MouseEvent): boolean {
 		const ref = (e.target as Element).closest<HTMLElement>(
-			'.tmr-citation, [data-rid], a[href^="#"]'
+			".tmr-citation, [data-rid], a[href]"
 		);
 		if (!ref) return false;
 		// Second tap on the same marker follows it — fall through to the caller's
@@ -2825,31 +3013,46 @@ export class ReaderView extends ItemView {
 		return true;
 	}
 
-	private handleLinkHover(anchor: HTMLAnchorElement, e: MouseEvent): void {
+	/** Returns whether a floater was raised (or is certain to be, once an
+	 *  in-flight preview resolves). The touch two-step reads it to decide
+	 *  whether the tap was spent; the desktop hover path ignores it. */
+	private handleLinkHover(anchor: HTMLAnchorElement, e: MouseEvent): boolean {
 		const href = anchor.getAttribute("href")?.trim() ?? "";
-		if (!href || href.startsWith("http") || href.startsWith("mailto:")) return;
+		if (!href || href.startsWith("http") || href.startsWith("mailto:")) return false;
 
 		if (href.startsWith("#")) {
 			const targetEl = this.findTarget(href.slice(1));
-			if (targetEl) this.showTooltip(targetEl, e);
-			return;
+			if (!targetEl) return false;
+			this.showTooltip(targetEl, e);
+			return true;
 		}
 
 		const key = this.getLinkPreviewKey(anchor);
-		if (!key) return;
+		if (!key) return false;
 
 		this.hoveredLinkPreviewKey = key;
 		const cached = this.linkPreviewCache.get(key);
 		if (cached) {
 			this.showTooltipPreview(cached, e);
-			return;
+			return true;
 		}
-		if (cached === null && this.linkPreviewCache.has(key)) return;
+		// Cached as null = already looked, nothing there. Follow it on the first
+		// tap rather than charging one for an empty floater.
+		if (this.linkPreviewCache.has(key)) return false;
 
+		// Uncached is rare — preloadLinkPreviewsForUnit warms every cross-document
+		// anchor when the unit mounts — so claim the tap and let it land late.
 		void this.ensureLinkPreview(anchor).then((preview) => {
-			if (!preview || this.hoveredLinkPreviewKey !== key) return;
+			if (this.hoveredLinkPreviewKey !== key) return;
+			if (!preview) {
+				// Nothing to show after all: hand the reference back so the next
+				// tap follows it instead of waiting on a floater that isn't coming.
+				if (this.referenceTapEl === anchor) this.referenceTapEl = null;
+				return;
+			}
 			this.showTooltipPreview(preview, e);
 		});
+		return true;
 	}
 
 	private preloadLinkPreviewsForUnit(unitRoot: HTMLElement): void {
@@ -3382,6 +3585,191 @@ export class ReaderView extends ItemView {
 		}
 	}
 
+	// ─── Bookmarks ───────────────────────────────────────────────────────────
+	/** Opening text of the anchored paragraph, stored as the callout's quote.
+	 *  Long enough to recognise the passage in the Annotations list, short
+	 *  enough not to dump a paragraph into the companion doc. */
+	private static readonly BOOKMARK_QUOTE_LEN = 180;
+
+	/** The paragraph the current spread opens on — what a bookmark anchors to.
+	 *
+	 *  The inverse of `scrollToTarget`, which turns an element into a spread
+	 *  index the same way. One pass handles both cases: a paragraph spanning two
+	 *  spreads reports the union of its fragments, so its `left` sits on the
+	 *  *earlier* one, and a page made entirely of such a tail would match
+	 *  nothing. Keeping the last paragraph at or before the current spread lands
+	 *  on the one the page's first line actually belongs to either way. */
+	private firstParaIdOnSpread(): string | null {
+		if (!this.contentNode) return null;
+		const stride = this.getNavigationStride();
+		if (stride <= 0) return null;
+		const contentLeft = this.contentNode.getBoundingClientRect().left;
+		let fallback: string | null = null;
+		for (const el of Array.from(this.contentNode.querySelectorAll<HTMLElement>("[data-para-id]"))) {
+			const spread = Math.floor((el.getBoundingClientRect().left - contentLeft) / stride);
+			// Document order means offsets only increase — nothing later can match.
+			if (spread > this.currentSpread) break;
+			if (spread === this.currentSpread) return el.dataset.paraId ?? null;
+			fallback = el.dataset.paraId ?? fallback;
+		}
+		return fallback;
+	}
+
+	/** Every spread an element's rendered fragments land on — two, for a
+	 *  paragraph that splits across the column boundary.
+	 *
+	 *  `getBoundingClientRect` cannot answer this: it returns the *union* of the
+	 *  fragments, so its `left` is always the earlier spread. Exact only while
+	 *  `break-inside: avoid-column` keeps paragraphs atomic — once they may
+	 *  fragment, a page made entirely of continuation text anchors its bookmark
+	 *  to the page before it, and no tap on that page can clear it.
+	 *
+	 *  Range rects are per line box, so this sees each fragment separately. */
+	private spreadsForElement(el: HTMLElement, contentLeft: number, stride: number): Set<number> {
+		const spreads = new Set<number>();
+		const range = document.createRange();
+		range.selectNodeContents(el);
+		for (const rect of Array.from(range.getClientRects())) {
+			if (rect.width <= 0 && rect.height <= 0) continue;
+			spreads.add(Math.floor((rect.left - contentLeft) / stride));
+		}
+		// Nothing rendered (empty paragraph, or an element the range can't
+		// measure) — fall back to the union so it still maps somewhere rather
+		// than dropping out of bookmark detection entirely.
+		if (spreads.size === 0) {
+			spreads.add(Math.floor((el.getBoundingClientRect().left - contentLeft) / stride));
+		}
+		return spreads;
+	}
+
+	/** Index of a bookmark whose paragraph is visible on the current spread, or
+	 *  -1. Deliberately "visible on", not "anchors the page": it is what lights
+	 *  the button up when you arrive at a bookmarked page from either
+	 *  direction, and what stops a page collecting a second bookmark when a
+	 *  reflow moves which paragraph opens it. */
+	private bookmarkIndexOnSpread(): number {
+		if (!this.contentNode) return -1;
+		const stride = this.getNavigationStride();
+		if (stride <= 0) return -1;
+		const contentLeft = this.contentNode.getBoundingClientRect().left;
+		for (let idx = 0; idx < this.savedHighlights.length; idx++) {
+			const saved = this.savedHighlights[idx];
+			if (saved.mode !== BOOKMARK_MODE.id) continue;
+			const resolvedId = saved.prefix
+				? this.offsetMap.findParaIdByPrefix(saved.prefix, saved.paraIdHint)
+				: saved.paraIdHint;
+			if (!resolvedId) continue;
+			const entry = this.offsetMap.get(resolvedId);
+			// The offsetMap holds adjacent units too, so presence isn't presence
+			// on screen — same check the overlay painter makes.
+			if (!entry || !this.contentNode.contains(entry.element)) continue;
+			if (this.spreadsForElement(entry.element, contentLeft, stride).has(this.currentSpread)) return idx;
+		}
+		return -1;
+	}
+
+	/** Sync the chrome button with whether this page carries a bookmark. Driven
+	 *  from `renderSavedHighlights`, which already runs after every mount and
+	 *  every persist — the two things that can change the answer. */
+	private updateBookmarkButton(): void {
+		const marked = this.bookmarkIndexOnSpread() !== -1;
+		// Set before the early return: on a phone the caption carries this state
+		// with the chrome down, when the button itself is not on screen.
+		this.spreadBookmarked = marked;
+		const el = this.bookmarkToggleEl;
+		if (!el) return;
+		el.toggleClass("tmr-bookmark-active", marked);
+		el.ariaLabel = marked ? "Remove bookmark" : "Bookmark this page";
+	}
+
+	/** Set or clear a bookmark on the current page. */
+	async toggleBookmark(): Promise<void> {
+		if (!this.book) return;
+		const existing = this.bookmarkIndexOnSpread();
+		if (existing !== -1) {
+			// No confirmation: the same button that made it unmakes it.
+			await this.pane.deleteHighlightAt(existing, false);
+			this.updateBookmarkButton();
+			this.renderMobilePages();
+			return;
+		}
+
+		const paraId = this.firstParaIdOnSpread();
+		if (!paraId) {
+			new Notice("Third Mind Reader: nothing on this page to bookmark");
+			return;
+		}
+		const built = this.buildBookmarkCallout(paraId);
+		if (!built) return;
+
+		const path = this.getCompanionDocPath();
+		if (!path) return;
+		const file = await ensureCompanionDoc(
+			this.app,
+			path,
+			this.book.title || this.currentFile?.basename || "Book",
+			this.currentFile ? `[[${this.currentFile.path}]]` : "",
+		);
+		if (!file) return;
+		await appendCallout(this.app, file, built.callout);
+
+		// Synthesise the in-memory record so the pane and the button update
+		// without a re-parse. -1 offsets are the rangeless marker.
+		this.savedHighlights.push({
+			mode: BOOKMARK_MODE.id,
+			paraIdHint: paraId,
+			startChar: -1,
+			endChar: -1,
+			prefix: built.prefix,
+			userText: "",
+			quote: built.quote,
+			turns: [],
+			aiState: "complete",
+		});
+		this.renderSavedHighlights();
+		// The caption only redraws on navigation otherwise, and setting a
+		// bookmark is the one thing that changes it while standing still.
+		this.renderMobilePages();
+		this.pane.renderActivePane();
+		// No Notice: the button's active state (and the phone caption's glyph)
+		// already say it happened, and on a phone the toast lands over the
+		// toolbar it is reporting on.
+	}
+
+	/** The callout for a bookmark: an anchor with no `chars:` field, and the
+	 *  anchored paragraph's opening as the quote. Nothing was selected, so that
+	 *  quote is context rather than a quotation — but it is the only thing that
+	 *  identifies the page in the Annotations list, and it keeps the companion
+	 *  doc readable on its own. */
+	private buildBookmarkCallout(
+		paraId: string,
+	): { callout: string; prefix: string; quote: string } | null {
+		const match = /^s(\d+)-p(\d+)$/.exec(paraId);
+		if (!match) return null;
+		const spineIdx = parseInt(match[1], 10);
+		const paraIdx = parseInt(match[2], 10);
+		const sectionLabel = this.sections[this.sectionIndexBySpine[spineIdx] ?? 0]?.label ?? "";
+		const entry = this.offsetMap.get(paraId);
+		const text = entry ? entry.text.replace(/\s+/g, " ").trim() : "";
+		const prefix = text.slice(0, ANCHOR_PREFIX_LEN);
+		const max = ReaderView.BOOKMARK_QUOTE_LEN;
+		const quote = text.length > max ? text.slice(0, max).trimEnd() + "…" : text;
+		const anchor =
+			`<!-- tmr-anchor spine:${spineIdx} para:${paraId} ` +
+			`prefix:"${encodeURIComponent(prefix)}" -->`;
+		return {
+			callout: buildCallout({
+				modeId: BOOKMARK_MODE.id,
+				header: calloutHeader(quote, sectionLabel, `¶${paraIdx}`),
+				anchor,
+				quote,
+				userText: "",
+			}),
+			prefix,
+			quote,
+		};
+	}
+
 	/** Re-read the companion doc and repaint everything that renders from it.
 	 *  Used after the queue processor rewrites callouts underneath a book that
 	 *  is already open. */
@@ -3418,12 +3806,58 @@ export class ReaderView extends ItemView {
 	/** Paint all saved highlights that land inside the currently-mounted unit.
 	 *  Called after every mount (DOM gets wiped by `contentNode.empty()`, so we
 	 *  rebuild the overlay from scratch) and after a successful persist. */
+	/** The highlight's own client rects — one per line box — in the live DOM.
+	 *  Empty when it has no geometry to speak of: a bookmark (anchored to a
+	 *  paragraph, selecting nothing), a legacy anchor with -1 char offsets, or a
+	 *  selection whose end paragraph isn't in this unit.
+	 *
+	 *  Shared by the overlay painter and the pane's jump so "where is this
+	 *  highlight" has exactly one answer. The *paragraph* element can't serve:
+	 *  its bounding rect is the union of its fragments, so a highlight in a
+	 *  paragraph's tail would land one page early. */
+	private savedHighlightRects(saved: SavedHighlight, resolvedId: string): DOMRect[] {
+		if (saved.mode === BOOKMARK_MODE.id) return [];
+		if (saved.startChar < 0 || saved.endChar < 0) return [];
+		const entry = this.offsetMap.get(resolvedId);
+		if (!entry || !this.contentNode?.contains(entry.element)) return [];
+		// Cross-paragraph selections need their end paragraph in this unit too;
+		// a cross-unit one has nothing to measure.
+		const endParaId = saved.endParaIdHint;
+		if (endParaId && endParaId !== resolvedId) {
+			const endEntry = this.offsetMap.get(endParaId);
+			if (!endEntry || !this.contentNode.contains(endEntry.element)) return [];
+		}
+		return this.rectsForCharRange(resolvedId, saved.startChar, saved.endChar, endParaId);
+	}
+
+	/** Client rects — one per line box — for a character range in a paragraph.
+	 *  The single place the offset model becomes geometry: the saved-highlight
+	 *  overlay, the search-match flash and both jumps read it, so "where is this
+	 *  text on screen" has one answer rather than three copies that can drift. */
+	private rectsForCharRange(paraId: string, start: number, end: number, endParaId?: string): DOMRect[] {
+		const cursorRange = this.offsetMap.charRangeToCursorRange(paraId, start, end, endParaId);
+		if (!cursorRange) return [];
+		const rects: DOMRect[] = [];
+		for (const range of this.offsetMap.cursorsToRanges(cursorRange)) {
+			for (const r of Array.from(range.getClientRects())) {
+				if (r.width > 0 && r.height > 0) rects.push(r);
+			}
+		}
+		return rects;
+	}
+
 	private renderSavedHighlights(): void {
 		// Runs on every unit mount + after each annotation submit, so it's the
 		// natural place to refresh the note button once the first save creates
 		// the companion doc.
 		this.pane.refreshCompanionDocButton();
 		if (!this.contentNode) return;
+		// Covers the persist case — a bookmark added or removed without any
+		// navigation. Page turns are handled by `updateProgress`, which is the
+		// one thing that runs on a spread change *within* a mounted unit; this
+		// method does not (the overlay rides the translateX transform, so it
+		// has nothing to repaint until the unit changes).
+		this.updateBookmarkButton();
 		this.contentNode.querySelectorAll(".tmr-saved-highlight-overlay").forEach((n) => n.remove());
 		if (this.savedHighlights.length === 0) return;
 
@@ -3433,6 +3867,11 @@ export class ReaderView extends ItemView {
 
 		for (let idx = 0; idx < this.savedHighlights.length; idx++) {
 			const saved = this.savedHighlights[idx];
+			// Bookmarks anchor to a paragraph but select no text, so there is
+			// nothing to paint. Explicit rather than relying on the -1 char
+			// offsets to fall through — that path happens to no-op today, and
+			// a stray rect is exactly the kind of bug that ships silently.
+			if (saved.mode === BOOKMARK_MODE.id) continue;
 			// Resolve paraId via prefix — recovers from paragraph-index drift
 			// if the source epub's paragraph count shifts (split/merge). Falls
 			// back to the hint when no prefix is stored (legacy anchors).
@@ -3446,37 +3885,19 @@ export class ReaderView extends ItemView {
 			// the offsetMap alone doesn't mean the paragraph is on screen.
 			if (!entry || !this.contentNode.contains(entry.element)) continue;
 
-			// For cross-paragraph highlights, verify the end paragraph is also in
-			// this unit's DOM. If not (cross-unit selection), skip rendering.
-			const endParaId = saved.endParaIdHint;
-			if (endParaId && endParaId !== resolvedId) {
-				const endEntry = this.offsetMap.get(endParaId);
-				if (!endEntry || !this.contentNode.contains(endEntry.element)) continue;
-			}
-
-			let cursorRange: CursorRange | null = null;
-			if (saved.startChar >= 0 && saved.endChar >= 0) {
-				cursorRange = this.offsetMap.charRangeToCursorRange(
-					resolvedId, saved.startChar, saved.endChar, endParaId);
-			}
-			if (!cursorRange) continue;
-
-			for (const range of this.offsetMap.cursorsToRanges(cursorRange)) {
-				for (const r of Array.from(range.getClientRects())) {
-					if (r.width === 0 || r.height === 0) continue;
-					const rectEl = document.createElement("div");
-					rectEl.className = "tmr-saved-highlight-rect";
-					if (idx === this.pane.activeConversationIdx) {
-						rectEl.classList.add("tmr-saved-highlight-rect-active");
-					}
-					rectEl.dataset.mode = saved.mode;
-					rectEl.dataset.highlightIdx = String(idx);
-					rectEl.style.left = `${r.left - contentRect.left}px`;
-					rectEl.style.top = `${r.top - contentRect.top}px`;
-					rectEl.style.width = `${r.width}px`;
-					rectEl.style.height = `${r.height}px`;
-					overlay.appendChild(rectEl);
+			for (const r of this.savedHighlightRects(saved, resolvedId)) {
+				const rectEl = document.createElement("div");
+				rectEl.className = "tmr-saved-highlight-rect";
+				if (idx === this.pane.activeConversationIdx) {
+					rectEl.classList.add("tmr-saved-highlight-rect-active");
 				}
+				rectEl.dataset.mode = saved.mode;
+				rectEl.dataset.highlightIdx = String(idx);
+				rectEl.style.left = `${r.left - contentRect.left}px`;
+				rectEl.style.top = `${r.top - contentRect.top}px`;
+				rectEl.style.width = `${r.width}px`;
+				rectEl.style.height = `${r.height}px`;
+				overlay.appendChild(rectEl);
 			}
 		}
 		this.contentNode.appendChild(overlay);
@@ -3779,6 +4200,12 @@ export class ReaderView extends ItemView {
 
 	private updateProgress(): void {
 		if (!this.book) return;
+		// "Is this page bookmarked" is a per-spread answer, and this is the only
+		// method that runs on every spread change — `goToSpread` calls it after
+		// each turn, and mounting calls it too. Hanging the button off the
+		// overlay repaint instead left the state stale until the unit changed,
+		// which looked like it fixing itself at a chapter boundary.
+		this.updateBookmarkButton();
 		const globalSpread = this.getGlobalSpread();
 		const total = Math.max(1, this.totalSpreads);
 		if (this.globalPageEl) this.globalPageEl.setText(`${globalSpread + 1} of ${total}`);
@@ -3915,9 +4342,7 @@ export class ReaderView extends ItemView {
 		this.previousPosition = { unitIndex: this.currentUnitIndex, spread: this.currentSpread };
 		// A fresh jump supersedes any prior anchor: re-arm the pill at the new
 		// return point and restart the commit count.
-		this.backForwardTurns = 0;
-		this.backPillDismissed = false;
-		this.backPillHovering = false;
+		this.turnsSinceAnchor = 0;
 	}
 
 	/** Current reading fraction (0..1) from the global spread index, for the
@@ -3948,6 +4373,10 @@ export class ReaderView extends ItemView {
 			unitIndex: this.currentUnitIndex,
 			spread: this.currentSpread,
 			pct,
+			// Activity, not opening: this runs on page turns (and the close flush),
+			// so a book left open in a background tab doesn't outrank one actually
+			// being read.
+			lastRead: Date.now(),
 		};
 		// Position lives in data.json, not a vault file, so no vault event fires —
 		// poke any open Library so its card ticks live as the reader advances.
@@ -3969,9 +4398,7 @@ export class ReaderView extends ItemView {
 		if (!this.previousPosition) return;
 		const pos = this.previousPosition;
 		this.previousPosition = null;
-		this.backForwardTurns = 0;
-		this.backPillDismissed = false;
-		this.backPillHovering = false;
+		this.turnsSinceAnchor = 0;
 		await this.mountCurrentUnit(pos.unitIndex, pos.spread);
 	}
 
@@ -3979,18 +4406,69 @@ export class ReaderView extends ItemView {
 	 *  changes the numbers, revealing the chrome changes which of them is shown.
 	 *  Reading state gets the bare page number (Mobile/Default); chrome-up gets
 	 *  the Apple-Books "N pages left in chapter" line (Mobile/UIActive), which
-	 *  is the information the mobile design says a reader actually wants. */
+	 *  is the information the mobile design says a reader actually wants.
+	 *
+	 *  On a chrome toggle the wording waits for the caption to finish travelling,
+	 *  behind a cross-fade: written immediately it reads as two events in the
+	 *  wrong order — words changing in place, *then* the caption sliding across.
+	 *  The fade isn't decoration either. The two states say different things, so
+	 *  the swap is a hard cut wherever it lands; after the travel it lands in
+	 *  stillness, fully exposed. `.tmr-caption-swapping` takes the caption to
+	 *  zero for the length of the move, so the change happens off screen.
+	 *
+	 *  Navigation (chrome state unchanged) still writes at once and never fades,
+	 *  so page turns stay instant. */
 	private renderMobilePages(): void {
 		const el = this.mobilePagesEl;
 		if (!el) return;
-		if (!this.contentEl.hasClass("tmr-chrome-visible")) {
-			el.setText(String(this.mobileLocalPage));
+		const chromeUp = this.contentEl.hasClass("tmr-chrome-visible");
+		const write = () => {
+			const left = this.mobilePagesLeft;
+			// Resting state only (Mobile/Default/BookmarkActive): a bookmarked
+			// page turns the caption `--bookmark` and gains a glyph. Chrome-up
+			// says "N pages left in chapter", where a mark would mean nothing —
+			// the toolbar's own button is carrying that state by then.
+			const marked = !chromeUp && this.spreadBookmarked;
+			el.empty();
+			el.toggleClass("tmr-mobile-pages-marked", marked);
+			if (marked) {
+				setIcon(el.createEl("span", { cls: "tmr-mobile-pages-icon" }), BOOKMARK_MODE.icon);
+			}
+			el.createEl("span", {
+				text: !chromeUp
+					? String(this.mobileLocalPage)
+					: left === 0
+						? "Chapter complete"
+						: `${left} page${left === 1 ? "" : "s"} left in chapter`,
+			});
+			this.mobilePagesChromeUp = chromeUp;
+		};
+
+		if (this.mobilePagesTimer !== null) {
+			window.clearTimeout(this.mobilePagesTimer);
+			this.mobilePagesTimer = null;
+		}
+		if (chromeUp === this.mobilePagesChromeUp) {
+			// Also the landing spot for a toggle that reversed mid-swap: the
+			// wording never changed, so drop the fade and leave it visible.
+			el.removeClass("tmr-caption-swapping");
+			write();
 			return;
 		}
-		const left = this.mobilePagesLeft;
-		el.setText(
-			left === 0 ? "Chapter complete" : `${left} page${left === 1 ? "" : "s"} left in chapter`
-		);
+		// Fade out where it stands, travel invisible, fade back in already saying
+		// the other thing — the cut itself is never on screen.
+		el.addClass("tmr-caption-swapping");
+		// Expanding waits out the navbar first, then travels short; collapsing has
+		// no delay of its own (that token applies under the chrome class only) and
+		// travels long. Two different lengths, matching the navbar.
+		const travel = chromeUp
+			? ReaderView.MOBILE_CAPTION_DELAY_MS + ReaderView.MOBILE_CAPTION_MOVE_IN_MS
+			: ReaderView.MOBILE_CAPTION_MOVE_OUT_MS;
+		this.mobilePagesTimer = window.setTimeout(() => {
+			this.mobilePagesTimer = null;
+			write();
+			el.removeClass("tmr-caption-swapping");
+		}, travel);
 	}
 
 	/** Publishes Obsidian's navbar rect to CSS as four custom properties, which
@@ -4013,13 +4491,14 @@ export class ReaderView extends ItemView {
 		// Obsidian pulls the navbar while the keyboard is up, so the slot reads
 		// null and `tmr-navbar-tracked` would come off mid-typing — dropping the
 		// whole mobile bar back to the desktop segmented one, which then lays
-		// itself out in the middle of the shrunken viewport. Device-reported
-		// during book search. Hold the last measurement: nothing it describes
+		// itself out in the middle of the shrunken viewport.
+		// Hold the last measurement: nothing it describes
 		// has moved, the navbar is only hidden.
 		if (this.softKeyboardUp()) return;
 		const slot = getNavbarSlot();
 		if (!slot) {
 			root.removeClass("tmr-navbar-tracked");
+			this.updateBackMarker();
 			return;
 		}
 		const rootRect = root.getBoundingClientRect();
@@ -4031,6 +4510,9 @@ export class ReaderView extends ItemView {
 		// Reading area stops above the whole bottom band, not just the navbar.
 		root.style.setProperty("--tmr-nav-band", `${Math.max(0, rootRect.height - top)}px`);
 		root.addClass("tmr-navbar-tracked");
+		// Both of the marker's inputs just moved: which bar it is placed against
+		// (this class) and how wide that bar is (the chrome's rest/expanded rects).
+		this.updateBackMarker();
 	}
 
 	private updateBackMarker(): void {
@@ -4048,13 +4530,10 @@ export class ReaderView extends ItemView {
 			marker?.addClass("tmr-hidden");
 			return;
 		}
-		// The dot rides the bar for the anchor's whole life. The pill is the
-		// obtrusive part: it shows while uncommitted, decays (fades out via the
-		// dismissed class — not display:none, so it animates) once committed, and
-		// is transiently re-summoned while the dot is hovered.
+		// Pill and dot share the anchor's lifetime — both go when it expires,
+		// which `previousPosition === null` above has already handled.
 		marker?.removeClass("tmr-hidden");
 		backBtn.removeClass("tmr-hidden");
-		backBtn.toggleClass("tmr-progress-back-dismissed", this.backPillDismissed && !this.backPillHovering);
 
 		// Coordinate system match the fill bar: each section is a flex segment
 		// with equal visual width, so compute x from the segment's actual
@@ -4070,10 +4549,19 @@ export class ReaderView extends ItemView {
 		const segEl = sectionIdx >= 0
 			? this.progressBarEl.querySelector<HTMLElement>(`.tmr-progress-segment[data-section="${sectionIdx}"]`)
 			: null;
-		if (Platform.isMobile) {
-			// The mobile bar spans the *current chapter*, not the book, so it can
-			// place the return point exactly — as long as the return point is in
-			// this chapter. It is the cross-chapter case that has nowhere to sit:
+		// Which bar is on screen, not which platform we are on. The chapter-scoped
+		// bar exists only where a navbar was measured to seat it — the same class
+		// the stylesheet uses to hide the segments — so the two agree by
+		// construction. `Platform.isMobile` was the wrong question and iPad was
+		// the case that showed it: no navbar there, so the book-wide segmented bar
+		// renders while this took the chapter-scoped branch, and a chapter-local
+		// fraction spread across the whole book's width put the return dot far
+		// ahead of the page it stood for. Navigation was always correct — only the
+		// dot lied.
+		if (this.contentEl.hasClass("tmr-navbar-tracked")) {
+			// That bar spans the *current chapter*, not the book, so it can place
+			// the return point exactly — as long as the return point is in this
+			// chapter. It is the cross-chapter case that has nowhere to sit:
 			// there the dot parks at whichever end it lies past, which reads as
 			// "this takes you out of the chapter, backwards/forwards".
 			const start = this.sectionStartSpreads[sectionIdx] ?? 0;
@@ -4144,30 +4632,31 @@ export class ReaderView extends ItemView {
 		const sel = window.getSelection();
 		if (sel && !sel.isCollapsed) return;
 
+		// A page turn deliberately does *not* sync the chrome. It leaves the chrome
+		// state untouched, and the navbar needs no re-asserting: `restoreNavigation`
+		// early-returns on our behalf (see syncMobileChrome), so Obsidian's tap
+		// listener never pulled it back. The sync that used to sit here was a
+		// leftover from the hideNavigation-based approach, and it cost a forced
+		// layout plus a native status-bar bridge call on every turn.
 		const zone = this.tapZoneEdges();
-		if (zone && e.clientX <= zone.left) void this.retreat();
-		else if (zone && e.clientX >= zone.right) void this.advance();
-		else {
-			this.toggleChrome();
-			return;
-		}
-		// Page turns leave the chrome exactly as it was; only the navbar needs
-		// re-asserting, because Obsidian just restored it out from under us.
-		this.syncMobileChrome();
+		if (e.clientX <= zone.left) void this.retreat();
+		else if (e.clientX >= zone.right) void this.advance();
+		else this.toggleChrome();
 	}
 
-	/** Horizontal extent of the two chevron columns, measured off the buttons
-	 *  rather than restating `--tmr-chrome-btn` / `--tmr-chrome-inset` in JS.
-	 *  Measured per tap, not cached: the tokens change at the 550px breakpoint
-	 *  and the pane can be resized under a split view. */
-	private tapZoneEdges(): { left: number; right: number } | null {
-		const prev = this.contentEl.querySelector<HTMLElement>(".tmr-page-nav-prev");
-		const next = this.contentEl.querySelector<HTMLElement>(".tmr-page-nav-next");
-		if (!prev || !next) return null;
-		return {
-			left: prev.getBoundingClientRect().right,
-			right: next.getBoundingClientRect().left,
-		};
+	/** Horizontal extent of the two page-turn strips: a third of the reader's
+	 *  width at each edge, leaving the middle third to toggle the chrome.
+	 *
+	 *  Thirds, not anything derived from the chevron buttons: those give ~45px on
+	 *  a phone, narrow enough that taps meant as page turns land in the middle
+	 *  and summon the chrome instead.
+	 *
+	 *  Off the reader's own rect, not the viewport's — they differ under a split
+	 *  — and measured per tap, since a pane can be resized under one. */
+	private tapZoneEdges(): { left: number; right: number } {
+		const root = this.contentEl.getBoundingClientRect();
+		const zone = root.width * ReaderView.TAP_ZONE_SHARE;
+		return { left: root.left + zone, right: root.right - zone };
 	}
 
 	private toggleChrome(): void {
@@ -4188,35 +4677,44 @@ export class ReaderView extends ItemView {
 	 *
 	 *  Those two are wired to a window-level `mousedown` listener registered at
 	 *  app start, so *every* tap restores the navbar and fires a native status-bar
-	 *  fade-in. This used to re-assert the hidden state in a rAF once that
-	 *  listener had run, which worked but showed as a status-bar flicker on every
-	 *  page turn (device-reported).
+	 *  fade-in — re-asserting the hidden state afterwards shows as a flicker on
+	 *  every page turn.
 	 *
-	 *  Instead we own the hidden state ourselves. `restoreNavigation` early-returns
-	 *  unless `is-hidden-nav` is on the body, so by never setting that class we
-	 *  satisfy its own guard: Obsidian's listener still runs on every tap and does
-	 *  nothing at all. No event interception, no patching — nothing that an
-	 *  Obsidian update can break beyond the navbar simply staying put.
+	 *  Instead we own the hidden state. `restoreNavigation` early-returns unless
+	 *  `is-hidden-nav` is on the body, so by never setting that class we satisfy
+	 *  its own guard: Obsidian's listener still runs on every tap and does
+	 *  nothing. No interception, no patching.
 	 *
-	 *  Hiding the native status bar in step is the one thing we lose by not
-	 *  calling `hideNavigation()`, so we do it directly (see `statusBarPlugin`).
-	 *  If that turns out to be unreachable on device, the reader keeps working and
-	 *  the clock stays on screen — see the Mobile spec for the rollback. */
+	 *  Hiding the native status bar in step is what we lose by not calling
+	 *  `hideNavigation()`, so we do it directly (see `statusBarPlugin`). If that
+	 *  is unreachable on device the reader keeps working and the clock stays.
+	 *
+	 *  Phones only. Hiding the status bar changes the top safe-area inset, so the
+	 *  frame resizes whenever the chrome moves — worth it on a phone, where it
+	 *  buys a calmer page. On iPad it buys nothing: Obsidian renders no navbar on
+	 *  a tablet, so the resize *is* the whole visible effect. Hence the gate on
+	 *  form factor rather than `isMobile`. */
 	private syncMobileChrome(): void {
 		if (!Platform.isMobile) return;
+		// A full-screen pane owns the phone: the chrome tap that opened it must not
+		// leave the navbar floating over its chat box, or the status bar over its
+		// header. The keyboard guard and the user's auto-fullscreen setting below
+		// still win — with the navbar up, the pane's own clearance lifts its
+		// pinned controls clear of it.
+		const paneOwnsScreen = this.tocOpen || this.pane.isOpen;
 		const keepVisible =
 			// A reader that isn't the active leaf must not hold the navbar hidden
 			// for whatever the user switched to — this is a body-level class now,
 			// not a per-view one.
 			this.app.workspace.getActiveViewOfType(ReaderView) !== this
-			|| this.contentEl.hasClass("tmr-chrome-visible")
+			|| (this.contentEl.hasClass("tmr-chrome-visible") && !paneOwnsScreen)
 			// Settings → Appearance → auto fullscreen. Obsidian mirrors it onto
 			// the body, so honouring it costs no private config read.
 			|| !document.body.hasClass("auto-full-screen")
 			// Never pull the navbar out from under an open soft keyboard.
 			|| isTextInputFocused();
 		document.body.toggleClass("tmr-immersive", !keepVisible);
-		ReaderView.setStatusBarHidden(!keepVisible);
+		if (Platform.isPhone) ReaderView.setStatusBarHidden(!keepVisible);
 		// The bar's rest/expanded geometry and the copy under it both hang off
 		// the chrome state, and this runs on every change of it.
 		this.layoutMobileProgress();
@@ -4348,14 +4846,28 @@ export default class ThirdMindReader extends Plugin {
 		this.registerVaultEvents();
 
 		// PDF Gloss: augment Obsidian's native PDF viewer with the same GlossBar.
-		// Desktop-only for now (mobile PDF belongs to the Phase 5.5 track), and
-		// internally feature-gated — an unrecognised viewer simply stays native.
-		if (Platform.isDesktopApp) {
-			this.pdfGloss = new PdfGlossManager(
-				this.app, () => this.settings, () => this.saveSettings(),
-			);
-			this.addChild(this.pdfGloss);
-		}
+		// All platforms — the touch grammar the reader worked out is shared, so a
+		// PDF gets the docked bar, the keyboard-aware input and the tap two-step
+		// without a second implementation. Still internally feature-gated: if the
+		// mobile viewer doesn't expose the internals `supportsPdfGloss` checks
+		// for, the PDF simply stays native rather than breaking.
+		this.pdfGloss = new PdfGlossManager(
+			this.app, () => this.settings, () => this.saveSettings(),
+			// A PDF's reading position lands in the same `bookPositions` entry an
+			// epub's does, so the Library card reads one field for both formats.
+			// `persistSettings` rather than `saveSettings`: this fires as the user
+			// scrolls, and there's no theme change to fan out to every open view.
+			(path, pct) => {
+				this.settings.bookPositions[path] = {
+					...this.settings.bookPositions[path],
+					pct,
+					lastRead: Date.now(),
+				};
+				void this.persistSettings();
+				this.updateLibraryProgress(path, pct);
+			},
+		);
+		this.addChild(this.pdfGloss);
 
 		this.app.workspace.onLayoutReady(() => void this.repairCompanionSourceLinks());
 	}
@@ -4396,7 +4908,7 @@ export default class ThirdMindReader extends Plugin {
 	}
 
 	/** Live Library upkeep. Keeps reading position (and the display override)
-	 *  attached to a book as it moves between collections (bug B4), keeps the
+	 *  attached to a book as it moves between collections, keeps the
 	 *  metadata/marks caches honest, and refreshes any open Library view when its
 	 *  `Library/` contents change — no manual reload needed. */
 	private registerVaultEvents(): void {
@@ -4542,6 +5054,19 @@ export default class ThirdMindReader extends Plugin {
 			},
 		});
 		this.addCommand({
+			// No default hotkey: `b` toggles it from inside the reader (see the
+			// view-scoped keydown listener); the command exists so users can
+			// bind their own combo.
+			id: "toggle-bookmark",
+			name: "Bookmark this page",
+			checkCallback: (checking) => {
+				const v = this.activeReaderView();
+				if (!v) return false;
+				if (!checking) void v.toggleBookmark();
+				return true;
+			},
+		});
+		this.addCommand({
 			// No default hotkey: 3C-mode toggling is the least-used reader action
 			// and Shift+Mod+3 clashes with the macOS screenshot shortcut. Exposed
 			// for users to bind to a combo of their choosing.
@@ -4646,10 +5171,33 @@ export default class ThirdMindReader extends Plugin {
 		document.head.appendChild(el);
 	}
 
+	/** Open a Library book in its own tab, in whichever viewer owns its format:
+	 *  the reader for `.epub`, Obsidian's native viewer (which PDF Gloss then
+	 *  attaches to) for `.pdf`. Both dedup onto an already-open tab, so a second
+	 *  card click reveals rather than duplicates. */
+	async openBookInNewTab(filePath: string): Promise<void> {
+		if (!filePath.toLowerCase().endsWith(".pdf")) {
+			await this.openEpubInNewTab(filePath);
+			return;
+		}
+		const file = this.app.vault.getFileByPath(filePath);
+		if (!file) return;
+		const existing = this.app.workspace
+			.getLeavesOfType("pdf")
+			.find((leaf) => (leaf.view as { file?: TFile }).file?.path === filePath);
+		if (existing) {
+			await this.app.workspace.revealLeaf(existing);
+			return;
+		}
+		const leaf = this.app.workspace.getLeaf("tab");
+		await leaf.openFile(file);
+		await this.app.workspace.revealLeaf(leaf);
+	}
+
 	async openEpubInNewTab(filePath: string): Promise<void> {
 		// Dedup: if this book is already open in a reader tab, reveal it rather than
 		// spawning a duplicate (mirrors the companion-doc dedup, and makes Library
-		// card clicks idempotent — bug B3). `getState().file` is the live path.
+		// card clicks idempotent). `getState().file` is the live path.
 		const existing = this.app.workspace.getLeavesOfType(READER_VIEW_TYPE).find((leaf) => {
 			const view = leaf.view;
 			return view instanceof ReaderView && view.getState()?.file === filePath;
@@ -4746,7 +5294,11 @@ export default class ThirdMindReader extends Plugin {
 		await this.persistSettings();
 		this.app.workspace.getLeavesOfType(READER_VIEW_TYPE).forEach((leaf) => {
 			const view = leaf.view;
-			if (view instanceof ReaderView) { view.applyThemeClasses(); view.applyAiFeaturesState(); }
+			if (view instanceof ReaderView) {
+				view.applyThemeClasses();
+				view.applyAiFeaturesState();
+				view.applyReaderFontSize();
+			}
 		});
 		this.app.workspace.getLeavesOfType(LIBRARY_VIEW_TYPE).forEach((leaf) => {
 			const view = leaf.view;
@@ -4755,9 +5307,8 @@ export default class ThirdMindReader extends Plugin {
 		this.pdfGloss?.applySettings();
 	}
 
-	/** Open (or reveal) the Library home view. Replaces the old `activateView`,
-	 *  which constructed a fileless ReaderView stuck on "Opening…" (bug B1).
-	 *  Reuses an already-open Library leaf rather than spawning duplicates. */
+	/** Open (or reveal) the Library home view, reusing an already-open Library
+	 *  leaf rather than spawning duplicates. */
 	private async activateLibraryView(): Promise<void> {
 		const { workspace } = this.app;
 		let leaf = workspace.getLeavesOfType(LIBRARY_VIEW_TYPE)[0];
@@ -4814,6 +5365,67 @@ class TmrSettingTab extends PluginSettingTab {
 		super(app, plugin);
 	}
 
+	/** Reader text size: a "use Obsidian's" switch, plus the slider that appears
+	 *  only once it's off. Repaints its own block rather than calling `display()`
+	 *  on toggle — a full redraw would collapse every expanded provider panel
+	 *  further down the tab. */
+	private renderTextSizeSetting(parent: HTMLElement): void {
+		const block = parent.createEl("div");
+		const paint = (): void => {
+			block.empty();
+			const following = this.plugin.settings.readerFontSize === null;
+
+			new Setting(block)
+				.setName("Use Obsidian's text size")
+				.setDesc("Book text matches Appearance → Font size, so it changes with the rest of the app. Turn this off to set a size for the reader alone.")
+				.addToggle(t => t
+					.setValue(following)
+					.onChange(async (v) => {
+						// Seeded with the size already on screen, so flipping the
+						// switch off changes nothing until the slider moves.
+						this.plugin.settings.readerFontSize = v ? null : appTextSize();
+						await this.plugin.saveSettings();
+						paint();
+					}));
+
+			if (following) return;
+
+			const current = this.plugin.settings.readerFontSize ?? appTextSize();
+			const setting = new Setting(block)
+				.setName("Reader text size")
+				.setDesc("Size of book text in pixels. Affects the reader only — notes and the rest of Obsidian are untouched.")
+				.addExtraButton(b => b
+					.setIcon("rotate-ccw")
+					.setTooltip("Match Obsidian's text size")
+					.onClick(async () => {
+						this.plugin.settings.readerFontSize = appTextSize();
+						await this.plugin.saveSettings();
+						paint();
+					}));
+			// Created between the reset button and the slider so the row reads
+			// [reset] [18] [────●────], the same order as Obsidian's own.
+			const value = setting.controlEl.createEl("span", {
+				cls: "tmr-setting-slider-value",
+				text: String(current),
+			});
+			setting.addSlider(s => {
+				s.setLimits(READER_FONT_MIN, READER_FONT_MAX, 1)
+					.setValue(current)
+					// Commit on release, not on every drag tick: each change
+					// repaginates the open book.
+					.setInstant(false)
+					.onChange(async (n) => {
+						this.plugin.settings.readerFontSize = n;
+						await this.plugin.saveSettings();
+					});
+				// The number still tracks the thumb while dragging, so the slider
+				// reads live even though nothing has been committed yet.
+				s.sliderEl.addEventListener("input", () => value.setText(s.sliderEl.value));
+			});
+		};
+		paint();
+	}
+
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
@@ -4830,6 +5442,10 @@ class TmrSettingTab extends PluginSettingTab {
 						window.open(buildFeedbackUrl(this.plugin.manifest.version), "_blank");
 					}));
 		}
+
+		// ── Reading ──────────────────────────────────────────────────────
+		new Setting(containerEl).setName("Reading").setHeading();
+		this.renderTextSizeSetting(containerEl);
 
 		new Setting(containerEl)
 			.setName("Enable AI features")

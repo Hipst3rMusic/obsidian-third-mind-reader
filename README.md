@@ -5,24 +5,28 @@
 >**How this was built:** the code here is largely AI-generated and directed by me —
 > [see below](#how-this-was-built).
 
-An opinionated EPUB reader for Obsidian. It renders EPUBs with a character-precise
-reading layout, a highlighting and annotation layer ("Gloss"), per-book companion
-notes that live in your vault, and an optional inline AI librarian.
+An opinionated EPUB reader for Obsidian, on desktop and mobile. It renders EPUBs
+with a character-precise reading layout, a highlighting and annotation layer
+("Gloss") that also works on PDFs, per-book companion notes that live in your
+vault, and an optional inline AI librarian.
 
 ## Features
 
-- Two-page spread and single-page reading with chapter / table-of-contents navigation.
-- Highlight and Annotate books by selecting text.
-- Per-book **companion notes** written into your vault, linked back to the source.
-- Optional **AI librarian** for highlighting with four additional annotation modes (Exclaim, Explain, Examine, Enquiry) using a provider of your choice. Built for local models first.
-- A Library view of all books in your vault with annotation status and progress.
+- Two-page spread and single-page reading with chapter / table-of-contents navigation, in-book search, and bookmarks.
+- **Highlight, Bookmark and Annotate** books by selecting text. Add `[[Wikilinks]]` directly as you annotate.
+- **PDF annotation** — the same Gloss toolbar works inside Obsidian's own PDF viewer; annotations anchor as standard PDF deep links, so they play well with graph, search, and other PDF plugins.
+- **Companion notes** per book, written into your vault and linked back to the source.
+- Optional **AI librarian** for highlighting with four additional annotation modes (Exclaim, Explain, Examine, Enquiry) using a provider of your choice. Built for local models first. On mobile, AI annotations can defer: they're kept in the companion note and answered automatically next time the book opens on desktop.
+- **Mobile support** — the full reader on iPad and iPhone: tap the edges to turn pages, tap the middle for controls, everything sized for touch.
+- A Library view of all books (EPUBs and PDFs) in your vault with annotation status and progress, current reads sorted to the top.
+- Body text follows Obsidian's own text size — including quick font-size adjustment — or pin the reader to its own size in settings.
 
 ## Install (beta, via BRAT)
 
 1. Install the **BRAT** community plugin.
 2. In BRAT, run **"Add a beta plugin for testing"** and enter this repository's path.
 3. Enable **Third Mind Reader** in Community Plugins.
-4. Open any `.epub` file in your vault to start reading.
+4. Open any `.epub` file in your vault to start reading — or select text in a PDF to annotate it.
 
 ## How this was built
 
@@ -52,12 +56,19 @@ still working out what doing this properly looks like.
 
 ## Requirements & disclosures
 
-- **Desktop only** for now. The EPUB-import feature uses Node/Electron APIs that
-  aren't available on mobile.
+- **Desktop and mobile.** iPad and iPhone are supported as of 0.6.0; Android
+  should work but has seen less testing — reports welcome. Importing books from
+  outside the vault remains desktop-only (it uses Node/Electron APIs mobile
+  doesn't have); books already in your vault open anywhere.
+- **DRM-free books only.** Encrypted EPUBs (Adobe DRM, Readium LCP) are detected
+  and refused with an explanation instead of opening as garbage. This won't
+  change — LCP decryption requires a certified licensee key that an open-source
+  plugin has nowhere to keep. Font-obfuscated books (common in InDesign exports)
+  are unaffected and open normally.
 - **Network use (optional).** AI features send the text you select plus your prompt
-  to the AI provider you configure — Anthropic, OpenAI, or a local server such as
-  Ollama or LM Studio. **No network request is made unless you actively use an AI
-  feature.** There is no telemetry and no advertising.
+  to the AI provider you configure — Anthropic, OpenAI, OpenRouter, or a local
+  server such as Ollama or LM Studio. **No network request is made unless you
+  actively use an AI feature.** There is no telemetry and no advertising.
 - **API key / account.** Cloud AI requires your own API key, entered in settings and
   stored in Obsidian's encrypted secret storage. Local models need no key.
 - **Your data.** Highlights and annotations are written to companion notes in your

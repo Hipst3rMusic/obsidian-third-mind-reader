@@ -58,6 +58,10 @@
 	--tmr-c-examine:      var(--color-cyan, #6396a2);
 	--tmr-c-emphasise:    var(--color-green, #50805c);
 	--tmr-c-enquiry:      #8c8787;
+	/* Bookmarks — DLS `--bookmark` / HipAnima. Obsidian's extended orange
+	   when 3C is off, the DLS shade itself when it's on (same in both 3C
+	   themes, which is why the two blocks below agree). */
+	--tmr-c-bookmark:     var(--color-orange, #90594e);
 
 	/* Update2 conversation-card border tokens — mode colour (icon-bright red
 	   for Exclaim, Empire-800W for Enquiry) at 33% alpha. color-mix resolves
@@ -136,6 +140,7 @@
 	--tmr-c-examine:      #6396a2;
 	--tmr-c-emphasise:    #50805c;
 	--tmr-c-enquiry:      #8c8787;
+	--tmr-c-bookmark:     #90594e;
 
 	/* user-tunable vars from Minimal/Style-Settings: force-set in 3C so
 	   headings/emphasis/blockquote flip with the theme rather than leaking
@@ -200,6 +205,7 @@
 	--tmr-c-examine:      #6396a2;
 	--tmr-c-emphasise:    #50805c;
 	--tmr-c-enquiry:      #8c8787;
+	--tmr-c-bookmark:     #90594e;
 	/* Enquiry's neutral border reads too faint on light Empire surfaces — the
 	   DLS doubles its alpha there (design token #a6a2a4a8 vs …54 in dark). */
 	--tmr-border-enquiry: color-mix(in srgb, #a7a3a5 66%, transparent);
@@ -243,6 +249,16 @@ body.is-translucent .tmr-root.tmr-3c-mode:not([data-tmr-theme="light"]) {
 body.is-phone .workspace-leaf-content[data-type="third-mind-reader"] .view-content,
 body.is-phone .workspace-leaf-content[data-type="tmr-library"] .view-content {
 	margin-top: var(--safe-area-inset-top, 0px);
+	/* …and paint that band ourselves, or it keeps whatever background the user's
+	   Obsidian theme has — a hard seam above the reader in 3C mode.
+
+	   A shadow rather than `padding-top` or a `::before`: padding would move the
+	   padding box the slide-in panels are absolutely positioned against, taking
+	   them under the notch, and `.tmr-root`'s own `overflow: hidden` clips a
+	   pseudo-element. A shadow paints outside the border box, unclipped, with no
+	   layout at all — and it reads `--background` from the same element, so it
+	   tracks 3C mode and theme for free. */
+	box-shadow: 0 calc(-1 * var(--safe-area-inset-top, 0px)) 0 0 var(--background);
 }
 
 .tmr-root {
@@ -310,6 +326,15 @@ body.is-phone .workspace-leaf-content[data-type="tmr-library"] .view-content {
 	padding: 2.0625rem var(--tmr-side-pad) 1rem;
 	width: 100%;
 	box-sizing: border-box;
+	/* Reading size, inherited by .tmr-content below. Falls back through the
+	   plugin's own override (settings → Reading, unset by default) to
+	   Obsidian's Appearance → Font size, so the reader matches the rest of the
+	   app instead of pinning 15px while the rem-based gutters grow with the
+	   setting — which made a larger app font shrink the text relatively.
+	   Declared here rather than on .tmr-content so getSpreadFontSize() in
+	   main.ts measures the reading em (the mobile single-page breakpoint is
+	   24 of them); .tmr-spread has no other children. */
+	font-size: var(--tmr-font-size, var(--font-text-size, 15px));
 }
 
 /* Touch layouts drop the adjacent-page bleed described on .tmr-spread above.
@@ -538,7 +563,9 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 .tmr-content,
 .tmr-content p {
 	font-family: var(--font-secondary);
-	font-size: 15px;
+	/* Size comes from .tmr-spread; stated explicitly so source-epub rules that
+	   set a px size on <p> lose to ours. */
+	font-size: inherit;
 	line-height: 1.65;
 	color: var(--foreground);
 }
@@ -574,10 +601,28 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 
 .tmr-content p {
 	margin: 0 0 1.1em;
-	break-inside: avoid-column;
+	/* Paragraphs fragment across the column boundary, as in print. They were
+	   `break-inside: avoid-column` — a paragraph that didn't fit the space left
+	   in a column jumped whole to the next one, so each page ended with a gap
+	   the height of whatever got bumped (an 8-line paragraph = 8 blank lines).
+	   Two lines minimum on either side of the split so the break never strands
+	   a single line. */
+	orphans: 2;
+	widows: 2;
 }
 
 .tmr-content p.tmr-drop-cap::first-letter {
+	/* WebKit shipped this prefixed for years before adopting the standard name,
+	   and Blink only ever had the standard one (verified: this Chromium supports
+	   `initial-letter` and not `-webkit-initial-letter`). Desktop renders drop
+	   caps correctly and iOS doesn't, with the same class applied — so the
+	   missing prefix is the first thing to rule out. Prefixed first, so the
+	   standard property wins wherever both are understood.
+
+	   Unverified on device; if drop caps are still absent, the next suspect is
+	   WebKit's handling of `initial-letter` inside CSS multicol, which the
+	   reading column always is. */
+	-webkit-initial-letter: 2;
 	initial-letter: 2;
 	margin-right: 4px;
 	font-family: var(--font-primary);
@@ -959,6 +1004,7 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 .tmr-gloss-input,
 .tmr-annotation-preview,
 .tmr-gloss-tooltip,
+.tmr-help-modal,
 .tmr-pdf-overlay {
 	--tmr-c-exclaim:      var(--color-red, #7d2e2e);
 	--tmr-c-exclaim-icon: var(--color-red, #af4d4d);
@@ -976,6 +1022,7 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 .tmr-gloss-input.tmr-3c-mode,
 .tmr-annotation-preview.tmr-3c-mode,
 .tmr-gloss-tooltip.tmr-3c-mode,
+.tmr-help-modal.tmr-3c-mode,
 .tmr-pdf-overlay.tmr-3c-mode {
 	--tmr-c-exclaim:      #7d2e2e;
 	--tmr-c-exclaim-icon: #af4d4d;
@@ -1007,10 +1054,36 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 	--icon-size: 1rem;
 }
 
-.tmr-gloss-tile {
+/* Scoped through the bar purely for specificity. The tile is a <button>, and
+   Obsidian's mobile stylesheet sizes bare buttons from `--input-height`, which
+   `.is-mobile` redefines as the 44px touch size — at (0,1,1) that outranks a
+   lone `.tmr-gloss-tile` (0,1,0) and the square came out a stretched pill.
+   Device-reported on iPad, and only there: the phone docks the bar, and the
+   docked rule below already carries three classes, so it was never at risk.
+   Desktop Electron ships no such rule, which is why it looked right in the one
+   place it was easy to check.
+
+   (0,2,0) beats it. `flex: none` and the min-* pair close the other two doors —
+   a flex item shrinking below its width, and `min-height` outranking `height`
+   whatever the importance.
+
+   ONLY the box lives here. `display` deliberately stays in the plain-class rule
+   below, because the Extend tile is shown and hidden *by* `display` from two
+   one-class rules further down — promoting it here promoted it past its own
+   hide rule, and the Extend control appeared over every selection on every
+   platform. Anything whose value another rule owns does not belong in a block
+   raised for an unrelated reason. */
+.tmr-gloss-bar .tmr-gloss-tile {
+	box-sizing: border-box;
+	flex: none;
 	width: 32px;
 	height: 32px;
+	min-width: 0;
+	min-height: 0;
 	padding: 0;
+}
+
+.tmr-gloss-tile {
 	display: flex;
 	align-items: center;
 	justify-content: center;
@@ -1022,7 +1095,14 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 	transition: filter 150ms ease, transform 150ms ease, background 150ms ease, color 150ms ease;
 }
 
+/* `flex: none` for the same reason as the ToC footer's icons: the tile is a flex
+   container, and on WebKit an inline SVG with no intrinsic size collapses inside
+   one instead of holding its width. That is the best candidate for the iPad's
+   blank coloured tiles — a tile whose icon has been squeezed to zero is exactly
+   a plain square of fill. Not reproducible on desktop Electron, which sizes the
+   icon from its viewBox and never collapses it. */
 .tmr-gloss-tile .svg-icon {
+	flex: none;
 	width: 20px;
 	height: 20px;
 }
@@ -1082,14 +1162,20 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 	justify-content: center;
 }
 
-.tmr-gloss-bar.tmr-gloss-docked .tmr-gloss-tile {
+/* Touch tile: 39px painted, whether the bar is docked or floating.
+   Scoped to the device rather than to the docked state, which is how this was
+   written first. Docking only ever happens on mobile, so the two were the same
+   set right up until the iPad — which has no navbar to dock into and so took
+   the floating path at the 32px desktop size, under a fingertip. One rule for
+   both keeps the tile the same object on every touch surface, and the PDF
+   gloss bar inherits it for free. */
+body.is-mobile .tmr-gloss-bar .tmr-gloss-tile {
 	position: relative;
 	width: 39px;
 	height: 39px;
-	flex-shrink: 0;
 }
 
-.tmr-gloss-bar.tmr-gloss-docked .tmr-gloss-tile .svg-icon {
+body.is-mobile .tmr-gloss-bar .tmr-gloss-tile .svg-icon {
 	width: 24px;
 	height: 24px;
 }
@@ -1097,7 +1183,7 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 /* 44px of reach on a 39px painted tile — the Phase B pattern. The 6px gap puts
    tile centres 45px apart, so the reaches tile edge-to-edge rather than
    overlapping and stealing each other's taps (the Library-strip trap). */
-.tmr-gloss-bar.tmr-gloss-docked .tmr-gloss-tile::after {
+body.is-mobile .tmr-gloss-bar .tmr-gloss-tile::after {
 	content: "";
 	position: absolute;
 	top: 50%;
@@ -1109,7 +1195,7 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 
 /* Hover lift belongs to a pointer. On touch the tile is under a fingertip and
    the transform just makes it flicker on the tap that opens the input. */
-.tmr-gloss-bar.tmr-gloss-docked .tmr-gloss-tile:hover {
+body.is-mobile .tmr-gloss-bar .tmr-gloss-tile:hover {
 	filter: none;
 	transform: none;
 }
@@ -1502,14 +1588,6 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 	border-color: var(--hover-border) !important;
 }
 
-/* Committed-to-destination: the pill recedes (fades + drops toward the bar)
-   but stays in the layout so it can fade back in on dot-hover. */
-.tmr-progress-back-dismissed {
-	opacity: 0;
-	transform: translateX(-50%) translateY(6px);
-	pointer-events: none;
-}
-
 .tmr-progress-back-icon {
 	display: inline-flex;
 	width: 11px;
@@ -1619,10 +1697,21 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 	text-overflow: ellipsis;
 }
 
-/* ── Table of Contents ──────────────────────────────────────────────────────── */
+/* ── Reader chrome buttons ──────────────────────────────────────────────────
+   One ghost-button family for every floating control: the corner toggles and
+   the page-turn chevrons. Each member declares only its own corner below; the
+   shared box lives here. `.tmr-highlights-toggle` used to restate all nineteen
+   of these properties verbatim 750 lines further down — identical but for
+   `right` in place of `left` — which meant every tweak had to be made twice or
+   silently applied to half the family.
+
+   The search bar deliberately stays out: it morphs into a text field, so it
+   needs its own box model (gap, overflow, box-sizing) and only shares about
+   half of this. */
 
 .tmr-toc-toggle,
-.tmr-help-toggle,
+.tmr-bookmark-toggle,
+.tmr-highlights-toggle,
 .tmr-page-nav {
 	position: absolute;
 	top: var(--tmr-chrome-inset);
@@ -1657,10 +1746,12 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
    an ancestor of the whole reader — so one tap anywhere pinned every control
    visible for the rest of the session, and dismissing the chrome did nothing. */
 .tmr-root.tmr-chrome-visible .tmr-toc-toggle,
-.tmr-root.tmr-chrome-visible .tmr-help-toggle,
+.tmr-root.tmr-chrome-visible .tmr-bookmark-toggle,
+.tmr-root.tmr-chrome-visible .tmr-highlights-toggle,
 .tmr-root.tmr-chrome-visible .tmr-page-nav,
 .tmr-toc-toggle:focus-visible,
-.tmr-help-toggle:focus-visible,
+.tmr-bookmark-toggle:focus-visible,
+.tmr-highlights-toggle:focus-visible,
 .tmr-page-nav:focus-visible {
 	opacity: 1;
 }
@@ -1676,8 +1767,8 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
    touch exactly as designed. */
 @media (hover: hover) {
 	.tmr-root:hover .tmr-toc-toggle,
-	.tmr-root:hover .tmr-help-toggle,
 	.tmr-root:hover .tmr-page-nav,
+	.tmr-root:hover .tmr-bookmark-toggle,
 	.tmr-root:hover .tmr-highlights-toggle,
 	.tmr-root:hover .tmr-search-bar,
 	.tmr-root:hover .tmr-global-page,
@@ -1702,14 +1793,90 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 	}
 }
 
-/* Help button sits just right of the ToC toggle, sharing its reveal:
-   left edge + button + a 0.375rem gap. */
-.tmr-help-toggle {
-	left: calc(var(--tmr-chrome-inset) + var(--tmr-chrome-btn) + 0.375rem);
+/* ── Dismissed chrome is untappable, not merely invisible ───────────────────
+   The other half of the pair above, and the reason it has to exist: the
+   controls fade to `opacity: 0` but kept their hit areas, including the 44px
+   ::after lids the touch-target pass gave them. On a phone that left four
+   invisible buttons parked over the corners of the page — a tap meant for the
+   text opened the ToC or the search bar instead. Device-reported.
+
+   Pointer devices are fine without this: `:hover` reveals a control before a
+   click can land on it, so there is no invisible-but-live state to close. On
+   touch there is nothing to reveal it, which is exactly what makes the gap.
+
+   An open search bar is the exception. It outlives the chrome auto-hide by
+   design (Mobile/BookSearch), so it must stay live with the chrome down. */
+@media (hover: none) {
+	.tmr-root:not(.tmr-chrome-visible) .tmr-toc-toggle,
+	.tmr-root:not(.tmr-chrome-visible) .tmr-bookmark-toggle,
+	.tmr-root:not(.tmr-chrome-visible) .tmr-highlights-toggle,
+	.tmr-root:not(.tmr-chrome-visible) .tmr-search-bar:not(.tmr-search-bar-open) {
+		pointer-events: none;
+	}
 }
 
-.tmr-toc-toggle.tmr-toc-toggle-hidden,
-.tmr-help-toggle.tmr-toc-toggle-hidden {
+/* The Highlights toggle is the same button in the opposite corner — `right`
+   has to unset the family's `left` rather than merely compete with it, since
+   both are inherited from the shared rule above. */
+.tmr-highlights-toggle {
+	left: auto;
+	right: var(--tmr-chrome-inset);
+}
+
+/* Bookmark sits one button in from Highlights, mirroring how Book search sits
+   one button in from the ToC toggle on the other side. */
+.tmr-bookmark-toggle {
+	left: auto;
+	right: calc(var(--tmr-chrome-inset) + var(--tmr-chrome-btn) + 0.5rem);
+}
+
+/* Active — this page carries a bookmark.
+ *
+ * Split by what the platforms actually share, which is only the glyph colour.
+ * The box treatment below is desktop/iPad only: on a phone the toolbar plate
+ * already supplies a box, so a second one reads as a button inside a button
+ * (Mobile/UIActive/BookmarkActive shows the icon alone).
+ *
+ * Split by *breakpoint* rather than by neutralising the desktop rules inside
+ * the phone block, which is how this was written first. That version keyed off
+ * `.tmr-chrome-visible`, so the instant the chrome class dropped the desktop
+ * rule took back over and the stroke flashed through the toolbar's fade-out —
+ * device-reported. Anything conditioned on a class that animates away will do
+ * that; the breakpoint doesn't move.
+ *
+ * `!important` throughout because the family's resting `background` and
+ * `border` carry it — they have to beat Obsidian's own button styling. */
+.tmr-bookmark-toggle.tmr-bookmark-active,
+.tmr-bookmark-toggle.tmr-bookmark-active:hover {
+	color: var(--tmr-c-bookmark) !important;
+}
+
+/* Complement of the phone block's `max-width: 550px`. The two themes are
+   deliberately not mirror images (BookmarkButton/…/Active/LightMode vs
+   /DarkMode): an orange outline reads clearly against a dark page and muddily
+   against a light one, where a solid fill with a pale glyph carries better.
+
+   The `:hover` pairs keep the active state legible rather than letting the
+   family's neutral hover fill repaint it. */
+@media (min-width: 551px) {
+	.tmr-bookmark-toggle.tmr-bookmark-active,
+	.tmr-bookmark-toggle.tmr-bookmark-active:hover {
+		border-color: var(--tmr-c-bookmark) !important;
+	}
+
+	.tmr-root.tmr-3c-mode[data-tmr-theme="light"] .tmr-bookmark-toggle.tmr-bookmark-active,
+	.tmr-root.tmr-3c-mode[data-tmr-theme="light"] .tmr-bookmark-toggle.tmr-bookmark-active:hover {
+		background: var(--tmr-c-bookmark) !important;
+		border-color: transparent !important;
+		color: var(--background) !important;
+	}
+}
+
+/* "A pane has slid over this button's corner." One class for the whole family
+   rather than a per-button name — the ToC and Highlights panes each used to
+   ship their own (`tmr-toc-toggle-hidden`, `tmr-highlights-toggle-hidden`) for
+   identical behaviour, set from two different files. */
+.tmr-chrome-btn-hidden {
 	opacity: 0 !important;
 	pointer-events: none;
 }
@@ -1730,14 +1897,16 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 }
 
 .tmr-toc-toggle:hover,
-.tmr-help-toggle:hover,
+.tmr-bookmark-toggle:hover,
+.tmr-highlights-toggle:hover,
 .tmr-page-nav:hover {
 	background: var(--hover-popover) !important;
 	color: var(--muted-foreground);
 }
 
 .tmr-toc-toggle .svg-icon,
-.tmr-help-toggle .svg-icon,
+.tmr-bookmark-toggle .svg-icon,
+.tmr-highlights-toggle .svg-icon,
 .tmr-page-nav .svg-icon {
 	color: inherit !important;
 }
@@ -1856,6 +2025,30 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 	line-height: 1.2;
 	color: #e3e1e2;
 	white-space: nowrap;
+}
+
+/* Touch rows swap the keycap for the icon of the control that does the job.
+   Square rather than the keycap's pill, and the same painted size as the
+   reader's own chrome buttons at this scale, so the sheet reads as a picture of
+   the interface rather than a second vocabulary. */
+.tmr-help-iconcap {
+	flex: 0 0 auto;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 30px;
+	height: 30px;
+	box-sizing: border-box;
+	background: #1f1f1f;
+	border: 1px solid #353535;
+	border-radius: 5px;
+	color: var(--muted-foreground);
+}
+
+.tmr-help-iconcap svg {
+	width: 17px;
+	height: 17px;
+	color: inherit;
 }
 
 .tmr-help-desc {
@@ -2100,6 +2293,7 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	border-top: 1px solid var(--sidebar-border);
 }
 
+.tmr-toc-help-btn,
 .tmr-toc-mode-btn,
 .tmr-toc-theme-btn {
 	appearance: none !important;
@@ -2119,6 +2313,7 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	flex-shrink: 0;
 }
 
+.tmr-toc-help-btn:hover,
 .tmr-toc-mode-btn:hover,
 .tmr-toc-theme-btn:hover {
 	color: var(--muted-foreground) !important;
@@ -2138,16 +2333,26 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	background: var(--hover-popover) !important;
 }
 
+/* `flex: none` because both buttons are flex containers and an inline SVG is a
+   flex item like any other. WebKit gives a viewBox-only SVG no intrinsic size,
+   so it shrinks to near-nothing inside one rather than holding the width it was
+   given — which is why these read as specks on iPad and correct on desktop
+   Electron. The width/height below were never the problem; nothing was
+   stopping them being overruled. 24px rather than 22 while we're here: it's the
+   size the docked gloss tiles already use, and it sits better in a 42px box. */
 .tmr-toc-mode-btn svg {
-	width: 22px;
-	height: 22px;
+	flex: none;
+	width: 24px;
+	height: 24px;
 	fill: currentColor;
 	color: inherit !important;
 }
 
+.tmr-toc-help-btn .svg-icon,
 .tmr-toc-theme-btn .svg-icon {
-	width: 22px;
-	height: 22px;
+	flex: none;
+	width: 24px;
+	height: 24px;
 	color: inherit !important;
 }
 
@@ -2279,30 +2484,46 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
    structure wherever it appears. The five gloss types are unique enough that
    we're not worried about collisions with other callout types in the vault.
 
-   `--callout-color` takes an `R, G, B` triplet; `--callout-icon` takes any
-   lucide icon name. Both are standard Obsidian callout hooks. Colour triplets
-   mirror the DLS primitives used by the GlossBar and the persistent-highlight
-   overlay so reader ↔ companion doc stays chromatically linked. */
+   `--callout-color` takes a **real CSS colour**; `--callout-icon` takes any
+   lucide icon name. Both are standard Obsidian callout hooks. Colours mirror
+   the DLS primitives used by the GlossBar and the persistent-highlight overlay
+   so reader ↔ companion doc stays chromatically linked.
+
+   These were `R, G, B` triplets until 2026-08-11, which is the convention every
+   callout guide and Callout Manager export still uses — and which Obsidian
+   silently stopped accepting. Its own rules now read
+   `color-mix(in oklch, var(--callout-color) …)` for the border and fill and
+   `color: var(--callout-color)` for the title; a bare triplet is not a colour,
+   so every one of those declarations was invalid and dropped. The result was
+   companion-doc callouts with the right icon and no fill, no border and a
+   neutral title — icons survive because `--callout-icon` is an identifier that
+   never passes through a colour function. Same breakage killed Callout Manager.
+   Obsidian's own stock callouts are hex (`--callout-error: #AF4D4D`), so hex is
+   the format to match. */
 
 .callout[data-callout="exclaim"] {
-	--callout-color: 175, 77, 77;               /* HipAgni */
+	--callout-color: #af4d4d;                   /* HipAgni */
 	--callout-icon: lucide-circle-alert;
 }
 .callout[data-callout="explain"] {
-	--callout-color: 172, 156, 93;              /* Look */
+	--callout-color: #ac9c5d;                   /* Look */
 	--callout-icon: lucide-help-circle;
 }
 .callout[data-callout="examine"] {
-	--callout-color: 99, 150, 162;              /* Learn */
+	--callout-color: #6396a2;                   /* Learn */
 	--callout-icon: lucide-search;
 }
 .callout[data-callout="emphasise"] {
-	--callout-color: 80, 128, 92;               /* All Good */
+	--callout-color: #50805c;                   /* All Good */
 	--callout-icon: lucide-highlighter;
 }
 .callout[data-callout="enquiry"] {
-	--callout-color: 140, 135, 135;             /* Shadow / Empire-900W */
+	--callout-color: #8c8787;                   /* Shadow / Empire-900W */
 	--callout-icon: lucide-message-circle-more;
+}
+.callout[data-callout="bookmark"] {
+	--callout-color: #90594e;                   /* HipAnima */
+	--callout-icon: lucide-bookmark;
 }
 
 /* ── GlossBar tile tooltip (body-scoped, tinted per mode) ──────────────────── */
@@ -2337,59 +2558,29 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 
 /* ── Highlights navigation panel (right-side slide-in) ─────────────────────── */
 
-.tmr-highlights-toggle {
-	position: absolute;
-	top: var(--tmr-chrome-inset);
-	right: var(--tmr-chrome-inset);
-	z-index: 25;
-	width: var(--tmr-chrome-btn);
-	height: var(--tmr-chrome-btn);
-	border-radius: 0.5625rem !important;
-	background: transparent !important;
-	border: 1px solid transparent !important;
-	box-shadow: none !important;
-	color: var(--foreground);
-	padding: 0 !important;
-	display: flex;
-	align-items: center;
-	justify-content: center;
-	cursor: pointer;
-	opacity: 0;
-	transition: opacity 200ms ease, background 150ms ease, color 150ms ease;
-	--icon-size: 1rem;
-}
-
-.tmr-root.tmr-chrome-visible .tmr-highlights-toggle,
-.tmr-highlights-toggle:focus-visible {
-	opacity: 1;
-}
-
-.tmr-highlights-toggle.tmr-highlights-toggle-hidden {
-	opacity: 0 !important;
-	pointer-events: none;
-}
-
-.tmr-highlights-toggle:hover {
-	background: var(--hover-popover) !important;
-	color: var(--muted-foreground);
-}
-
-.tmr-highlights-toggle .svg-icon {
-	color: inherit !important;
-}
+/* The toggle itself is a member of the reader-chrome button family — box,
+   reveal, hover, icon colour and the `.tmr-chrome-btn-hidden` state all come
+   from the shared rules up by the ToC toggle. Only its corner is its own. */
 
 /* ── Book search (Phase 5) — morphing bar + anchored results card. One
    element is both the ghost icon button and the expanded field (library
-   search pattern, BookSearchButton components): right-anchored, so the
-   width transition expands leftward. ─────────────────────────────────── */
+   search pattern, BookSearchButton components): left-anchored, so the width
+   transition expands rightward.
 
-/* Collapsed: ghost toggle seated one button-width left of the Highlights
-   toggle (0.5rem edge + button + 0.5rem gap). Fixed left padding keeps the
-   icon put while the width animates (library-search trick). */
+   It anchored right until Bookmarks moved in next to Highlights and Search
+   took the Help button's old corner. Left-anchoring is the simpler of the two
+   arrangements, not a compromise: the icon sits at the bar's fixed left
+   padding, so with the left edge pinned it genuinely holds still while the
+   field unfurls. Right-anchored, growing the width moved the left edge — and
+   the icon travelled with it. ────────────────────────────────────────────── */
+
+/* Collapsed: ghost toggle seated one button-width right of the ToC toggle,
+   on the same 0.375rem gap the Help button used, so it lands exactly where
+   Help did. */
 .tmr-search-bar {
 	position: absolute;
 	top: var(--tmr-chrome-inset);
-	right: calc(var(--tmr-chrome-inset) + var(--tmr-chrome-btn) + 0.5rem);
+	left: calc(var(--tmr-chrome-inset) + var(--tmr-chrome-btn) + 0.375rem);
 	z-index: 25;
 	display: flex;
 	align-items: center;
@@ -2450,12 +2641,12 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 }
 
 /* Results card (4izeN Dropdown tokens), anchored beneath the bar and
-   sharing its right edge/width so the pair reads as one assembly. Hides
+   sharing its left edge/width so the pair reads as one assembly. Hides
    itself whenever there's nothing to show (pre-query state). */
 .tmr-book-search {
 	position: absolute;
 	top: calc(var(--tmr-chrome-inset) + var(--tmr-chrome-btn) + 0.3125rem);
-	right: calc(var(--tmr-chrome-inset) + var(--tmr-chrome-btn) + 0.5rem);
+	left: calc(var(--tmr-chrome-inset) + var(--tmr-chrome-btn) + 0.375rem);
 	z-index: 24;
 	width: 21.25rem;
 	max-width: calc(100% - 4rem);
@@ -2692,31 +2883,57 @@ body.is-mobile .tmr-highlights-panel {
 	   pane's chat box sit under the floating navbar. It moves from the box to
 	   padding: the background runs to the screen edge, the content stops
 	   above the navbar. */
-	body.is-mobile .tmr-toc,
-	body.is-mobile .tmr-highlights-panel {
+	body.is-mobile .tmr-toc {
 		bottom: 0;
-		padding-bottom: calc(
-			var(--safe-area-inset-bottom, 0px) + var(--mobile-toolbar-height, 52px)
-		);
+		padding-bottom: var(--tmr-navbar-clear);
 		transition: transform 300ms ease, padding-bottom 240ms ease;
 	}
 
-	/* …but only while the navbar is actually there. `tmr-immersive` is the
-	   navbar's own visibility (ReaderView.syncMobileChrome sets both), and a
-	   pane spends most of its life with the chrome down — so the clearance was
-	   holding 86px of dead space under a navbar that wasn't on screen, and the
-	   list appeared to cut off early with room to spare. Device-reported.
+	/* The Highlights pane takes it further: its lists scroll *under* the navbar
+	   rather than ending above it, so the sheet reads as full-height instead of
+	   stopping at a line with reader showing below. The clearance moves inside,
+	   onto the scrollers' own padding (last row still reachable) and onto the
+	   pinned controls (which must stay clear of the pill). */
+	body.is-mobile .tmr-highlights-panel {
+		bottom: 0;
+		padding-bottom: 0;
+	}
 
-	   The two states that *do* show the navbar are the moment a pane opens and
-	   whenever the chat box has focus, which are exactly the moments the
-	   clearance is wanted. The padding transition above matches the navbar's
-	   own animation so the list doesn't jump.
+	body.is-mobile .tmr-highlights-list,
+	body.is-mobile .tmr-conv-cards {
+		padding-bottom: calc(1rem + var(--tmr-navbar-clear));
+		transition: padding-bottom 240ms ease;
+	}
+
+	body.is-mobile .tmr-conv-filter-row {
+		margin-bottom: var(--tmr-navbar-clear);
+		transition: margin-bottom 240ms ease;
+	}
+
+	body.is-mobile .tmr-conv-screen {
+		padding-bottom: calc(0.375rem + var(--tmr-navbar-clear));
+		transition: padding-bottom 240ms ease;
+	}
+
+	/* The clearance every rule above rides, in one place — and only while the
+	   navbar is actually there. `tmr-immersive` is the navbar's own visibility
+	   (ReaderView.syncMobileChrome sets both), and a pane spends most of its
+	   life with the chrome down, where reserving for it holds 86px of dead
+	   space under a navbar that isn't on screen. The two states that *do* show
+	   it — a pane opening, and the chat box taking focus — are exactly the ones
+	   that want it. The transitions above match the navbar's own animation so
+	   nothing jumps.
 
 	   Zero, not the safe-area inset: the home indicator is never painted over
-	   the app on this platform, so reserving for it only shortened the list. */
-	body.is-mobile.tmr-immersive .tmr-toc,
-	body.is-mobile.tmr-immersive .tmr-highlights-panel {
-		padding-bottom: 0;
+	   the app on this platform, so reserving for it only shortens the list. */
+	body.is-mobile {
+		--tmr-navbar-clear: calc(
+			var(--safe-area-inset-bottom, 0px) + var(--mobile-toolbar-height, 52px)
+		);
+	}
+
+	body.is-mobile.tmr-immersive {
+		--tmr-navbar-clear: 0px;
 	}
 
 	/* The row is [icon | body | delete] with an even 1rem padding, which reads
@@ -2911,12 +3128,14 @@ body.is-mobile .tmr-highlights-panel {
 .tmr-highlights-item[data-gloss-mode="examine"]   { border-left-color: var(--tmr-c-examine); }
 .tmr-highlights-item[data-gloss-mode="emphasise"] { border-left-color: var(--tmr-c-emphasise); }
 .tmr-highlights-item[data-gloss-mode="enquiry"]   { border-left-color: var(--tmr-c-enquiry); }
+.tmr-highlights-item[data-gloss-mode="bookmark"]  { border-left-color: var(--tmr-c-bookmark); }
 
 .tmr-highlights-item[data-gloss-mode="exclaim"]   .tmr-highlights-item-icon { color: var(--tmr-c-exclaim-icon); }
 .tmr-highlights-item[data-gloss-mode="explain"]   .tmr-highlights-item-icon { color: var(--tmr-c-explain); }
 .tmr-highlights-item[data-gloss-mode="examine"]   .tmr-highlights-item-icon { color: var(--tmr-c-examine); }
 .tmr-highlights-item[data-gloss-mode="emphasise"] .tmr-highlights-item-icon { color: var(--tmr-c-emphasise); }
 .tmr-highlights-item[data-gloss-mode="enquiry"]   .tmr-highlights-item-icon { color: var(--tmr-c-enquiry); }
+.tmr-highlights-item[data-gloss-mode="bookmark"]  .tmr-highlights-item-icon { color: var(--tmr-c-bookmark); }
 
 .tmr-highlights-item-body {
 	flex: 1;
@@ -3025,6 +3244,49 @@ body.is-mobile .tmr-highlights-panel {
 .tmr-highlights-item-delete .svg-icon {
 	width: 13px;
 	height: 13px;
+}
+
+/* Touch has no hover, so a hover-revealed control is simply unreachable: the
+   only way to see it was iOS's sticky hover after a tap, which is how it
+   surfaced as "the delete button is a weird shape" — the first sight of it was
+   also the first time its background painted. Show it at the same 0.65 the
+   desktop row-hover gives, and drop the hover treatment, which on touch fires
+   after the fact rather than in anticipation.
+
+   The box is pinned rather than inherited. Obsidian's bare `button` carries a
+   height and side padding; the base rule above overrides both on specificity,
+   but that margin is one theme rule wide, and the symptom is a control that
+   stops looking like the square it is everywhere else. Belt and braces: the
+   min-* pair closes the door `min-height` beats `height` opens, and box-sizing
+   keeps any padding that does land on the inside. */
+body.is-mobile .tmr-highlights-item-delete {
+	box-sizing: border-box;
+	width: 22px;
+	height: 22px;
+	min-width: 0;
+	min-height: 0;
+	padding: 0;
+	opacity: 0.65;
+}
+
+body.is-mobile .tmr-highlights-item-delete:hover {
+	background: transparent;
+	color: var(--muted-foreground);
+}
+
+/* 44px of reach on the 22px tile, tablet included — the phone block's touch
+   target list covers only `max-width: 550px`, and this control is as small on
+   an iPad as it is on a phone. Same geometry as the entries there. */
+body.is-mobile .tmr-highlights-item-delete::after {
+	content: "";
+	position: absolute;
+	top: 50%;
+	left: 50%;
+	transform: translate(-50%, -50%);
+	min-width: 44px;
+	min-height: 44px;
+	width: 100%;
+	height: 100%;
 }
 
 .tmr-highlights-backdrop {
@@ -3687,6 +3949,11 @@ body.is-mobile .tmr-highlights-panel {
 	border: none !important;
 	box-shadow: none !important;
 	outline: none;
+	/* `overflow-y: auto` below makes this a scroll container, which clips to the
+	   rounded border box — and with `padding: 0` the text sits flush in the
+	   corners, so Obsidian's mobile `--input-radius` bit the first character off
+	   the top and bottom lines. Nothing here is painted, so no radius is wanted. */
+	border-radius: 0 !important;
 	font-family: var(--font-secondary);
 	font-size: 0.8rem;
 	font-style: italic;
@@ -4051,6 +4318,15 @@ body.is-mobile .tmr-highlights-panel {
 .tmr-settings-import-ok { color: var(--color-green); }
 .tmr-settings-import-err { color: var(--color-red); }
 
+/* Live value beside the reader text-size slider. Fixed width so the slider
+   doesn't shift as the number goes 9 → 10 while dragging. */
+.tmr-setting-slider-value {
+	min-width: 2.5ch;
+	text-align: right;
+	color: var(--text-muted);
+	font-variant-numeric: tabular-nums;
+}
+
 
 /* ── Library View ─────────────────────────────────────────────────────────────
    The plugin's home surface (LibraryView, VIEW_TYPE "tmr-library"). Inherits the
@@ -4071,6 +4347,22 @@ body.is-mobile .tmr-highlights-panel {
 .tmr-lib-header {
 	flex: 0 0 auto;
 	padding: 48px 64px 24px;
+}
+
+/* Tablet: the 48px top is a desktop proportion, sized for a window whose only
+   chrome above it is the tab strip. An iPad stacks the status bar and the tab
+   strip above that same 48px, so the title sat ~113px down a 1133px screen.
+   Halved rather than taken to the phone's 8px — iPad has the height to keep
+   the header feeling composed, it just doesn't have room for a desktop margin
+   under two bands of system chrome.
+   `body.is-mobile` + min-width, not `.is-tablet`: the phone rules live in a
+   `max-width: 550px` block, so this covers exactly the touch devices above it
+   (including an iPad in Split View once it's wider than a phone) and leaves
+   desktop windows at any width alone. */
+@media (min-width: 551px) {
+	body.is-mobile .tmr-lib-header {
+		padding-top: 24px;
+	}
 }
 
 .tmr-lib-eyebrow {
@@ -4277,11 +4569,25 @@ body.is-mobile .tmr-highlights-panel {
 	justify-content: space-between;
 }
 
+.tmr-lib-card-stats-left {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+}
+
 .tmr-lib-card-pct,
+.tmr-lib-card-format,
 .tmr-lib-card-marks {
 	font-family: var(--font-mono);
 	font-size: 10px;
 	color: var(--muted-foreground);
+}
+
+/* Format label — only PDFs carry one, so it sits a shade back from the
+   percentage it follows rather than competing with it. */
+.tmr-lib-card-format {
+	letter-spacing: 0.06em;
+	opacity: 0.65;
 }
 
 .tmr-lib-card-marks {
@@ -4384,6 +4690,11 @@ body.is-mobile .tmr-highlights-panel {
 	display: inline-flex;
 	align-items: center;
 	justify-content: center;
+	/* Flex items shrink by default, and `min-width: auto` only floors them at
+	   their content — an 18px icon — so an expanding search field squeezed the
+	   whole cluster to ~20px wide. The row's overage belongs to the tab group,
+	   which scrolls. */
+	flex: 0 0 auto;
 	width: 33px;
 	height: 33px;
 	padding: 0 !important;
@@ -4396,9 +4707,16 @@ body.is-mobile .tmr-highlights-panel {
 	transition: border-color 150ms ease, color 150ms ease;
 }
 
-.tmr-lib-icon-btn:hover {
-	border-color: var(--tmr-c-examine) !important;
-	color: var(--tmr-c-examine) !important;
+/* Gated, because touch latches `:hover` onto whatever was last tapped and holds
+   it until something else is. Device-reported: turning 3C mode *off* left the
+   toggle wearing the teal hover treatment, so the button looked like it hadn't
+   taken — the active class was gone, the hover underneath it wasn't. Same trap
+   the reader's chrome reveal documents; same fix. */
+@media (hover: hover) {
+	.tmr-lib-icon-btn:hover {
+		border-color: var(--tmr-c-examine) !important;
+		color: var(--tmr-c-examine) !important;
+	}
 }
 
 .tmr-lib-icon-btn svg {
@@ -4515,10 +4833,13 @@ body.is-mobile .tmr-highlights-panel {
 		border-color 150ms ease, border-radius 150ms ease, background 150ms ease;
 }
 
-.tmr-lib-search:hover:not(.tmr-lib-search-open),
-.tmr-lib-search:hover:not(.tmr-lib-search-open) .tmr-lib-search-icon {
-	color: var(--tmr-c-examine);
-	border-color: var(--tmr-c-examine) !important;
+/* Pointer-gated for the same reason as `.tmr-lib-icon-btn:hover` above. */
+@media (hover: hover) {
+	.tmr-lib-search:hover:not(.tmr-lib-search-open),
+	.tmr-lib-search:hover:not(.tmr-lib-search-open) .tmr-lib-search-icon {
+		color: var(--tmr-c-examine);
+		border-color: var(--tmr-c-examine) !important;
+	}
 }
 
 .tmr-lib-search.tmr-lib-search-open {
@@ -4638,6 +4959,72 @@ body.is-mobile .tmr-highlights-panel {
 	box-shadow: inset 2px 0 0 0 var(--primary);
 }
 
+/* ── Library on touch devices (phone AND tablet) ─────────────────────────────
+   The rest of the Library's mobile pass lives in the `max-width: 550px` block
+   further down, which is correct — those rules are tuned for a 393pt screen and
+   a tablet should stay on the desktop layout. These three are the ones that are
+   not about width at all, and were unreachable to every iPad while the whole
+   pass sat behind that query.
+
+   The principle for a tablet is desktop-first: an iPad Mini in portrait is the
+   narrowest tablet there is, and every larger one has more room, so anything
+   that only bites at 744pt is a phone rule. What follows bites everywhere. */
+
+/* Obsidian's `.is-mobile` redefines `--input-height` from 30px to
+   `--touch-size-m` (44px) and the tabs are <button>s that set no height of
+   their own, so every iPad drew a 52px tab group beside 33px icon buttons.
+   `.is-mobile` covers tablets in both orientations, so this is not a portrait
+   problem and not a width problem — and the fix is not a phone treatment
+   either: `auto` hands the tab back to its own `padding: 6px 12px`, which is
+   the desktop rule above.
+
+   No `!important`, deliberately. Obsidian's `button { height: … }` carries none,
+   so this selector already outranks it — and an important here would outrank
+   the phone block's own `height: 31px !important` too (important declarations
+   are compared by specificity, and this selector is the stronger one), silently
+   overriding a value that was measured on device. */
+body.is-mobile .tmr-lib-tab {
+	height: auto;
+	min-height: 0;
+}
+
+/* The tab group is a fixed-width segmented control in a flex row, so when the
+   search field expands to 240px the strip runs out of room and the two crowd
+   each other. Letting the group shrink and scroll gives search its space
+   without hiding anything — and unlike a width threshold it holds for any
+   number of collections, which is what actually decides whether the strip is
+   tight. (`min-width: 0` is the whole trick: flex items refuse to shrink below
+   their content because `min-width` defaults to `auto`.) */
+body.is-mobile .tmr-lib-tabs {
+	min-width: 0;
+	overflow-x: auto;
+	scrollbar-width: none;
+}
+
+body.is-mobile .tmr-lib-tabs::-webkit-scrollbar {
+	display: none;
+}
+
+/* The shelf runs to the bottom edge of the screen: the navbar and the home
+   indicator float over the list rather than standing on a hard cut, and
+   clearance lives inside the scroll container as run-off (see `.tmr-lib-body`)
+   so the last card still comes to rest above them.
+
+   This also retires the dead band under an open search, which was the same
+   inset seen in its worst light. Obsidian folds the keyboard's height into
+   `--safe-area-inset-bottom` while *also* shrinking the layout viewport for it,
+   so the root paid twice — measured on device as 335px of padding inside a
+   458px box, leaving the card list 54px. Two rules previously capped that
+   (a 34px home-indicator fallback, and a measured `keyboardCoveredPx()` class);
+   an inset of zero needs neither, so both went, along with the keyboard
+   tracking in library-view.ts that existed only to drive them.
+
+   Reader-side keyboard handling is untouched — the docked gloss input still
+   measures the keyboard through the same `gloss.ts` helpers. */
+body.is-mobile .tmr-root.tmr-library {
+	padding-bottom: 0;
+}
+
 /* ── Touch targets ──────────────────────────────────────────────────────────
    Every control the reader offers was sized for a mouse pointer: measured on a
    393pt phone, the panel toggles came out 37px, the pane tabs 31.5px, the
@@ -4668,19 +5055,18 @@ body.is-mobile .tmr-highlights-panel {
 	   a bare class selector, and these rows are all centred flex containers so
 	   a floor lands the text correctly without touching the cascade. */
 	.tmr-toc-item,
-	.tmr-pane-tab,
 	.tmr-highlights-section-header,
 	.tmr-conv-sort-btn {
 		min-height: 44px;
 	}
 
-	/* …and let the segmented control grow to hold them. Its `height: 2.25rem`
-	   (40.5px) leaves 31.5px between its 0.25rem paddings, so a 44px tab burst
-	   straight out of the track — the active pill sat proud of the container on
-	   every edge, which is the "broken tab bar". Device-reported. `auto` keeps
-	   the desktop height derived from the same tokens as before. */
+	/* The tabs are the one control here that opts out of the 44px floor. A 44px
+	   tab plus the track's 0.25rem paddings made a 52px bar — half again the
+	   desktop's 36 — for a two-target control whose targets are ~145px wide, so
+	   the floor was buying reach it already had. 39px track (31px tabs) instead:
+	   the same pair of numbers as the Library's mobile pills. */
 	.tmr-pane-tabs {
-		height: auto;
+		height: 39px;
 	}
 
 	.tmr-pane-hdr-btn,
@@ -4709,7 +5095,7 @@ body.is-mobile .tmr-highlights-panel {
 	   state where a control is visible without it. One fill, from one element —
 	   which is also what the design specifies. */
 	.tmr-root.tmr-chrome-visible .tmr-toc-toggle,
-	.tmr-root.tmr-chrome-visible .tmr-help-toggle,
+	.tmr-root.tmr-chrome-visible .tmr-bookmark-toggle,
 	.tmr-root.tmr-chrome-visible .tmr-highlights-toggle,
 	.tmr-root.tmr-chrome-visible .tmr-page-nav,
 	.tmr-root.tmr-chrome-visible .tmr-search-bar:not(.tmr-search-bar-open) {
@@ -4722,12 +5108,13 @@ body.is-mobile .tmr-highlights-panel {
 	   and `pointer-events` is inherited from the control, so the enlarged area
 	   is live without any JS. Purely additive: none of these elements uses
 	   ::after for anything else. */
-	.tmr-highlights-item-delete::after,
+	/* (`.tmr-highlights-item-delete` gets the same lid from a `body.is-mobile`
+	   rule instead — it needs it on tablet too.) */
 	.tmr-conv-send::after,
 	.tmr-conv-settings-btn::after,
 	.tmr-conv-back::after,
 	.tmr-toc-toggle::after,
-	.tmr-help-toggle::after,
+	.tmr-bookmark-toggle::after,
 	.tmr-highlights-toggle::after,
 	.tmr-page-nav::after,
 	/* Collapsed only. Expanded, the bar is 289px of input and this pseudo-element
@@ -4758,22 +5145,31 @@ body.is-mobile .tmr-highlights-panel {
 		position: relative;
 	}
 
-	/* ── Library ────────────────────────────────────────────────────────────
+	/* ── Library (Mobile/Library `k2pip`) ───────────────────────────────────
 	   The Library lays itself out on a hardcoded 64px horizontal inset, which
 	   is a fine desktop proportion and a third of a 393pt phone. It left a
 	   265px content column: book titles wrapped to four lines, cards ran 237px
-	   tall, and 27 of them made the shelf unreadable. Same gutter as the
-	   reader gives 348px back. */
+	   tall, and 27 of them made the shelf unreadable.
+
+	   The design uses three different insets on purpose, so they're kept apart
+	   rather than averaged into one gutter: the control row runs widest at 7px
+	   (it needs the width for four buttons and a scrolling tab group), the
+	   header text sits at 13px, and the divider and cards at 21px. */
 	.tmr-lib-header {
-		padding: 24px 1.25rem 16px;
+		padding: 8px 13px 15px;
 	}
 
+	/* 22px is the design's gap between the divider and the first card, and it is
+	   all this needs now that the strip's own padding carries the 17px above the
+	   line and the body starts at it.
+
+	   The bottom is run-off rather than spacing: the list bleeds under the
+	   navbar (see `body.is-mobile .tmr-root.tmr-library`), so it carries the
+	   navbar's own height and the home indicator on top of the 32px, leaving the
+	   last card clear of both at rest. Phone-only because the tablet has no
+	   navbar to clear — its 48px base already outruns the indicator. */
 	.tmr-lib-body {
-		padding: 20px 1.25rem 32px;
-	}
-
-	.tmr-lib-strip {
-		margin: 0 1.25rem;
+		padding: 22px 21px calc(32px + var(--mobile-toolbar-height, 52px) + var(--safe-area-inset-bottom, 0px));
 	}
 
 	.tmr-lib-title {
@@ -4785,7 +5181,7 @@ body.is-mobile .tmr-highlights-panel {
 	   short title — `justify-content: space-between` pushes the progress row
 	   to the bottom of a card that has nothing to fill the middle with. */
 	.tmr-lib-card {
-		padding: 16px;
+		padding: 18px;
 		min-height: 0;
 	}
 
@@ -4797,19 +5193,71 @@ body.is-mobile .tmr-highlights-panel {
 	   width and scroll within itself instead; the sliding indicator is
 	   positioned against the group, so it rides along. The spacer that pushed
 	   the icon buttons right has nothing left to push with. */
+	/* Pills sit flush inside the group here — the desktop's 4px gap costs width
+	   the phone hasn't got, and the sliding indicator already separates active
+	   from inactive on its own. */
 	.tmr-lib-tabs {
 		flex: 1 1 auto;
 		min-width: 0;
 		overflow-x: auto;
 		scrollbar-width: none;
+		gap: 0;
 	}
 
 	.tmr-lib-tabs::-webkit-scrollbar {
 		display: none;
 	}
 
+	/* Obsidian's bare `button` rule sets `height: var(--input-height)`, and
+	   `.is-mobile` redefines that token as `--touch-size-m` (44px) where the
+	   desktop leaves it at 30. The pills never set a height of their own, so on a
+	   phone they quietly took 44 and the group came out at 52 against a design
+	   that puts it at 39 — while the icon buttons, which do set one, stayed put.
+	   That is the misalignment the device pass reported: the buttons were never
+	   small, the tabs were inflated by a token that only moves on mobile.
+
+	   Pinned to the design's 31 rather than re-derived from the token, and
+	   `min-height` neutralised alongside it — min-height beats height whatever
+	   the importance, so pinning one without the other leaves the door open. The
+	   12px side padding is unchanged, so the sliding indicator's measured
+	   positions don't move. */
 	.tmr-lib-tab {
 		flex: 0 0 auto;
+		display: flex;
+		align-items: center;
+		height: 31px !important;
+		min-height: 0 !important;
+		padding: 0 12px !important;
+	}
+
+	/* The strip runs wider than everything else (7px vs the header's 13 and the
+	   cards' 21) because it has the most to fit. Its divider does not: the design
+	   lines that up with the cards, so it comes off the strip's own border and
+	   onto a pseudo-element that can be inset independently. 14px inside a 7px
+	   margin lands it at 21.
+
+	   The 17px below the controls is the strip's own padding rather than an
+	   offset on the pseudo-element, so the strip's box genuinely ends at the
+	   divider. That makes the divider the scroll cutoff: the body starts there,
+	   and cards clip against the line instead of sliding up past it into the gap
+	   and hiding it. Device-reported — the real cutoff was sitting right under
+	   the buttons and the line never appeared once the list had moved. */
+	.tmr-lib-strip {
+		position: relative;
+		margin: 0 7px;
+		gap: 6px;
+		padding-bottom: 17px;
+		border-bottom: none;
+	}
+
+	.tmr-lib-strip::after {
+		content: "";
+		position: absolute;
+		left: 14px;
+		right: 14px;
+		bottom: 0;
+		height: 1px;
+		background: var(--border);
 	}
 
 	.tmr-lib-strip-spacer {
@@ -4842,20 +5290,48 @@ body.is-mobile .tmr-highlights-panel {
 		position: relative;
 	}
 
-	/* 44px hit areas only work if the controls are far enough apart to own
-	   them. The strip's four icon buttons were ~20px wide with 6px gaps, so
-	   each one's reach ran straight over its neighbour's and whichever came
-	   last in the DOM won the tap. 36px boxes with 8px gaps puts the centres
-	   exactly 44px apart, so the hit areas tile edge to edge instead of
-	   fighting — every control ends up with a full, exclusive 44px. */
-	.tmr-lib-strip {
-		gap: 8px;
+	/* Icon Button/Large/Tertiary — the phone takes the Large variant of the same
+	   component the desktop uses small, which is the change the redesign is
+	   mostly about. 39px box, `--radius-s`, 19px icon.
+	   Centres end up 45px apart (39 + the strip's 6px gap), so the 44px hit lids
+	   above still tile edge to edge rather than overlapping and stealing each
+	   other's taps. */
+	/* Height on both search states, not just the collapsed one: the field is a
+	   div rather than a button, so it never took `--input-height`, but it did
+	   keep the desktop base rule's 33px and sat a row short of its neighbours
+	   once they grew to 39. */
+	.tmr-lib-icon-btn,
+	.tmr-lib-search {
+		height: 39px !important;
+		min-height: 0 !important;
 	}
 
 	.tmr-lib-icon-btn,
 	.tmr-lib-search:not(.tmr-lib-search-open) {
-		min-width: 36px;
+		width: 39px !important;
+		min-width: 39px !important;
+		border-radius: var(--radius-s) !important;
 		justify-content: center;
+	}
+
+	.tmr-lib-icon-btn svg,
+	.tmr-lib-search-icon svg {
+		width: 19px !important;
+		height: 19px !important;
+	}
+
+	/* The field's × (`PXLbC` `TsGc5`): 15px, muted. `color: inherit` on the
+	   glyph because Obsidian's `.svg-icon` paints itself in `--icon-color`,
+	   brighter than the muted grey the button sets. The box is sized by the
+	   touch-target rule at the end of this block, not here. */
+	.tmr-lib-search-open .tmr-lib-search-clear {
+		color: var(--muted-foreground) !important;
+	}
+
+	.tmr-lib-search-clear svg {
+		width: 15px !important;
+		height: 15px !important;
+		color: inherit !important;
 	}
 
 	/* The search bar clips its children so the input can't spill during the
@@ -4869,35 +5345,68 @@ body.is-mobile .tmr-highlights-panel {
 		overflow: visible;
 	}
 
+	/* Search state (Mobile/Library/Search `o4WYk`). The tabs and Add-Folder give
+	   way; 3C and Settings stay, which is how the desktop behaves too. Four
+	   buttons plus a field plus a scrolling tab group want ~380px of a 379px row
+	   — the strip overflowed and shoved the whole view sideways, the same failure
+	   the tabs scroller fixed above arriving from the other direction. Dropping
+	   the two that have nothing to say mid-search leaves the field 289px, which
+	   is what the design specifies.
+
+	   Percentage width rather than `flex: 1` so the 240ms open still animates out
+	   of the collapsed 39px — neither `auto` nor a flex-basis interpolates. The
+	   two surviving buttons are 39 + 39 + two 6px gaps = 90px of the row. */
+	.tmr-root.tmr-lib-searching .tmr-lib-tabs,
+	.tmr-root.tmr-lib-searching .tmr-lib-add-btn {
+		display: none;
+	}
+
+	/* Anchored right, so the width animation reads as the field expanding
+	   leftward out of the search button rather than sliding across the row. The
+	   tabs group normally absorbs the row's slack; with it gone, nothing held the
+	   field against the right edge and its left edge stayed pinned while the
+	   right one travelled — growth in the wrong direction. `margin-left: auto`
+	   restores the anchor without a second layout mode. */
+	.tmr-root.tmr-lib-searching .tmr-lib-search {
+		margin-left: auto;
+	}
+
+	.tmr-root.tmr-lib-searching .tmr-lib-search.tmr-lib-search-open {
+		width: calc(100% - 90px);
+		padding: 0 15px;
+	}
+
 	/* The page-turn chevrons are gone on a phone (Mobile/UIActive): tap zones
 	   *replace* them rather than supplementing them, and two buttons parked over
 	   the text to duplicate a gesture people already have is the visual clutter
 	   the mobile design set out to remove.
 
-	   ⚠ They stay in the DOM at opacity 0 rather than `display: none`, and that
-	   is load-bearing: `tapZoneEdges()` derives the left/right strips from these
-	   two elements' bounding rects, so the zones track --tmr-chrome-btn through
-	   this breakpoint instead of restating it in TypeScript. Collapse the box and
-	   page turns stop working, silently and only on phones. `pointer-events` off
-	   so an invisible button can never take a tap the zone should own. */
+	   Hidden by opacity rather than `display: none` so the row keeps its geometry
+	   for the surrounding layout; nothing reads their rects any more, since the
+	   tap zones are now a flat third of the reader's width (`tapZoneEdges`).
+	   `pointer-events` off so an invisible button can never take a tap the zone
+	   should own. */
 	.tmr-root .tmr-page-nav,
 	.tmr-root.tmr-chrome-visible .tmr-page-nav {
 		opacity: 0;
 		pointer-events: none;
 	}
 
-	/* Expanded book search spans from the Help button's left edge to the search
-	   button's own right edge (Mobile/BookSearch). Derived rather than measured,
-	   so it holds at any phone width: the bar's `right` already puts its right
-	   edge one button + 0.5rem in from the edge, and the Help toggle's `left` is
-	   one button + 0.375rem in from the other, so subtracting both offsets from
-	   the containing block lands the left edge exactly on Help.
+	/* Expanded book search spans from the search button's own left edge to the
+	   Highlights toggle (Mobile/BookSearch). Derived rather than measured, so it
+	   holds at any phone width: the bar's `left` puts its left edge one button +
+	   0.375rem in from one side, and Highlights sits one button + inset in from
+	   the other, so subtracting both offsets from the containing block lands the
+	   right edge exactly on Highlights.
+
+	   The expression is symmetric, so mirroring the corners left it untouched —
+	   only which button each end lands on changed.
 
 	   The old `21.25rem` capped by `100% - 4rem` was a generic cap with no
 	   relationship to the buttons — on a 393pt phone it resolved to 321px and
-	   overhung Help by 35px, which is the left-heavy look. The results card
-	   shares the value: the pair is meant to read as one assembly, so a width
-	   they don't agree on is worse than either width alone. */
+	   overhung by 35px. The results card shares the value: the pair is meant to
+	   read as one assembly, so a width they don't agree on is worse than either
+	   width alone. */
 	.tmr-root {
 		--tmr-search-open-w: calc(
 			100% - 2 * var(--tmr-chrome-inset) - 2 * var(--tmr-chrome-btn) - 0.75rem
@@ -4931,7 +5440,7 @@ body.is-mobile .tmr-highlights-panel {
 	   controls that sit *above* the scrim and would otherwise float over it. */
 	.tmr-root.tmr-search-open .tmr-toolbar,
 	.tmr-root.tmr-search-open .tmr-toc-toggle,
-	.tmr-root.tmr-search-open .tmr-help-toggle,
+	.tmr-root.tmr-search-open .tmr-bookmark-toggle,
 	.tmr-root.tmr-search-open .tmr-highlights-toggle {
 		opacity: 0 !important;
 		pointer-events: none;
@@ -4939,15 +5448,15 @@ body.is-mobile .tmr-highlights-panel {
 
 	/* Both inner gaps are one token in the design (`--radius-miniscule`), and
 	   they need to be: the toolbar plate makes the two pairs read as one row,
-	   where the desktop sheet's 0.375rem on the left and 0.5rem on the right
-	   showed up as a 2.25px lean. The open-search width above is derived from
-	   this value — change one and the bar stops landing on the Help button. */
+	   where a wider gap on one side than the other showed up as a 2.25px lean.
+	   The open-search width above is derived from this value — change one and
+	   the bar stops landing on the Highlights toggle. */
 	.tmr-search-bar {
-		right: calc(var(--tmr-chrome-inset) + var(--tmr-chrome-btn) + 0.375rem);
+		left: calc(var(--tmr-chrome-inset) + var(--tmr-chrome-btn) + 0.375rem);
 	}
 
 	.tmr-book-search {
-		right: calc(var(--tmr-chrome-inset) + var(--tmr-chrome-btn) + 0.375rem);
+		left: calc(var(--tmr-chrome-inset) + var(--tmr-chrome-btn) + 0.375rem);
 	}
 
 	/* ── Toolbar (Toolbar component, Mobile/UIActive) ────────────────────────
@@ -5039,7 +5548,7 @@ body.is-mobile .tmr-highlights-panel {
 	   hidden-state family threaded through two files. */
 	.tmr-root.tmr-pane-open .tmr-toolbar,
 	.tmr-root.tmr-pane-open .tmr-toc-toggle,
-	.tmr-root.tmr-pane-open .tmr-help-toggle,
+	.tmr-root.tmr-pane-open .tmr-bookmark-toggle,
 	.tmr-root.tmr-pane-open .tmr-highlights-toggle,
 	.tmr-root.tmr-pane-open .tmr-search-bar,
 	/* The bar and its caption outrank the pane on z-index (they have to clear
@@ -5061,11 +5570,44 @@ body.is-mobile .tmr-highlights-panel {
 	   it — iPad, which has no navbar — none of this applies and the footer
 	   keeps its in-flow layout. */
 
-	/* How long the bar waits for Obsidian's navbar to slide in before expanding
-	   behind it. One token because three elements have to move together: the
-	   bar, its dim, and the caption. */
+	/* The numbers that shape the bar's reveal, as tokens because three elements
+	   have to move together — the bar, its dim, and the caption — and because
+	   this is tuned by eye on a device rather than derived.
+
+	   `delay` is how long the bar waits for Obsidian's navbar to slide in before
+	   expanding behind it, and applies on summon only. `move` is the travel.
+
+	   **Summoning and dismissing are not the same length**, because Obsidian's
+	   navbar isn't either — matching it in one direction while mismatching the
+	   other is worse than being wrong in both. Device-tuned 2026-08-05: 240ms in
+	   (was 390) felt right on summon, and the original 240ms move was better on
+	   dismiss. Treat asymmetry as the default for any chrome that answers the
+	   navbar; symmetry is the special case that has to earn itself.
+
+	   One token, redefined under `.tmr-chrome-visible`, rather than a second
+	   transition list. A transition reads its duration from the style being
+	   transitioned *to*, so summoning picks up the value under the class and
+	   dismissing picks up the one above it — the asymmetry falls out of the
+	   cascade instead of being restated per element.
+
+	   `renderMobilePages` in main.ts sequences the caption's *text* swap against
+	   these, so the caption finishes travelling before its wording changes.
+	   Change these and change `MOBILE_CAPTION_*_MS` with them. */
 	.tmr-root.tmr-navbar-tracked {
-		--tmr-chrome-delay: 150ms;
+		--tmr-chrome-delay: 100ms;
+		--tmr-chrome-move: 240ms;
+		/* The caption's cross-fade, and asymmetric for the same reason the travel
+		   is. This is the fade *in* — the slow half. Leaving is housekeeping and
+		   wants to be quick; arriving is the moment you actually watch, and at
+		   the fade-out's speed the new wording snapped into place at its
+		   destination (device-reported). The fade-out value lives on
+		   `.tmr-caption-swapping`, and has to stay under `--tmr-chrome-move` so
+		   it finishes inside the travel and the swap lands unseen. */
+		--tmr-caption-fade: 250ms;
+	}
+
+	.tmr-root.tmr-navbar-tracked.tmr-chrome-visible {
+		--tmr-chrome-move: 140ms;
 	}
 
 	/* Whole-book position is explicitly demoted in the mobile design, and a
@@ -5091,8 +5633,9 @@ body.is-mobile .tmr-highlights-panel {
 		width: calc(var(--tmr-nav-w) - var(--tmr-nav-h));
 		top: calc(var(--tmr-nav-t) + var(--tmr-nav-h) - 6px);
 		height: 6px;
-		transition: left 240ms ease, width 240ms ease, top 240ms ease,
-			height 240ms ease, opacity 200ms ease;
+		transition: left var(--tmr-chrome-move) ease, width var(--tmr-chrome-move) ease,
+			top var(--tmr-chrome-move) ease, height var(--tmr-chrome-move) ease,
+			opacity 200ms ease;
 	}
 
 	/* Chrome up: grow into the navbar's full rect. Obsidian paints the navbar
@@ -5124,7 +5667,7 @@ body.is-mobile .tmr-highlights-panel {
 		background: var(--secondary);
 		border-radius: var(--radius-pill);
 		overflow: hidden;
-		transition: opacity 240ms ease;
+		transition: opacity var(--tmr-chrome-move) ease;
 	}
 
 	/* Expanded, the bar is behind Obsidian's navbar and the navbar's icons have
@@ -5160,7 +5703,15 @@ body.is-mobile .tmr-highlights-panel {
 	   is up (Mobile/Default y=788 vs Mobile/UIActive y=824, both measured from
 	   the navbar's own top). */
 	.tmr-root.tmr-navbar-tracked .tmr-mobile-pages {
-		display: block;
+		/* Flex rather than a text line: with a glyph alongside, `text-align`
+		   would align the two on their baselines and the number sat low against
+		   the icon (device-reported). `align-items: center` is what the design's
+		   equal-height boxes actually mean. Centring survives the icon's absence
+		   — one child in a `justify-content: center` row is still centred. */
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 0.375rem;
 		position: absolute;
 		left: 0;
 		right: 0;
@@ -5172,7 +5723,55 @@ body.is-mobile .tmr-highlights-panel {
 		line-height: 1.2;
 		color: var(--muted-foreground);
 		pointer-events: none;
-		transition: top 240ms ease, opacity 200ms ease;
+		transition: top var(--tmr-chrome-move) ease, opacity var(--tmr-caption-fade) ease;
+	}
+
+	/* Bookmarked resting page (Mobile/Default/BookmarkActive): the caption takes
+	   the bookmark colour and gains a glyph to the left of the number. It is the
+	   only place the state is visible with the chrome down, since the toolbar
+	   button that normally carries it is off screen.
+
+	   The caption's flex row re-centres the pair as it widens — the design moves
+	   the group from 19px to 44px wide with its midpoint unchanged, and this
+	   gets that for free rather than by restating either number. */
+	.tmr-root.tmr-navbar-tracked .tmr-mobile-pages-marked {
+		color: var(--tmr-c-bookmark);
+	}
+
+	.tmr-mobile-pages-icon {
+		display: flex;
+		align-items: center;
+	}
+
+	/* Sized in `em` so it tracks the caption rather than pinning a px value the
+	   text can drift away from. 1.25em against 13px mono lands the glyph a touch
+	   taller than the digits, which is the proportion in the frame — the
+	   artboard's 19px box is mostly padding around a smaller glyph. */
+	.tmr-mobile-pages-icon .svg-icon {
+		width: 1.25em;
+		height: 1.25em;
+		color: inherit;
+	}
+
+
+	/* The caption's two states say different things ("9" vs "11 pages left in
+	   chapter"), so the swap is a cut no matter when it happens. It used to be
+	   written the instant the chrome class flipped, and the bar's travel
+	   immediately afterwards covered for it. Now that the wording waits for the
+	   caption to land, the same cut happens in stillness with nothing to hide
+	   behind — so it gets a cross-fade of its own.
+
+	   Held on for the length of the travel: the caption fades out where it was,
+	   moves while invisible, and fades back in at its destination already
+	   saying the other thing. `renderMobilePages` owns the class.
+
+	   Redefining the token here rather than writing a second transition is the
+	   same mechanism the travel uses: a transition takes its duration from the
+	   style it moves *to*, so adding the class fades out at this value and
+	   removing it fades in at the one above. */
+	.tmr-mobile-pages.tmr-caption-swapping {
+		--tmr-caption-fade: 120ms;
+		opacity: 0;
 	}
 
 	.tmr-root.tmr-navbar-tracked.tmr-chrome-visible .tmr-mobile-pages {
@@ -5228,6 +5827,13 @@ body.is-mobile .tmr-highlights-panel {
 		width: 2rem;
 		height: 100% !important;
 		border-radius: 0 !important;
+	}
+
+	/* That 2rem box centres its 15px glyph, so the × sat 8.5px further in than
+	   the design's 15px padding. Push the glyph to the box's right edge; the
+	   spare reach falls leftward into the input, where nothing else is. */
+	.tmr-lib-search-open .tmr-lib-search-clear {
+		justify-content: flex-end;
 	}
 }
 

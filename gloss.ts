@@ -1,17 +1,13 @@
 /** Shared Gloss grammar — everything the annotation layer needs that is not
- *  specific to one reading surface.
- *
- *  Extracted from `main.ts` for PDF Gloss Phase A (see
- *  `Feature Docs/PDF Gloss - Feature Spec.md`): the EPUB `ReaderView` and the
- *  PDF `PdfGlossController` both drive the *same* GlossBar / input / tooltip
- *  floaters and write the *same* companion-doc callouts. Nothing here knows
- *  about epubs, pretext offsets, or pdf.js — hosts supply the anchor.
+ *  specific to one reading surface. The EPUB `ReaderView` and the PDF
+ *  `PdfGlossController` drive the same floaters and write the same
+ *  companion-doc callouts. Nothing here knows about epubs, pretext offsets, or
+ *  pdf.js — hosts supply the anchor.
  */
 
 import {
 	App,
 	Component,
-	Notice,
 	Platform,
 	TFile,
 	AbstractInputSuggest,
@@ -32,6 +28,18 @@ export const GLOSS_MODES = [
 	{ id: "examine",   label: "Examine",   icon: "search" },
 	{ id: "enquiry",   label: "Enquiry",   icon: "message-circle-more" },
 ] as const;
+
+/** Bookmark is an annotation with no text range: same callout, same anchor,
+ *  same Annotations list, but no character offsets and so nothing painted in
+ *  the text. Deliberately *not* in GLOSS_MODES — that array builds the
+ *  GlossBar's tiles, and a bookmark fires from the reader chrome with no
+ *  selection, so a sixth tile would appear over every selection.
+ *  See Feature Docs/Bookmarks - Feature Spec.md. */
+export const BOOKMARK_MODE = { id: "bookmark", label: "Bookmark", icon: "bookmark" } as const;
+
+/** Every mode that can appear in the Annotations list, for anything resolving a
+ *  saved highlight's icon or label. GLOSS_MODES stays the tile list. */
+export const ANNOTATION_MODES = [...GLOSS_MODES, BOOKMARK_MODE];
 
 /** Placeholder copy per gloss mode; exact phrasing from Feature Spec §Phase 2. */
 export const GLOSS_PLACEHOLDERS: Record<string, string> = {
@@ -151,7 +159,9 @@ export const SOURCE_LINK_RE = /^—\s*(?:\[\[[^\]]*\]\]|\[[^\]]*\]\([^)]*\))\s*$
  *  `start:s,g end:s,g` format, and the PDF `pdfPage:N pdfSel:a,b,c,d` format. */
 export function parseSavedHighlights(md: string): SavedHighlight[] {
 	const result: SavedHighlight[] = [];
-	const modeRe = /^>\s*\[!(exclaim|explain|examine|emphasise|enquiry)\]/;
+	// `bookmark` carries no `chars:` field, which is what marks its anchor as
+	// rangeless; everything downstream already tolerates the absent offsets.
+	const modeRe = /^>\s*\[!(exclaim|explain|examine|emphasise|enquiry|bookmark)\]/;
 	const anchorRe = /<!--\s*tmr-anchor\s+([^>]*?)-->/;
 	const fieldRe =
 		/(spine|para|chars|prefix|endPara|endChars|pdfPage|pdfSel):(?:"((?:[^"\\]|\\.)*)"|(\S+))/g;
@@ -205,15 +215,8 @@ export function parseSavedHighlights(md: string): SavedHighlight[] {
 
 		const prefix = fields.prefix ? decodeURIComponent(fields.prefix) : "";
 
-		// Walk forward through the callout body (all subsequent `>`-prefixed
-		// lines) and split into:
-		//   - source quote   (`> > ...` lines)
-		//   - turns          (`> User: ...` / `> AI: ...` line-prefix scheme)
-		//   - legacyUserText (bare `> <text>` lines without a turn prefix —
-		//                     Phase 2 callouts, before multi-turn was a thing)
-		// HTML comments are scanned for AI state markers. Continuation lines
-		// for a turn (lines following `User:` / `AI:` that don't start with
-		// either prefix and aren't a comment) are appended to that turn.
+		// Bare `> <text>` lines with no turn prefix are Phase 2 callouts, from
+		// before multi-turn — they collect into legacyUserText, not a turn.
 		const quoteLines: string[] = [];
 		const legacyUserLines: string[] = [];
 		const turns: ConversationTurn[] = [];
@@ -227,7 +230,6 @@ export function parseSavedHighlights(md: string): SavedHighlight[] {
 		while (j < lines.length) {
 			const bodyLine = lines[j];
 			if (!/^>/.test(bodyLine)) break;
-			// Bail if we hit the next callout's header line
 			if (modeRe.test(bodyLine)) break;
 
 			const stripped = bodyLine.replace(/^>\s?/, "");
@@ -260,7 +262,6 @@ export function parseSavedHighlights(md: string): SavedHighlight[] {
 					};
 					turns.push(currentTurn);
 				} else if (currentTurn) {
-					// Continuation of the previous turn (multi-line user/AI text).
 					currentTurn.content += "\n" + stripped;
 				} else {
 					// Phase 2 legacy: bare user text with no `User:` prefix.
@@ -276,9 +277,8 @@ export function parseSavedHighlights(md: string): SavedHighlight[] {
 		// stay idempotent.
 		for (const t of turns) t.content = t.content.replace(/\n+$/, "");
 
-		// Prefer the first explicit user turn for `userText` (the field that
-		// powers hover previews and the conversations-card title); fall back
-		// to the legacy bucket for Phase 2 callouts.
+		// Prefer the first explicit user turn; the legacy bucket is the
+		// fallback for Phase 2 callouts.
 		const firstUserTurn = turns.find((t) => t.role === "user");
 		const userText = firstUserTurn?.content.trim() ?? legacyUserLines.join("\n").trim();
 
@@ -380,11 +380,10 @@ export const AI_PENDING_KEY = "ai-pending";
 // ─── Callout editing ─────────────────────────────────────────────────────────
 //
 // Pure string surgery over a companion doc: locate one callout by its anchor
-// comment and rewrite its body from a SavedHighlight. Lives here rather than in
-// the Highlights pane because the deferred-queue processor (Mobile spec, Tier 1)
-// has to resolve exchanges in docs whose book is not open, so it has no pane —
-// and two implementations of "find the callout" would be two ways to silently
-// rewrite the wrong one.
+// comment and rewrite its body from a SavedHighlight. Belongs here, not in the
+// Highlights pane: the deferred-queue processor resolves exchanges in docs whose
+// book is not open, and two implementations of "find the callout" would be two
+// ways to silently rewrite the wrong one.
 
 /** The anchor-comment substrings that identify one saved highlight uniquely.
  *  Two shapes, because the two sources anchor differently: an EPUB entry is
@@ -429,12 +428,9 @@ export function findCalloutBounds(
 	}
 	if (anchorIdx === -1) return null;
 
-	// Header is the nearest `> [!mode]` line at or above the anchor.
 	let startIdx = anchorIdx;
 	while (startIdx > 0 && !/^>\s*\[!/.test(lines[startIdx])) startIdx--;
 
-	// End of the callout: first line not starting with `>` (or the next
-	// callout header).
 	let endIdx = anchorIdx + 1;
 	while (endIdx < lines.length) {
 		if (!/^>/.test(lines[endIdx])) break;
@@ -679,19 +675,16 @@ export class AnnotationPreview extends Component {
 	}
 }
 
-/** Bounds a body-appended floater may occupy, in client coordinates.
- *
- *  Every tooltip, preview and popover in the plugin clamps itself to
- *  `window.innerWidth/innerHeight`. On a phone that viewport runs *underneath*
- *  the status bar and Obsidian's floating navbar, so a preview clamped to it
- *  lands half-hidden behind the navbar and a flipped-up tooltip can sit under
- *  the notch. This is the same viewport with those regions taken off.
+/** Bounds a body-appended floater may occupy, in client coordinates — the
+ *  window viewport with the status bar and Obsidian's floating navbar taken
+ *  off. On a phone `innerWidth/innerHeight` runs *underneath* both, so anything
+ *  clamped to it lands behind the navbar or under the notch.
  *
  *  The navbar is measured rather than derived from `--mobile-toolbar-height`:
  *  it floats above the bottom safe-area inset rather than inside it, so its
  *  real top edge is the only figure that doesn't need two tokens added up
- *  correctly. On desktop there's no navbar and every inset resolves to 0, so
- *  this collapses to the plain viewport and callers behave exactly as before. */
+ *  correctly. On desktop every inset resolves to 0 and this collapses to the
+ *  plain viewport. */
 export function getSafeViewport(): { top: number; left: number; right: number; bottom: number } {
 	const bodyStyle = getComputedStyle(document.body);
 	const inset = (name: string): number => {
@@ -709,23 +702,21 @@ export function getSafeViewport(): { top: number; left: number; right: number; b
 }
 
 /** The band Obsidian's floating navbar pill occupies, or null where there isn't
- *  one — desktop, and tablets, where Obsidian sets `.mobile-navbar { display:
- *  none }` and the rect measures 0×0. Phase C docks the GlossBar here (see
- *  Mobile/GlossBarActive): iOS puts its own selection menu wherever it finds
- *  room, so anything anchored to the selection is competing for those pixels.
+ *  one — desktop, and tablets, where `.mobile-navbar { display: none }` makes
+ *  the rect 0×0. The GlossBar docks here because iOS puts its own selection menu
+ *  wherever it finds room, so anything anchored to the selection competes for
+ *  those pixels.
  *
- *  Vertical geometry comes from `offsetTop`/`offsetHeight`, NOT from the client
- *  rect: the auto-hide moves the navbar with `transform: translateY(...)` rather
- *  than removing it, so the rect's top is wrong exactly when the user is reading
- *  — which is when the slot is wanted. Offsets are layout values and a transform
- *  never touches them. Left and width still come from the rect, which keeps
- *  subpixel precision and only a *vertical* transform is in play.
+ *  Vertical geometry comes from `offsetTop`/`offsetHeight`, NOT the client rect:
+ *  auto-hide moves the navbar with `transform: translateY(...)` rather than
+ *  removing it, so the rect's top is wrong exactly when the slot is wanted.
+ *  Offsets are layout values a transform never touches. Left and width still
+ *  come from the rect — only a *vertical* transform is in play.
  *
- *  Don't be tempted to derive the top from `innerHeight` and the height instead:
- *  the pill's clearance above the home indicator is a bottom *margin* under
- *  `is-floating-nav` and bottom *padding* otherwise, so that arithmetic is right
- *  in one configuration and 32px out in the other. Padding is still subtracted
- *  from the height, since when it is used it sits inside the box. */
+ *  Don't derive the top from `innerHeight` minus the height instead: the pill's
+ *  clearance above the home indicator is a bottom *margin* under
+ *  `is-floating-nav` and bottom *padding* otherwise, so that arithmetic is 32px
+ *  out in one of the two configurations. */
 export function getNavbarSlot(): { left: number; top: number; width: number; height: number } | null {
 	if (!Platform.isMobile) return null;
 	const navbar = document.body.querySelector<HTMLElement>(".mobile-navbar");
@@ -753,6 +744,80 @@ export function hitTestHighlightRects(root: ParentNode, clientX: number, clientY
 		}
 	}
 	return -1;
+}
+
+// ─── On-screen keyboard geometry ─────────────────────────────────────────────
+// Shared by the gloss input's docking and the Library's search fit — both need
+// the same answer to "where does the keyboard start".
+
+/** Elements that shrink when the keyboard opens, if anything does. */
+function keyboardBoxes(): HTMLElement[] {
+	const sel = ".app-container, .workspace, .mod-root, .workspace-leaf.mod-active";
+	return Array.from(document.body.querySelectorAll<HTMLElement>(sel));
+}
+
+/** Lowest screen y that is *not* under the keyboard, per the most pessimistic
+ *  box that reports one. Falls back to the full window height.
+ *
+ *  Neither the layout viewport nor `visualViewport` shrinks for the keyboard on
+ *  this platform — a fixed `bottom: 16px` sits behind the keys. Obsidian's app
+ *  container is what actually moves, so measure every box that could report the
+ *  keyboard and trust the shortest rather than betting on one. */
+export function keyboardTop(): number {
+	const full = window.innerHeight;
+	let top = full;
+	const vv = window.visualViewport;
+	if (vv) top = Math.min(top, vv.offsetTop + vv.height);
+	for (const el of keyboardBoxes()) {
+		const bottom = el.getBoundingClientRect().bottom;
+		// A floor, not a zero-guard: a collapsed container reports 0 and would
+		// win every time, and Obsidian over-shrinks some boxes past the keyboard.
+		if (bottom > full * 0.4) top = Math.min(top, bottom);
+	}
+	return top;
+}
+
+/** Screen pixels the keyboard covers, or 0 when nothing reports one. Rounding
+ *  noise in a container's rect is not a keyboard, hence the 24px floor. */
+export function keyboardCoveredPx(): number {
+	const covered = window.innerHeight - keyboardTop();
+	return covered > 24 ? covered : 0;
+}
+
+/** Call `onChange` whenever the keyboard's geometry might have changed, until
+ *  the returned disposer runs. `final` is true on the last scheduled callback,
+ *  for callers that want a give-up branch.
+ *
+ *  Three triggers, because which one fires is exactly what's in question:
+ *  `visualViewport` events if it moves at all, a ResizeObserver on the
+ *  containers, and a ladder of timers as the backstop. The ladder runs to 1.6s
+ *  because containers can still report full height at 700ms — the keyboard
+ *  reports late, not never. */
+export function trackSoftKeyboard(onChange: (final: boolean) => void): () => void {
+	const vv = window.visualViewport;
+	const listener = (): void => onChange(false);
+	if (vv) {
+		vv.addEventListener("resize", listener);
+		vv.addEventListener("scroll", listener);
+	}
+	const observer = new ResizeObserver(() => onChange(false));
+	for (const el of keyboardBoxes()) observer.observe(el);
+
+	const rungs = [80, 200, 400, 700, 1100, 1600];
+	const timers = rungs.map((ms, i) =>
+		window.setTimeout(() => onChange(i === rungs.length - 1), ms),
+	);
+
+	onChange(false);
+
+	return () => {
+		if (vv) {
+			vv.removeEventListener("resize", listener);
+			vv.removeEventListener("scroll", listener);
+		}
+		observer.disconnect();
+		for (const t of timers) window.clearTimeout(t);
+	};
 }
 
 /** True when a text field has focus, so bare-key shortcuts yield to typing. */
@@ -892,9 +957,7 @@ export class GlossSurface extends Component {
 	private tooltipEl: HTMLElement | null = null;
 	private linkSuggest: WikilinkSuggest | null = null;
 	private activeMode: string | null = null;
-	private vvListener: (() => void) | null = null;
-	private kbdObserver: ResizeObserver | null = null;
-	private kbdTimers: number[] = [];
+	private kbdDispose: (() => void) | null = null;
 
 	constructor(private opts: GlossSurfaceOptions) {
 		super();
@@ -1045,116 +1108,39 @@ export class GlossSurface extends Component {
 		this.activeMode = null;
 	}
 
-	/** Keep the docked input above the on-screen keyboard.
-	 *
-	 *  Two rounds of device testing killed one assumption each: the *layout*
-	 *  viewport does not shrink for the keyboard (so a fixed `bottom: 16px` sits
-	 *  behind the keys), and neither, on this platform, does `visualViewport`.
-	 *  What demonstrably does move is Obsidian's own app container — that is why
-	 *  the book repaginates and why the search bar clears the keyboard for free.
-	 *  So measure every box that could report it and trust the shortest, rather
-	 *  than betting the feature on one of them (`keyboardTop`).
-	 *
-	 *  Three triggers, because the keyboard slides in over ~300ms and which of
-	 *  them fires is exactly what's in question: `visualViewport` events if it
-	 *  moves at all, a ResizeObserver on the containers, and a short ladder of
-	 *  timers as the backstop. The last timer also unlocks the top-docked
-	 *  fallback — if nothing has reported a keyboard by then, the panel goes to
-	 *  the top of the screen where it is at least reachable. */
+	/** Keep the docked input above the on-screen keyboard. The measurement and
+	 *  the three-trigger tracking live in `trackSoftKeyboard`/`keyboardTop`
+	 *  above; what's specific here is the give-up branch on the last rung — if
+	 *  nothing has reported a keyboard by then, the panel goes to the top of the
+	 *  screen where it is at least reachable. */
 	private trackKeyboard(): void {
 		this.untrackKeyboard();
-		const vv = window.visualViewport;
-		if (vv) {
-			this.vvListener = () => this.layoutDockedInput();
-			vv.addEventListener("resize", this.vvListener);
-			vv.addEventListener("scroll", this.vvListener);
-		}
-		this.kbdObserver = new ResizeObserver(() => this.layoutDockedInput());
-		for (const el of this.keyboardBoxes()) this.kbdObserver.observe(el);
-		// The ladder runs to 1.6s because the device showed the containers still
-		// reporting full height at 700ms — the keyboard reports late, not never
-		// (every box read 852 in the fallback dump, then the observer corrected
-		// the panel a moment later). Only the last rung may give up.
-		const rungs = [80, 200, 400, 700, 1100, 1600];
-		for (const [i, ms] of rungs.entries()) {
-			this.kbdTimers.push(
-				window.setTimeout(() => this.layoutDockedInput(i === rungs.length - 1), ms),
-			);
-		}
-		this.layoutDockedInput();
+		this.kbdDispose = trackSoftKeyboard((final) => this.layoutDockedInput(final));
 	}
 
 	private untrackKeyboard(): void {
-		const vv = window.visualViewport;
-		if (vv && this.vvListener) {
-			vv.removeEventListener("resize", this.vvListener);
-			vv.removeEventListener("scroll", this.vvListener);
-		}
-		this.vvListener = null;
-		this.kbdObserver?.disconnect();
-		this.kbdObserver = null;
-		for (const t of this.kbdTimers) window.clearTimeout(t);
-		this.kbdTimers = [];
-	}
-
-	/** Elements that shrink when the keyboard opens, if anything does. */
-	private keyboardBoxes(): HTMLElement[] {
-		const sel = ".app-container, .workspace, .mod-root, .workspace-leaf.mod-active";
-		return Array.from(document.body.querySelectorAll<HTMLElement>(sel));
-	}
-
-	/** Lowest screen y that is *not* under the keyboard, per the most pessimistic
-	 *  box that reports one. Falls back to the full window height. */
-	private keyboardTop(): number {
-		const full = window.innerHeight;
-		let top = full;
-		const vv = window.visualViewport;
-		if (vv) top = Math.min(top, vv.offsetTop + vv.height);
-		for (const el of this.keyboardBoxes()) {
-			const bottom = el.getBoundingClientRect().bottom;
-			// A collapsed or hidden container reports 0 and would win every time.
-			if (bottom > full * 0.4) top = Math.min(top, bottom);
-		}
-		return top;
-	}
-
-	/** One-line dump of every candidate box, for the fallback Notice. */
-	private keyboardReport(): string {
-		const vv = window.visualViewport;
-		const parts = [
-			`win ${Math.round(window.innerHeight)}`,
-			vv ? `vv ${Math.round(vv.offsetTop + vv.height)}` : "vv none",
-		];
-		for (const el of this.keyboardBoxes()) {
-			const cls = el.className.split(/\s+/)[0] || "?";
-			parts.push(`${cls} ${Math.round(el.getBoundingClientRect().bottom)}`);
-		}
-		return parts.join(" · ");
+		this.kbdDispose?.();
+		this.kbdDispose = null;
 	}
 
 	private layoutDockedInput(allowFallback = false): void {
 		const panel = this.inputEl;
 		if (!panel || !panel.hasClass("tmr-gloss-input-docked")) return;
-		const covered = window.innerHeight - this.keyboardTop();
-		// Rounding noise in a container's rect is not a keyboard.
-		if (covered > 24) {
+		const covered = keyboardCoveredPx();
+		if (covered > 0) {
 			panel.removeClass("tmr-gloss-input-top");
 			// Offsetting `bottom` (not `top`) keeps the panel's height auto —
 			// setting both edges on a fixed element stretches it, not moves it.
 			panel.style.bottom = `${covered + 16}px`;
 			// Revealed only once placed: until the keyboard reports itself the
-			// resting `bottom` is under the keys, and showing the panel there
-			// first is the very bug this replaced. The rise is CSS.
+			// resting `bottom` is under the keys. The rise is CSS.
 			panel.addClass("tmr-gloss-input-ready");
 		} else if (allowFallback) {
+			// Every box we know how to measure claims the keyboard isn't there.
+			// Dock to the top instead of leaving the panel under the keys.
 			panel.style.removeProperty("bottom");
 			panel.addClass("tmr-gloss-input-top");
 			panel.addClass("tmr-gloss-input-ready");
-			// Mobile has no console, and this branch means every box we know how
-			// to measure claims the keyboard isn't there. Report what they said,
-			// so a third round has data instead of another guess. Remove once the
-			// bottom-docked path is confirmed on device.
-			new Notice(`gloss dock: ${this.keyboardReport()}`, 8000);
 		}
 	}
 
@@ -1187,10 +1173,8 @@ export class GlossSurface extends Component {
 				if (this.opts.disabledModes?.().has(mode.id)) return;
 				this.openInput(mode.id, this.lastRect ?? tile.getBoundingClientRect());
 			});
-			// Custom tile tooltip (theme-synced, tinted per-mode). Replaces the
-			// neutral Obsidian aria-label tooltip so the hint can inherit the
-			// tile's fill colour and carry the numeric shortcut hint. A disabled
-			// tile shows the host's reason instead of the shortcut hint.
+			// Custom tooltip rather than an Obsidian aria-label one, so the hint
+			// can inherit the tile's fill colour and carry the shortcut number.
 			this.registerDomEvent(tile, "mouseenter", () => {
 				// Touch synthesises mouseenter on tap, so without this the tooltip
 				// fires on the very gesture that opens the input — and its hint is
@@ -1353,4 +1337,43 @@ export class GlossSurface extends Component {
 		el.style.left = `${left}px`;
 		el.style.top = `${Math.min(Math.max(safe.top + 8, top), safe.bottom - rect.height - 8)}px`;
 	}
+}
+
+/** How long `selectionchange` must go quiet before a touch selection counts as
+ *  settled. Long enough to sit out a drag-handle adjustment, short enough that
+ *  the bar doesn't feel like it's lagging the finger. */
+const SELECTION_SETTLE_MS = 250;
+
+/**
+ * Raise the GlossBar for a *touch* selection, and no-op anywhere else.
+ *
+ * Touch has no usable mouseup: iOS fires its synthetic mouse events
+ * inconsistently across the long-press-then-drag-handles gesture, so a
+ * mouseup-driven bar either never rises or rises against a half-made selection.
+ * `selectionchange` fires on every handle move including the last, so debounce
+ * to the end of the gesture. Desktop keeps its mouseup path and needs no timer.
+ *
+ * `raise` is the host's ordinary selection-to-bar routine, so a host adopts
+ * touch selection without a second code path.
+ */
+export function registerTouchSelectionRaise(
+	owner: Component,
+	surface: GlossSurface,
+	raise: () => void,
+): void {
+	if (!Platform.isMobile) return;
+	let timer: number | null = null;
+	owner.register(() => {
+		if (timer !== null) window.clearTimeout(timer);
+	});
+	owner.registerDomEvent(document, "selectionchange", () => {
+		// The input owns the selection once it's open — re-raising here would
+		// close it out from under a half-typed annotation.
+		if (surface.inputOpen) return;
+		if (timer !== null) window.clearTimeout(timer);
+		timer = window.setTimeout(() => {
+			timer = null;
+			raise();
+		}, SELECTION_SETTLE_MS);
+	});
 }
