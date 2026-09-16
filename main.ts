@@ -99,10 +99,12 @@ const SEARCH_MAX_HITS = 500;
 const SEARCH_RENDER_CAP = 100;
 
 interface ImportEntry {
-	folderPath: string;
+	/** Book root as it appears in `webkitRelativePath`, e.g. `Books/Zen.epub`. */
+	root: string;
 	name: string;
 	finalName: string;
 	checked: boolean;
+	files: Map<string, File>;
 }
 
 interface AiDefaults {
@@ -4125,6 +4127,13 @@ export class ReaderView extends ItemView {
 			return true;
 		}
 
+		// The preview's add-note line is only reachable if the pointer crosses the
+		// gap to it before the grace period expires, so the click does the same job.
+		if (saved.mode === "emphasise" && !saved.userText.trim()) {
+			this.beginAddNote(matchedIdx, new DOMRect(e.clientX, e.clientY, 0, 0));
+			return true;
+		}
+
 		return this.openConversationForHighlight(matchedIdx, saved);
 	}
 
@@ -4164,9 +4173,11 @@ export class ReaderView extends ItemView {
 
 	/** "+ Add a note" on a note-less Emphasise preview. `editingNoteIdx` is what
 	 *  routes the submit to that highlight instead of to a live selection. */
-	private beginAddNote(idx: number): void {
+	private beginAddNote(idx: number, fallback?: DOMRect): void {
 		if (!this.savedHighlights[idx]) return;
-		const rect = this.annotationPreview.anchorRect;
+		// A click can arrive with no preview raised, whose rect then measures zero.
+		const anchor = this.annotationPreview.anchorRect;
+		const rect = anchor.width || !fallback ? anchor : fallback;
 		this.annotationPreview.hide();
 		this.editingNoteIdx = idx;
 		this.glossSurface.openInput("emphasise", rect, true);
@@ -6193,14 +6204,14 @@ class TmrSettingTab extends PluginSettingTab {
 		const head = new Setting(section)
 			.setName("Apple Books import")
 			.setDesc("Import exploded epub folders from Apple Books as proper .epub files. "
-				+ "Select one or more book folders — each must contain a mimetype file.")
+				+ "Choose a book folder, or a folder holding several — each must contain a mimetype file.")
 			.addButton(b => b
-				.setButtonText("Select epub folders…")
+				.setButtonText("Select folder…")
 				.setCta()
 				.onClick(async () => {
 					const picked = await this.pickEpubFolders();
 					if (!picked.length) return;
-					this.importEntries = this.validateEpubFolders(picked);
+					this.importEntries = await this.validateEpubFolders(picked);
 					if (this.importEntries.length) this.renderImportResults(resultsEl);
 				}));
 		head.settingEl.addClass("tmr-settings-import-head");
@@ -6252,52 +6263,54 @@ class TmrSettingTab extends PluginSettingTab {
 		btn.addEventListener("click", () => void onImportClick());
 	}
 
-	private validateEpubFolders(paths: string[]): ImportEntry[] {
-		if (!Platform.isDesktop) return [];
-		/* eslint-disable @typescript-eslint/no-require-imports, no-undef -- Node builtins must
-		   stay inside the function body: a module-scope import becomes a top-of-bundle
-		   require(), which kills the plugin at load on mobile (no require there at all). */
-		const nodePath = require("path") as typeof import("path");
-		const fs = require("fs") as typeof import("fs");
-		/* eslint-enable @typescript-eslint/no-require-imports, no-undef -- end of the deliberately
-		   lazy Node requires; normal import rules apply again below. */
+	/** Group a picked directory into books: any folder holding a `mimetype` file
+	 *  is one, so a single book folder and a shelf of them both work. */
+	private async validateEpubFolders(picked: File[]): Promise<ImportEntry[]> {
+		const roots: string[] = [];
+		for (const file of picked) {
+			const rel = file.webkitRelativePath || file.name;
+			if (rel === "mimetype" || rel.endsWith("/mimetype")) {
+				roots.push(rel.slice(0, Math.max(0, rel.length - "mimetype".length - 1)));
+			}
+		}
+		if (!roots.length) {
+			new Notice("No epub folders found — each book needs a mimetype file.");
+			return [];
+		}
+		// Deepest first, so a book nested inside another folder claims its own files.
+		roots.sort((a, b) => b.length - a.length);
+
+		const grouped = new Map<string, Map<string, File>>();
+		for (const file of picked) {
+			const rel = file.webkitRelativePath || file.name;
+			const root = roots.find(r => rel === r || rel.startsWith(`${r}/`));
+			if (root === undefined) continue;
+			const files = grouped.get(root) ?? new Map<string, File>();
+			files.set(rel, file);
+			grouped.set(root, files);
+		}
+
 		const results: ImportEntry[] = [];
-		for (const folderPath of paths) {
-			const name = nodePath.basename(folderPath);
-			try {
-				const mimetype = fs.readFileSync(nodePath.join(folderPath, "mimetype"), "utf8").trim();
-				if (mimetype !== "application/epub+zip") {
-					new Notice(`Skipped "${name}" — not an epub folder.`);
-					continue;
-				}
-			} catch {
-				new Notice(`Skipped "${name}" — no mimetype file found.`);
+		for (const [root, files] of grouped) {
+			const name = root.split("/").pop() || root;
+			const mimetype = files.get(root ? `${root}/mimetype` : "mimetype");
+			const declared = (await mimetype?.text())?.trim();
+			if (declared !== "application/epub+zip") {
+				new Notice(`Skipped "${name}" — not an epub folder.`);
 				continue;
 			}
 			results.push({
-				folderPath,
+				root,
 				name,
 				finalName: name.replace(/\.(epub|book)$/i, "").trim() || name,
 				checked: true,
+				files,
 			});
 		}
-		return results;
+		return results.sort((a, b) => a.name.localeCompare(b.name));
 	}
 
 	private async importBooks(entries: ImportEntry[], statusEl: HTMLElement): Promise<number> {
-		if (!Platform.isDesktop) return 0;
-		/* eslint-disable @typescript-eslint/no-require-imports, no-undef -- see validateEpubFolders. */
-		const nodePath = require("path") as typeof import("path");
-		const fs = require("fs") as typeof import("fs");
-		/* eslint-enable @typescript-eslint/no-require-imports, no-undef -- end of the deliberately
-		   lazy Node requires; normal import rules apply again below. */
-		const fsx: EpubPackFs = {
-			join: (...parts) => nodePath.join(...parts),
-			list: dir => fs.readdirSync(dir, { withFileTypes: true })
-				.map(d => ({ name: d.name, isDirectory: d.isDirectory() })),
-			readFile: path => fs.readFileSync(path),
-		};
-
 		const vault = this.plugin.app.vault;
 		const outputDir = normalizePath(`${libraryRootPath()}/Imported`);
 		if (!vault.getFolderByPath(outputDir)) {
@@ -6319,7 +6332,8 @@ class TmrSettingTab extends PluginSettingTab {
 				outputPath = normalizePath(`${outputDir}/${safe} ${n++}.epub`);
 			}
 			try {
-				await vault.createBinary(outputPath, await packEpubFolder(entry.folderPath, fsx));
+				const fsx = await readPickedFolder(entry.files);
+				await vault.createBinary(outputPath, await packEpubFolder(entry.root, fsx));
 				imported++;
 			} catch (e) {
 				statusEl.createDiv({
@@ -6338,33 +6352,49 @@ class TmrSettingTab extends PluginSettingTab {
 		return imported;
 	}
 
-	private async pickEpubFolders(): Promise<string[]> {
-		try {
-			// eslint-disable-next-line @typescript-eslint/no-require-imports, no-undef -- Electron's remote dialog is only reachable via require() in Obsidian's renderer.
-			const electron = require("electron") as {
-				remote?: {
-					dialog?: {
-						showOpenDialog: (opts: {
-							properties: string[];
-							filters: { name: string; extensions: string[] }[];
-							title: string;
-						}) => Promise<{ canceled: boolean; filePaths: string[] }>;
-					};
-				};
+	/** A directory `<input>` rather than Electron's dialog: the browser hands back
+	 *  the files themselves, so importing needs no filesystem access at all. */
+	private pickEpubFolders(): Promise<File[]> {
+		return new Promise(resolve => {
+			const input = createEl("input", { type: "file" });
+			input.webkitdirectory = true;
+			input.multiple = true;
+			const settle = (files: File[]): void => {
+				input.remove();
+				resolve(files);
 			};
-			const dialog = electron.remote?.dialog;
-			if (!dialog) {
-				new Notice("Folder picker unavailable in this version of Obsidian.");
-				return [];
-			}
-			const result = await dialog.showOpenDialog({
-				properties: ["openFile", "multiSelections"],
-				filters: [{ name: "EPUB", extensions: ["epub"] }],
-				title: "Select epub files to import",
-			});
-			return result.canceled ? [] : result.filePaths;
-		} catch {
-			return [];
-		}
+			input.addEventListener("change", () => settle(Array.from(input.files ?? [])), { once: true });
+			input.addEventListener("cancel", () => settle([]), { once: true });
+			input.click();
+		});
 	}
+}
+
+/** Reads a picked book into memory and serves it through the packer's adapter.
+ *  `File` reads are async while the adapter is synchronous, so every byte is
+ *  pulled up front; a book is a handful of megabytes. */
+async function readPickedFolder(picked: Map<string, File>): Promise<EpubPackFs> {
+	const bytes = new Map<string, Uint8Array>();
+	for (const [path, file] of picked) {
+		bytes.set(path, new Uint8Array(await file.arrayBuffer()));
+	}
+	return {
+		join: (...parts) => parts.filter(Boolean).join("/"),
+		list: (dir) => {
+			const prefix = dir ? `${dir}/` : "";
+			const children = new Map<string, boolean>();
+			for (const path of bytes.keys()) {
+				if (!path.startsWith(prefix)) continue;
+				const rest = path.slice(prefix.length);
+				const slash = rest.indexOf("/");
+				if (rest) children.set(slash === -1 ? rest : rest.slice(0, slash), slash !== -1);
+			}
+			return Array.from(children, ([name, isDirectory]) => ({ name, isDirectory }));
+		},
+		readFile: (path) => {
+			const data = bytes.get(path);
+			if (!data) throw new Error(`Missing file: ${path}`);
+			return data;
+		},
+	};
 }

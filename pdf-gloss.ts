@@ -729,6 +729,12 @@ export class PdfGlossController extends Component {
 			this.preview?.showFor(idx, saved, e.clientX, e.clientY);
 			return;
 		}
+		// The preview's add-note line is only reachable if the pointer crosses the
+		// gap to it before the grace period expires, so the click does the same job.
+		if (saved.mode === "emphasise" && !saved.userText.trim()) {
+			this.beginAddNote(idx, new DOMRect(e.clientX, e.clientY, 0, 0));
+			return;
+		}
 		this.openConversationFor(idx, saved);
 	}
 
@@ -770,9 +776,11 @@ export class PdfGlossController extends Component {
 
 	/** "+ Add a note" on a note-less Emphasise preview. `editingNoteIdx` is what
 	 *  routes the submit to that highlight instead of to a live selection. */
-	private beginAddNote(idx: number): void {
+	private beginAddNote(idx: number, fallback?: DOMRect): void {
 		if (!this.saved[idx] || !this.preview) return;
-		const rect = this.preview.anchorRect;
+		// A click can arrive with no preview raised, whose rect then measures zero.
+		const anchor = this.preview.anchorRect;
+		const rect = anchor.width || !fallback ? anchor : fallback;
 		this.preview.hide();
 		this.editingNoteIdx = idx;
 		this.surface?.openInput("emphasise", rect, true);

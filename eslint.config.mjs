@@ -9,7 +9,9 @@ export default defineConfig([
 	// ships to users — console output there is the point, so the Obsidian plugin
 	// rules (no-console chief among them) don't apply. Same reasoning as
 	// esbuild.config.mjs above it.
-	{ ignores: ["main.js", "node_modules/**", "esbuild.config.mjs", "scripts/**", "fonts/**"] },
+	// shims/ replaces third-party modules at build time, so it's CommonJS written
+	// against their APIs rather than plugin source the Obsidian rules apply to.
+	{ ignores: ["main.js", "node_modules/**", "esbuild.config.mjs", "scripts/**", "fonts/**", "shims/**"] },
 	...obsidianmd.configs.recommended,
 	{
 		files: ["**/*.ts"],

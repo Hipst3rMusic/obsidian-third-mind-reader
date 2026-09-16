@@ -533,7 +533,7 @@ async function readBookTextFile(book: EpubBook, path: string): Promise<string> {
 
 function buildImagePreview(target: Element, path: string, book: EpubBook): EpubLinkPreview | null {
 	const block = findClosest(target, "figure, aside, div, p, section, article") ?? target;
-	const img = block.matches("img") ? block as HTMLImageElement : block.querySelector("img");
+	const img = block.instanceOf(HTMLImageElement) ? block : block.querySelector("img");
 	if (!img) return null;
 
 	const xhtmlDir = path.includes("/")

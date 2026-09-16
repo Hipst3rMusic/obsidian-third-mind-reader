@@ -1,6 +1,6 @@
 {
   "name": "third-mind-reader",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Third Mind Reader — Obsidian Plugin",
   "main": "main.js",
   "scripts": {
@@ -24,8 +24,8 @@
     "typescript-eslint": "^8.62.1"
   },
   "dependencies": {
-    "@chenglou/pretext": "^0.0.4",
-    "dompurify": "^3.4.11",
+    "@chenglou/pretext": "^0.0.9",
+    "dompurify": "^3.4.15",
     "jszip": "^3.10.1"
   }
 }
