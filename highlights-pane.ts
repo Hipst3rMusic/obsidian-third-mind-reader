@@ -19,8 +19,10 @@ import {
 	Component,
 	MarkdownRenderer,
 	Menu,
+	Modal,
 	Notice,
 	Platform,
+	Setting,
 	SuggestModal,
 	TFile,
 	setIcon,
@@ -48,6 +50,41 @@ import {
 	type GlossHostSettings,
 	type SavedHighlight,
 } from "./gloss";
+
+class ConfirmModal extends Modal {
+	private confirmed = false;
+
+	constructor(
+		app: App,
+		private heading: string,
+		private message: string,
+		private confirmLabel: string,
+		private onResult: (confirmed: boolean) => void,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.setTitle(this.heading);
+		this.contentEl.createEl("p", { text: this.message });
+		new Setting(this.contentEl)
+			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()))
+			.addButton((b) => b.setButtonText(this.confirmLabel).setDestructive().onClick(() => {
+				this.confirmed = true;
+				this.close();
+			}));
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+		this.onResult(this.confirmed);
+	}
+}
+
+/** Resolves false on Cancel, Escape, or clicking outside. */
+function confirmAction(app: App, heading: string, message: string, confirmLabel: string): Promise<boolean> {
+	return new Promise((resolve) => new ConfirmModal(app, heading, message, confirmLabel, resolve).open());
+}
 
 export type PaneTab = "annotations" | "conversations";
 
@@ -125,7 +162,7 @@ export function makePaneResizable(
 	edge: "left" | "right",
 	bounds: HTMLElement,
 ): void {
-	const grip = panel.createEl("div", { cls: `tmr-pane-resize-edge tmr-pane-resize-edge-${edge}` });
+	const grip = panel.createDiv({ cls: `tmr-pane-resize-edge tmr-pane-resize-edge-${edge}` });
 	owner.registerDomEvent(grip, "pointerdown", (e: PointerEvent) => {
 		if (e.button !== 0) return;
 		e.preventDefault();
@@ -143,7 +180,7 @@ export function makePaneResizable(
 		const onMove = (ev: PointerEvent) => {
 			pendingX = ev.clientX;
 			if (raf) return;
-			raf = requestAnimationFrame(() => {
+			raf = window.requestAnimationFrame(() => {
 				raf = 0;
 				if (pendingX === null) return;
 				const delta = edge === "left" ? startX - pendingX : pendingX - startX;
@@ -154,7 +191,7 @@ export function makePaneResizable(
 			});
 		};
 		const onUp = () => {
-			if (raf) cancelAnimationFrame(raf);
+			if (raf) window.cancelAnimationFrame(raf);
 			grip.removeEventListener("pointermove", onMove);
 			grip.removeEventListener("pointerup", onUp);
 			grip.removeEventListener("pointercancel", onUp);
@@ -406,10 +443,10 @@ export class HighlightsPane extends Component {
 			this.toggleEl = hlToggle;
 		}
 
-		const hlPanel = root.createEl("div", { cls: "tmr-highlights-panel" });
+		const hlPanel = root.createDiv({ cls: "tmr-highlights-panel" });
 		hlPanel.inert = true; // Tab-proof while closed — see tocPanel.
-		const hlHeader = hlPanel.createEl("div", { cls: "tmr-highlights-header" });
-		hlHeader.createEl("span", { cls: "tmr-highlights-title", text: "Highlights" });
+		const hlHeader = hlPanel.createDiv({ cls: "tmr-highlights-header" });
+		hlHeader.createSpan({ cls: "tmr-highlights-title", text: "Highlights" });
 		// Note button — opens the companion annotation doc. Lives in the header
 		// (above the tab bar) so it's reachable from both tabs, and so readers
 		// who only Emphasise (no conversations) can still get to their notes.
@@ -426,8 +463,8 @@ export class HighlightsPane extends Component {
 		// Tab bar (Annotations / Conversations) lives between the header and
 		// the content. Two segmented buttons; click swaps which list is
 		// visible. Active tab persists per-book via the host.
-		const tabsWrap = hlPanel.createEl("div", { cls: "tmr-pane-tabs-wrap" });
-		const tabs = tabsWrap.createEl("div", { cls: "tmr-pane-tabs" });
+		const tabsWrap = hlPanel.createDiv({ cls: "tmr-pane-tabs-wrap" });
+		const tabs = tabsWrap.createDiv({ cls: "tmr-pane-tabs" });
 		tabs.dataset.active = "annotations";
 		const annTab = tabs.createEl("button", {
 			cls: "tmr-pane-tab",
@@ -443,20 +480,20 @@ export class HighlightsPane extends Component {
 		this.registerDomEvent(convTab, "click", () => this.setTab("conversations"));
 		this.paneTabsEl = tabs;
 
-		this.listEl = hlPanel.createEl("div", { cls: "tmr-highlights-list" });
-		const convListEl = hlPanel.createEl("div", { cls: "tmr-conversations-list tmr-hidden" });
+		this.listEl = hlPanel.createDiv({ cls: "tmr-highlights-list" });
+		const convListEl = hlPanel.createDiv({ cls: "tmr-conversations-list tmr-hidden" });
 		this.conversationsListEl = convListEl;
-		this.convCardsEl = convListEl.createEl("div", { cls: "tmr-conv-cards" });
-		const filterRow = convListEl.createEl("div", { cls: "tmr-conv-filter-row" });
+		this.convCardsEl = convListEl.createDiv({ cls: "tmr-conv-cards" });
+		const filterRow = convListEl.createDiv({ cls: "tmr-conv-filter-row" });
 		this.buildConvFilterRow(filterRow);
 		// Chat screen — hidden until a conversation opens; replaces the cards
 		// + filter row (via the container's tmr-conv-chat-open class) while
 		// the tabs and header above stay put.
-		this.convChatEl = convListEl.createEl("div", { cls: "tmr-conv-screen" });
+		this.convChatEl = convListEl.createDiv({ cls: "tmr-conv-screen" });
 		this.panelEl = hlPanel;
 		this.host.makeResizable(hlPanel, "left");
 
-		const hlBackdrop = root.createEl("div", { cls: "tmr-highlights-backdrop" });
+		const hlBackdrop = root.createDiv({ cls: "tmr-highlights-backdrop" });
 		this.registerDomEvent(hlBackdrop, "click", () => this.toggle());
 		this.backdropEl = hlBackdrop;
 	}
@@ -572,7 +609,7 @@ export class HighlightsPane extends Component {
 		this.convFilterRowEl = row;
 
 		// Middle: sort pills — hidden until filter is open.
-		const optionsEl = row.createEl("div", { cls: "tmr-conv-filter-options" });
+		const optionsEl = row.createDiv({ cls: "tmr-conv-filter-options" });
 		const opts: Array<{ key: "priority" | "recent" | "chapter"; label: string }> = [
 			{ key: "priority", label: "Priority" },
 			{ key: "recent",   label: "Recent"   },
@@ -622,7 +659,7 @@ export class HighlightsPane extends Component {
 		list.empty();
 
 		if (this.saved.length === 0) {
-			list.createEl("div", {
+			list.createDiv({
 				cls: "tmr-highlights-empty",
 				text: "No highlights yet — select any text to begin annotating.",
 			});
@@ -680,19 +717,19 @@ export class HighlightsPane extends Component {
 		collapsible: boolean,
 		collapsed: boolean,
 	): HTMLElement {
-		const section = list.createEl("div", { cls: "tmr-section" });
+		const section = list.createDiv({ cls: "tmr-section" });
 		section.toggleClass("tmr-section-collapsed", collapsed);
 
-		const header = section.createEl("div", { cls: "tmr-highlights-section-header" });
-		const left = header.createEl("div", { cls: "tmr-section-header-left" });
-		left.createEl("span", { cls: "tmr-section-header-label", text: label });
+		const header = section.createDiv({ cls: "tmr-highlights-section-header" });
+		const left = header.createDiv({ cls: "tmr-section-header-left" });
+		left.createSpan({ cls: "tmr-section-header-label", text: label });
 
 		if (collapsible) {
 			header.addClass("tmr-section-header-collapsible");
-			setIcon(left.createEl("span", { cls: "tmr-section-chevron" }), "chevron-down");
-			const countEl = header.createEl("div", { cls: "tmr-section-count" });
-			setIcon(countEl.createEl("span", { cls: "tmr-section-count-icon" }), "bookmark");
-			countEl.createEl("span", { cls: "tmr-section-count-num", text: String(count) });
+			setIcon(left.createSpan({ cls: "tmr-section-chevron" }), "chevron-down");
+			const countEl = header.createDiv({ cls: "tmr-section-count" });
+			setIcon(countEl.createSpan({ cls: "tmr-section-count-icon" }), "bookmark");
+			countEl.createSpan({ cls: "tmr-section-count-num", text: String(count) });
 			this.registerDomEvent(header, "click", () => {
 				const nowCollapsed = !this.collapsedSections.has(sectionId);
 				if (nowCollapsed) this.collapsedSections.add(sectionId);
@@ -701,25 +738,25 @@ export class HighlightsPane extends Component {
 			});
 		}
 
-		const itemsOuter = section.createEl("div", { cls: "tmr-section-items" });
-		return itemsOuter.createEl("div", { cls: "tmr-section-items-inner" });
+		const itemsOuter = section.createDiv({ cls: "tmr-section-items" });
+		return itemsOuter.createDiv({ cls: "tmr-section-items-inner" });
 	}
 
 	/** Render one saved-highlight row into `parent`. */
 	private renderHighlightItem(parent: HTMLElement, saved: SavedHighlight, idx: number): void {
-		const item = parent.createEl("div", { cls: "tmr-highlights-item" });
+		const item = parent.createDiv({ cls: "tmr-highlights-item" });
 		item.dataset.glossMode = saved.mode;
 		item.dataset.highlightIdx = String(idx);
 
-		const iconEl = item.createEl("span", { cls: "tmr-highlights-item-icon" });
+		const iconEl = item.createSpan({ cls: "tmr-highlights-item-icon" });
 		// ANNOTATION_MODES, not GLOSS_MODES: bookmarks appear in this list but
 		// never as a GlossBar tile, so they're absent from the tile array.
 		const modeMeta = ANNOTATION_MODES.find((m) => m.id === saved.mode);
 		if (modeMeta) setIcon(iconEl, modeMeta.icon);
 
-		const body = item.createEl("div", { cls: "tmr-highlights-item-body" });
+		const body = item.createDiv({ cls: "tmr-highlights-item-body" });
 		const quote = saved.quote.replace(/\s+/g, " ").trim();
-		body.createEl("div", {
+		body.createDiv({
 			cls: "tmr-highlights-item-quote",
 			text: quote.length > 0 ? quote : "(no quote)",
 		});
@@ -732,7 +769,7 @@ export class HighlightsPane extends Component {
 		if (this.editingNoteIdx === idx && noteEditable) {
 			this.renderNoteEditor(body, idx, saved.userText);
 		} else if (note.length > 0) {
-			const noteEl = body.createEl("div", { cls: "tmr-highlights-item-note", text: note });
+			const noteEl = body.createDiv({ cls: "tmr-highlights-item-note", text: note });
 			if (noteEditable) {
 				noteEl.addClass("tmr-highlights-item-note-editable");
 				noteEl.setAttr("title", "Click to edit");
@@ -743,7 +780,7 @@ export class HighlightsPane extends Component {
 				});
 			}
 		} else if (noteEditable) {
-			const addEl = body.createEl("div", {
+			const addEl = body.createDiv({
 				cls: "tmr-highlights-item-add-note",
 				text: "+ Add a note",
 			});
@@ -803,7 +840,7 @@ export class HighlightsPane extends Component {
 			}
 		});
 		this.registerDomEvent(input, "blur", () => window.setTimeout(commit, 120));
-		requestAnimationFrame(() => { input.focus(); input.select(); });
+		window.requestAnimationFrame(() => { input.focus(); input.select(); });
 	}
 
 	private cancelNoteEdit(): void {
@@ -811,9 +848,9 @@ export class HighlightsPane extends Component {
 		this.renderHighlightsList();
 	}
 
-	/** Persist an edited Emphasise note. An empty value clears the note back to
-	 *  a bare callout. No-op write when the text is unchanged. */
-	private async commitNoteEdit(idx: number, value: string): Promise<void> {
+	/** An empty value clears the note back to a bare callout. Public because the
+	 *  reader's in-page "+ Add a note" writes through here too. */
+	async commitNoteEdit(idx: number, value: string): Promise<void> {
 		const saved = this.saved[idx];
 		this.editingNoteIdx = null;
 		if (!saved) { this.renderHighlightsList(); return; }
@@ -842,8 +879,11 @@ export class HighlightsPane extends Component {
 	async deleteHighlightAt(idx: number, confirmFirst = true): Promise<void> {
 		const saved = this.saved[idx];
 		if (!saved) return;
-		if (confirmFirst && !window.confirm(
-			"Delete this annotation? It will be removed from the companion doc. This cannot be undone (the doc remains in vault history).",
+		if (confirmFirst && !await confirmAction(
+			this.app,
+			"Delete this annotation?",
+			"It will be removed from the companion doc. This cannot be undone (the doc remains in vault history).",
+			"Delete",
 		)) return;
 
 		const path = this.host.companionDocPath();
@@ -894,7 +934,7 @@ export class HighlightsPane extends Component {
 			// A chat can't stay open with nothing to return to (e.g. the last
 			// conversation was just deleted) — fall back to the empty state.
 			if (this.convChatEl?.dataset.conversationIdx !== undefined) this.closeConversation();
-			list.createEl("div", {
+			list.createDiv({
 				cls: "tmr-highlights-empty",
 				text: "No conversations yet — use Explain, Examine, Exclaim or Enquiry on a selection to start one.",
 			});
@@ -935,26 +975,26 @@ export class HighlightsPane extends Component {
 				const section = this.host.sectionOf(saved);
 				if (section.id !== lastSectionId) {
 					lastSectionId = section.id;
-					list.createEl("div", {
+					list.createDiv({
 						cls: "tmr-highlights-section-header",
 						text: section.label,
 					});
 				}
 			}
 
-			const card = list.createEl("div", { cls: "tmr-conv-card" });
+			const card = list.createDiv({ cls: "tmr-conv-card" });
 			card.dataset.glossMode = saved.mode;
 			card.dataset.conversationIdx = String(idx);
 
 			// Header row — body + chevron sit here so the card can flex-column
 			// when the conversation surface is appended below.
-			const row = card.createEl("div", { cls: "tmr-conv-card-row" });
-			const body = row.createEl("div", { cls: "tmr-conv-card-body" });
+			const row = card.createDiv({ cls: "tmr-conv-card-row" });
+			const body = row.createDiv({ cls: "tmr-conv-card-body" });
 
 			// Title = user's first turn (or `userText` for legacy callouts).
 			// Falls through to "(no prompt)" for bare-flagged entries.
 			const title = saved.userText.trim();
-			body.createEl("div", {
+			body.createDiv({
 				cls: "tmr-conv-card-title",
 				text: title.length > 0 ? title : "(no prompt)",
 			});
@@ -963,13 +1003,13 @@ export class HighlightsPane extends Component {
 			const firstAssistant = saved.turns.find((t) => t.role === "assistant");
 			const previewText = this.conversationPreviewText(saved, firstAssistant);
 			if (previewText) {
-				const preview = body.createEl("div", { cls: "tmr-conv-card-preview" });
+				const preview = body.createDiv({ cls: "tmr-conv-card-preview" });
 				preview.toggleClass("tmr-conv-card-preview-pending", saved.aiState === "pending");
 				preview.toggleClass("tmr-conv-card-preview-error",   saved.aiState === "error");
 				preview.setText(this.stripInlineMarkdown(previewText));
 			}
 
-			const chevron = row.createEl("span", { cls: "tmr-conv-card-chevron" });
+			const chevron = row.createSpan({ cls: "tmr-conv-card-chevron" });
 			setIcon(chevron, "chevron-right");
 
 			this.registerDomEvent(row, "click", () => {
@@ -1080,18 +1120,18 @@ export class HighlightsPane extends Component {
 	}
 
 	private renderConversationSurface(host: HTMLElement, saved: SavedHighlight): void {
-		const surface = host.createEl("div", { cls: "tmr-conv-surface" });
+		const surface = host.createDiv({ cls: "tmr-conv-surface" });
 
 		// Chat log — scrollable middle section. Quote is prepended inside so it scrolls away.
-		const log = surface.createEl("div", { cls: "tmr-conv-log" });
+		const log = surface.createDiv({ cls: "tmr-conv-log" });
 		this.activeConvLog = log;
 		void this.renderConversationLog(log, saved);
 
 		// Chat box — fixed-height bottom section matching DLS "Chat box" component.
-		const chatbox = surface.createEl("div", { cls: "tmr-conv-chatbox" });
+		const chatbox = surface.createDiv({ cls: "tmr-conv-chatbox" });
 
 		// Top: textarea + send button.
-		const chatboxTop = chatbox.createEl("div", { cls: "tmr-conv-chatbox-top" });
+		const chatboxTop = chatbox.createDiv({ cls: "tmr-conv-chatbox-top" });
 		const textarea = chatboxTop.createEl("textarea", {
 			cls: "tmr-conv-textarea",
 			attr: { placeholder: "Say something…", rows: "1" },
@@ -1104,11 +1144,11 @@ export class HighlightsPane extends Component {
 		// user-given provider name from settings (provider.id), not the raw
 		// model id — the picker dialog still lists raw model ids; the hover
 		// tooltip carries the currently resolved one.
-		const chatboxBottom = chatbox.createEl("div", { cls: "tmr-conv-chatbox-bottom" });
+		const chatboxBottom = chatbox.createDiv({ cls: "tmr-conv-chatbox-bottom" });
 		const provider = this.getActiveProvider();
-		const modelPicker = chatboxBottom.createEl("div", { cls: "tmr-conv-model-picker" });
+		const modelPicker = chatboxBottom.createDiv({ cls: "tmr-conv-model-picker" });
 		setIcon(modelPicker, "chevron-down");
-		modelPicker.createEl("span", { text: provider ? provider.id : "No model configured" });
+		modelPicker.createSpan({ text: provider ? provider.id : "No model configured" });
 		if (provider?.defaultModel) setTooltip(modelPicker, provider.defaultModel);
 		// Clickable when a provider is resolved: opens the model browser for it
 		// and updates this provider's default model. No-op when unconfigured.
@@ -1178,11 +1218,11 @@ export class HighlightsPane extends Component {
 		log.empty();
 		for (const turn of saved.turns) {
 			if (turn.role === "user") {
-				const wrap = log.createEl("div", { cls: "tmr-conv-turn-user-wrap" });
-				wrap.createEl("div", { cls: "tmr-conv-turn-user-bubble", text: turn.content });
+				const wrap = log.createDiv({ cls: "tmr-conv-turn-user-wrap" });
+				wrap.createDiv({ cls: "tmr-conv-turn-user-bubble", text: turn.content });
 			} else {
-				const wrap = log.createEl("div", { cls: "tmr-conv-turn-ai-wrap" });
-				const bubble = wrap.createEl("div", { cls: "tmr-conv-turn-ai-bubble" });
+				const wrap = log.createDiv({ cls: "tmr-conv-turn-ai-wrap" });
+				const bubble = wrap.createDiv({ cls: "tmr-conv-turn-ai-bubble" });
 				await this.renderAssistantBubble(bubble, turn.content);
 				// A newer render superseded us mid-await — stop before appending
 				// into the tree it has since rebuilt.
@@ -1193,8 +1233,8 @@ export class HighlightsPane extends Component {
 		if (isQueued(saved)) {
 			// Static, not the animated indicator: nothing is happening, and
 			// three bouncing dots would promise otherwise.
-			const wrap = log.createEl("div", { cls: "tmr-conv-turn-ai-wrap" });
-			wrap.createEl("div", {
+			const wrap = log.createDiv({ cls: "tmr-conv-turn-ai-wrap" });
+			wrap.createDiv({
 				cls: "tmr-conv-turn-ai-bubble tmr-turn-queued",
 				text: queuedLabel(),
 			});
@@ -1203,14 +1243,14 @@ export class HighlightsPane extends Component {
 			if (phase === "streaming") {
 				// Live token stream — plain text while arriving; renderAssistant-
 				// Bubble re-renders it as formatted markdown once the turn lands.
-				const wrap = log.createEl("div", { cls: "tmr-conv-turn-ai-wrap" });
-				const bubble = wrap.createEl("div", { cls: "tmr-conv-turn-ai-bubble tmr-turn-streaming" });
+				const wrap = log.createDiv({ cls: "tmr-conv-turn-ai-wrap" });
+				const bubble = wrap.createDiv({ cls: "tmr-conv-turn-ai-bubble tmr-turn-streaming" });
 				bubble.textContent = saved.streamingText ?? "";
 			} else {
 				// Animated indicator: "Connecting…" while probing the server,
 				// "Loading model…" during a cold load, "Thinking…" once generating.
-				const wrap = log.createEl("div", { cls: "tmr-conv-turn-ai-wrap tmr-conv-pending-wrap" });
-				const ind = wrap.createEl("div", {
+				const wrap = log.createDiv({ cls: "tmr-conv-turn-ai-wrap tmr-conv-pending-wrap" });
+				const ind = wrap.createDiv({
 					cls: `tmr-conv-turn-ai-bubble tmr-turn-pending tmr-turn-${phase}`,
 				});
 				ind.createSpan({
@@ -1223,8 +1263,8 @@ export class HighlightsPane extends Component {
 				dots.createSpan({ cls: "tmr-dot" });
 			}
 		} else if (saved.aiState === "error") {
-			const wrap = log.createEl("div", { cls: "tmr-conv-turn-ai-wrap" });
-			wrap.createEl("div", {
+			const wrap = log.createDiv({ cls: "tmr-conv-turn-ai-wrap" });
+			wrap.createDiv({
 				cls: "tmr-conv-turn-ai-bubble tmr-turn-error",
 				text: saved.aiError ?? "Model unreachable — check plugin settings.",
 			});
@@ -1266,13 +1306,13 @@ export class HighlightsPane extends Component {
 			replacements.push({ node, parts });
 		}
 		for (const { node, parts } of replacements) {
-			const frag = document.createDocumentFragment();
+			const frag = createFragment();
 			for (const part of parts) {
 				if (typeof part === "string") {
 					frag.appendChild(document.createTextNode(part));
 				} else {
 					const cite = citations.get(part)!;
-					const span = document.createElement("span");
+					const span = createSpan();
 					span.className = "tmr-citation";
 					span.textContent = `[${part}]`;
 					span.dataset.citationNum = String(part);
@@ -1457,9 +1497,8 @@ export class HighlightsPane extends Component {
 						// plain-text bubble we append to (formatted on completion).
 						saved.livePhase = "streaming";
 						log.querySelector(".tmr-conv-pending-wrap")?.remove();
-						const wrap = log.createEl("div", { cls: "tmr-conv-turn-ai-wrap" });
-						streamBubble = wrap.createEl("div",
-							{ cls: "tmr-conv-turn-ai-bubble tmr-turn-streaming" });
+						const wrap = log.createDiv({ cls: "tmr-conv-turn-ai-wrap" });
+						streamBubble = wrap.createDiv({ cls: "tmr-conv-turn-ai-bubble tmr-turn-streaming" });
 					}
 					streamBubble.textContent = saved.streamingText ?? "";
 					log.scrollTop = log.scrollHeight;
@@ -1604,8 +1643,11 @@ export class HighlightsPane extends Component {
 				.setIcon("rotate-ccw")
 				.setDisabled(!canReset)
 				.onClick(async () => {
-					const ok = window.confirm(
-						"Reset this conversation? All turns after the first exchange will be removed. This cannot be undone (the companion doc remains in vault history).",
+					const ok = await confirmAction(
+						this.app,
+						"Reset this conversation?",
+						"All turns after the first exchange will be removed. This cannot be undone (the companion doc remains in vault history).",
+						"Reset",
 					);
 					if (!ok) return;
 					const firstUser = saved.turns.find((t) => t.role === "user");

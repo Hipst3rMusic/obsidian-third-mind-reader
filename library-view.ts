@@ -1,4 +1,4 @@
-import { ItemView, WorkspaceLeaf, setIcon, setTooltip, Menu, Modal, Setting, App, TextComponent, Notice } from "obsidian";
+import { ItemView, WorkspaceLeaf, setIcon, setTooltip, Menu, Modal, Setting, App, TextComponent, Notice, sanitizeHTMLToDom } from "obsidian";
 import type ThirdMindReader from "./main";
 import { LOGO_3C_SVG } from "./main";
 import { scanLibrary, computeCollections, detectExplodedEpubs, type LibraryBook } from "./library-scan";
@@ -55,7 +55,6 @@ export class LibraryView extends ItemView {
 	private explodedFolders: string[] = [];
 	/** Repaint targets carved out by `render()` so state changes don't re-scan. */
 	private stripEl: HTMLElement | null = null;
-	private feedbackHintEl: HTMLElement | null = null;
 	private nudgeEl: HTMLElement | null = null;
 	private bodyEl: HTMLElement | null = null;
 	/** Tabs Group + its sliding active-indicator (the Conversations-pane pattern,
@@ -96,8 +95,6 @@ export class LibraryView extends ItemView {
 		this.tabResizeObserver?.disconnect();
 		this.tabResizeObserver = null;
 		if (this.tabIndicatorAnimTimer !== null) window.clearTimeout(this.tabIndicatorAnimTimer);
-		this.feedbackHintEl?.remove();
-		this.feedbackHintEl = null;
 		this.contentEl.empty();
 	}
 
@@ -173,9 +170,9 @@ export class LibraryView extends ItemView {
 
 		// Sticky strip above a scrolling body; nudge sits between them. These
 		// containers are repainted on state change without re-scanning.
-		this.stripEl = root.createEl("div", { cls: "tmr-lib-strip" });
-		this.nudgeEl = root.createEl("div", { cls: "tmr-lib-nudge-slot" });
-		this.bodyEl = root.createEl("div", { cls: "tmr-lib-body" });
+		this.stripEl = root.createDiv({ cls: "tmr-lib-strip" });
+		this.nudgeEl = root.createDiv({ cls: "tmr-lib-nudge-slot" });
+		this.bodyEl = root.createDiv({ cls: "tmr-lib-body" });
 
 		// Header/strip paint synchronously above; the grid fills in once the scan
 		// resolves.
@@ -208,8 +205,8 @@ export class LibraryView extends ItemView {
 	}
 
 	private buildHeader(root: HTMLElement): void {
-		const header = root.createEl("div", { cls: "tmr-lib-header" });
-		header.createEl("div", {
+		const header = root.createDiv({ cls: "tmr-lib-header" });
+		header.createDiv({
 			cls: "tmr-lib-eyebrow",
 			text: this.app.vault.getName().toUpperCase(),
 		});
@@ -227,10 +224,10 @@ export class LibraryView extends ItemView {
 		if (!strip) return;
 		strip.empty();
 
-		const tabs = strip.createEl("div", { cls: "tmr-lib-tabs" });
+		const tabs = strip.createDiv({ cls: "tmr-lib-tabs" });
 		this.tabsGroupEl = tabs;
 		// Sliding active-indicator behind the tabs (Conversations-pane pattern).
-		this.tabIndicatorEl = tabs.createEl("div", { cls: "tmr-lib-tab-indicator" });
+		this.tabIndicatorEl = tabs.createDiv({ cls: "tmr-lib-tab-indicator" });
 		this.renderTab(tabs, "", "Everything");
 		const collections = computeCollections(this.app.vault, this.plugin.settings.libraryCollectionOrder);
 		for (const c of collections) this.renderTab(tabs, c, c);
@@ -248,7 +245,7 @@ export class LibraryView extends ItemView {
 		addFolder.addClass("tmr-lib-add-btn");
 		this.registerDomEvent(addFolder, "click", () => this.promptAddFolder());
 
-		strip.createEl("div", { cls: "tmr-lib-strip-spacer" });
+		strip.createDiv({ cls: "tmr-lib-strip-spacer" });
 
 		this.renderSearchControl(strip);
 
@@ -259,8 +256,6 @@ export class LibraryView extends ItemView {
 		const addBook = this.iconButton(strip, "settings", "Settings");
 		this.registerDomEvent(addBook, "click", () => this.openSettings());
 
-		if (!this.plugin.settings.feedbackHintShown) this.showFeedbackHint(addBook);
-
 		this.positionTabIndicator(false);
 	}
 
@@ -268,12 +263,12 @@ export class LibraryView extends ItemView {
 	 *  global filter field. Open/close toggle a class (no strip rebuild) so the
 	 *  width animates at constant height — no vertical reflow of the view. */
 	private renderSearchControl(strip: HTMLElement): void {
-		const wrap = strip.createEl("div", { cls: "tmr-lib-search" });
+		const wrap = strip.createDiv({ cls: "tmr-lib-search" });
 		this.searchEl = wrap;
 		this.syncSearchOpen();
 		setTooltip(wrap, "Search");
 
-		setIcon(wrap.createEl("span", { cls: "tmr-lib-search-icon" }), "search");
+		setIcon(wrap.createSpan({ cls: "tmr-lib-search-icon" }), "search");
 
 		const input = wrap.createEl("input", { cls: "tmr-lib-search-input" });
 		this.searchInputEl = input;
@@ -440,7 +435,7 @@ export class LibraryView extends ItemView {
 		if (active.offsetWidth === 0) {
 			indicator.setCssProps({ opacity: "0" });
 			if (retries < 60 && indicator.isConnected) {
-				requestAnimationFrame(() => this.positionTabIndicator(false, retries + 1));
+				window.requestAnimationFrame(() => this.positionTabIndicator(false, retries + 1));
 			}
 			return;
 		}
@@ -484,8 +479,7 @@ export class LibraryView extends ItemView {
 	 *  any other open Library, including when toggled from the reader). */
 	private render3cToggle(strip: HTMLElement): void {
 		const btn = strip.createEl("button", { cls: "tmr-lib-icon-btn tmr-lib-3c-btn" });
-		// eslint-disable-next-line no-unsanitized/property -- Safe: LOGO_3C_SVG is a compile-time SVG constant.
-		btn.innerHTML = LOGO_3C_SVG;
+		btn.appendChild(sanitizeHTMLToDom(LOGO_3C_SVG));
 		this.registerDomEvent(btn, "click", async () => {
 			this.plugin.settings.tmrMode = this.plugin.settings.tmrMode === "3c" ? "obsidian" : "3c";
 			await this.plugin.saveSettings();
@@ -515,62 +509,6 @@ export class LibraryView extends ItemView {
 		}).setting;
 		setting?.open?.();
 		setting?.openTabById?.(this.plugin.manifest.id);
-	}
-
-	/** One-time hint pointing first-time users to where beta feedback lives: a
-	 *  pill above the settings gear (same shape as the reader's progress "Back"
-	 *  pill). Body-scoped + fixed so the strip's overflow can't clip it. Shown
-	 *  once ever (persisted via settings.feedbackHintShown); dismisses on click of
-	 *  the hint or the gear, or after a timeout. */
-	private showFeedbackHint(anchor: HTMLElement): void {
-		this.plugin.settings.feedbackHintShown = true;
-		void this.plugin.saveSettings();
-
-		this.feedbackHintEl?.remove();
-		const hint = document.body.createEl("div", { cls: "tmr-lib-feedback-hint" });
-		this.feedbackHintEl = hint;
-		hint.createSpan({ text: "Thanks for trying the beta! You can leave feedback in the settings page here" });
-		const caret = hint.createEl("div", { cls: "tmr-lib-feedback-hint-caret" });
-
-		// Hug the text: shrink to the narrowest width that preserves the natural
-		// wrap (at the CSS max-width), removing trailing dead space on the shorter
-		// line. CSS can't do this for a fixed-position box (its containing block is
-		// the viewport, so fit-content resolves to the single-line width).
-		const targetH = hint.offsetHeight;
-		let lo = 60, hi = hint.offsetWidth;
-		while (hi - lo > 4) {
-			const mid = (lo + hi) / 2;
-			hint.style.width = `${mid}px`;
-			if (hint.offsetHeight > targetH) lo = mid; else hi = mid;
-		}
-		hint.style.width = `${Math.ceil(hi)}px`;
-
-		const place = () => {
-			const r = anchor.getBoundingClientRect();
-			if (!r.width) return;
-			const margin = 8;
-			const gearCenter = r.left + r.width / 2;
-			const left = Math.max(margin, Math.min(gearCenter - hint.offsetWidth / 2, window.innerWidth - hint.offsetWidth - margin));
-			hint.style.top = `${Math.round(r.top - hint.offsetHeight - margin)}px`;
-			hint.style.left = `${Math.round(left)}px`;
-			// Point the caret at the gear itself, even when the pill is clamped
-			// against the window edge (otherwise it drifts toward the pill centre).
-			const caretX = Math.max(12, Math.min(gearCenter - left, hint.offsetWidth - 12));
-			caret.style.left = `${Math.round(caretX)}px`;
-		};
-		place();
-		// Force a reflow so the opacity transition plays, then reveal. (We avoid
-		// requestAnimationFrame here — it's paused while the window is backgrounded.)
-		void hint.offsetWidth;
-		hint.addClass("tmr-lib-feedback-hint-visible");
-
-		const dismiss = () => {
-			hint.remove();
-			if (this.feedbackHintEl === hint) this.feedbackHintEl = null;
-		};
-		this.registerDomEvent(hint, "click", () => { dismiss(); this.openSettings(); });
-		this.registerDomEvent(anchor, "click", dismiss);
-		window.setTimeout(dismiss, 9000);
 	}
 
 	private promptAddFolder(): void {
@@ -604,8 +542,8 @@ export class LibraryView extends ItemView {
 		const n = this.explodedFolders.length;
 		if (n === 0) return;
 
-		const banner = slot.createEl("div", { cls: "tmr-lib-nudge" });
-		banner.createEl("span", {
+		const banner = slot.createDiv({ cls: "tmr-lib-nudge" });
+		banner.createSpan({
 			cls: "tmr-lib-nudge-text",
 			text: `Found ${n} book${n === 1 ? "" : "s"} that ${n === 1 ? "needs" : "need"} to be imported.`,
 		});
@@ -640,7 +578,7 @@ export class LibraryView extends ItemView {
 			: this.books;
 
 		if (visible.length === 0) {
-			body.createEl("div", {
+			body.createDiv({
 				cls: "tmr-lib-collection-empty",
 				text: "No books in this collection yet.",
 			});
@@ -659,7 +597,7 @@ export class LibraryView extends ItemView {
 		);
 
 		if (matches.length === 0) {
-			body.createEl("div", {
+			body.createDiv({
 				cls: "tmr-lib-collection-empty",
 				text: `No matches for "${query}".`,
 			});
@@ -678,8 +616,8 @@ export class LibraryView extends ItemView {
 		if (groups.has("")) ordered.push("");
 
 		for (const key of ordered) {
-			const group = body.createEl("div", { cls: "tmr-lib-search-group" });
-			group.createEl("div", {
+			const group = body.createDiv({ cls: "tmr-lib-search-group" });
+			group.createDiv({
 				cls: "tmr-lib-search-group-label",
 				text: key || "Library",
 			});
@@ -688,20 +626,20 @@ export class LibraryView extends ItemView {
 	}
 
 	private renderGrid(parent: HTMLElement, books: LibraryBook[]): void {
-		const grid = parent.createEl("div", { cls: "tmr-lib-grid" });
+		const grid = parent.createDiv({ cls: "tmr-lib-grid" });
 		for (const book of sortForShelf(books)) this.renderCard(grid, book);
 	}
 
 	private renderCard(grid: HTMLElement, book: LibraryBook): void {
-		const card = grid.createEl("div", { cls: "tmr-lib-card" });
+		const card = grid.createDiv({ cls: "tmr-lib-card" });
 		card.setAttribute("role", "button");
 		card.dataset.path = book.path;
 		card.tabIndex = 0;
 
-		const head = card.createEl("div", { cls: "tmr-lib-card-head" });
-		head.createEl("div", { cls: "tmr-lib-card-title", text: book.title });
+		const head = card.createDiv({ cls: "tmr-lib-card-head" });
+		head.createDiv({ cls: "tmr-lib-card-title", text: book.title });
 		if (book.author) {
-			head.createEl("div", { cls: "tmr-lib-card-author", text: `— ${book.author}` });
+			head.createDiv({ cls: "tmr-lib-card-author", text: `— ${book.author}` });
 		}
 
 		// Hover-revealed ellipsis: a visible handle for the same menu that
@@ -721,29 +659,29 @@ export class LibraryView extends ItemView {
 			if (e.key === "Enter" || e.key === " ") e.stopPropagation();
 		});
 
-		const foot = card.createEl("div", { cls: "tmr-lib-card-foot" });
-		const track = foot.createEl("div", { cls: "tmr-lib-card-track" });
-		const fill = track.createEl("div", { cls: "tmr-lib-card-track-fill" });
+		const foot = card.createDiv({ cls: "tmr-lib-card-foot" });
+		const track = foot.createDiv({ cls: "tmr-lib-card-track" });
+		const fill = track.createDiv({ cls: "tmr-lib-card-track-fill" });
 		fill.style.width = `${Math.round(book.progress * 100)}%`;
 
-		const stats = foot.createEl("div", { cls: "tmr-lib-card-stats" });
+		const stats = foot.createDiv({ cls: "tmr-lib-card-stats" });
 		// Progress and format read as one left-hand group so the marks count keeps
 		// the right edge to itself (the row is `space-between`).
-		const left = stats.createEl("div", { cls: "tmr-lib-card-stats-left" });
-		left.createEl("span", {
+		const left = stats.createDiv({ cls: "tmr-lib-card-stats-left" });
+		left.createSpan({
 			cls: "tmr-lib-card-pct",
 			// progress = the reader's cached `pct`; 0 (or never-opened) reads "Unread".
 			text: book.progress > 0 ? `${Math.round(book.progress * 100)}%` : "Unread",
 		});
 		// Epub is the shelf's default, so only the exception is labelled.
 		if (book.kind === "pdf") {
-			left.createEl("span", { cls: "tmr-lib-card-format", text: "PDF" });
+			left.createSpan({ cls: "tmr-lib-card-format", text: "PDF" });
 		}
 		// Marks hidden at zero per spec.
 		if (book.marks > 0) {
-			const marks = stats.createEl("span", { cls: "tmr-lib-card-marks" });
-			setIcon(marks.createEl("span", { cls: "tmr-lib-card-marks-icon" }), "bookmark");
-			marks.createEl("span", { text: String(book.marks) });
+			const marks = stats.createSpan({ cls: "tmr-lib-card-marks" });
+			setIcon(marks.createSpan({ cls: "tmr-lib-card-marks-icon" }), "bookmark");
+			marks.createSpan({ text: String(book.marks) });
 		}
 
 		const open = () => void this.plugin.openBookInNewTab(book.path);
@@ -807,9 +745,9 @@ export class LibraryView extends ItemView {
 	}
 
 	private renderEmptyState(parent: HTMLElement): void {
-		const empty = parent.createEl("div", { cls: "tmr-lib-empty" });
-		empty.createEl("div", { cls: "tmr-lib-empty-title", text: "Your library is empty" });
-		empty.createEl("div", {
+		const empty = parent.createDiv({ cls: "tmr-lib-empty" });
+		empty.createDiv({ cls: "tmr-lib-empty-title", text: "Your library is empty" });
+		empty.createDiv({
 			cls: "tmr-lib-empty-hint",
 			text: "Import a book, or drop .epub and .pdf files into your Library folder.",
 		});

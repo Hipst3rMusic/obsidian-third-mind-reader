@@ -5,7 +5,6 @@ import {
 	App,
 	ItemView,
 	WorkspaceLeaf,
-	FileSystemAdapter,
 	type ViewStateResult,
 	type ViewState,
 	TFile,
@@ -18,8 +17,12 @@ import {
 	Modal,
 	Platform,
 	Scope,
+	AbstractInputSuggest,
+	TFolder,
 	apiVersion,
 	getLinkpath,
+	normalizePath,
+	sanitizeHTMLToDom,
 } from "obsidian";
 import {
 	parseEpub,
@@ -32,13 +35,15 @@ import {
 	EpubBook,
 	EpubDrmError,
 	EpubTocItem,
+	packEpubFolder,
 	type EpubLinkPreview,
+	type EpubPackFs,
 } from "./epub";
 import { OffsetMap, type CursorRange, isRegisterableBlock, REGISTERABLE_BLOCK_SELECTOR } from "./pretext-layer";
 import { isLocalEndpoint, probeProvider, starterModel, type AiProvider, type ProviderKind, type LocalRuntime } from "./ai-client";
 import { findFlaggedDocs, processPendingInFile } from "./ai-queue";
 import { LibraryView, LIBRARY_VIEW_TYPE } from "./library-view";
-import { type LibraryOverride, invalidateMetaCache, LIBRARY_ROOT, companionDocPath, sanitizeFileName } from "./library-scan";
+import { type LibraryOverride, invalidateMetaCache, configureLibraryPaths, libraryRootPath, annotationsFolderPath, DEFAULT_LIBRARY_ROOT, companionDocPath, sanitizeFileName } from "./library-scan";
 // Shared Gloss grammar — the annotation surface, saved-highlight model, and
 // companion-doc writers that the EPUB reader and the PDF controller both drive.
 import {
@@ -59,6 +64,7 @@ import {
 	hitTestHighlightRects,
 	isTextInputFocused,
 	parseSavedHighlights,
+	quickHighlightOn,
 	registerTouchSelectionRaise,
 	type SavedHighlight,
 } from "./gloss";
@@ -146,13 +152,20 @@ interface ThirdMindReaderSettings {
 	 *  which is always pinned leftmost). Also lets a freshly added but still-empty
 	 *  folder appear as a tab. */
 	libraryCollectionOrder: string[];
-	/** One-time flag: the Library shows a feedback hint above the settings gear on
-	 *  first load, then sets this so it never reappears. */
-	feedbackHintShown: boolean;
-	/** One-time flag: the "How to use the reader" help modal auto-opens the first
-	 *  time a book is opened, then sets this so it never auto-opens again. The
-	 *  help button (next to the ToC toggle) re-opens it on demand. */
-	helpShown: boolean;
+	/** Vault folder holding the user's books. Everything else the Library shows
+	 *  — collection tabs, imports — hangs off this. */
+	libraryRoot: string;
+	/** Where companion docs are written. Empty means "derive from `libraryRoot`",
+	 *  which is the normal case; it holds a real path only when the user moved
+	 *  the library and chose to leave existing annotations where they were. */
+	annotationsFolder: string;
+	/** Which one-shot prompts this vault has already seen, keyed by
+	 *  {@link OneTimeKey}. Written through `markSeen`, which persists before the
+	 *  prompt is shown — an in-memory-only flag re-fires after a crash. */
+	seenOnce: Record<string, boolean>;
+	/** Lite mode: a selection opens the Emphasise input directly. Split per platform
+	 *  because data.json syncs — a phone must not inherit the desktop's choice. */
+	quickHighlight: { desktop: boolean; mobile: boolean };
 	/** Reader body text size in px, or `null` to follow Obsidian's own
 	 *  Appearance → Font size (the default). A sentinel rather than a number
 	 *  that happens to match: someone who sets 20 here and later moves the app
@@ -160,6 +173,9 @@ interface ThirdMindReaderSettings {
 	 *  the app's value used to be. */
 	readerFontSize: number | null;
 }
+
+/** Prompts that must fire at most once per vault. */
+type OneTimeKey = "help-modal" | "library-setup";
 
 const DEFAULT_SETTINGS: ThirdMindReaderSettings = {
 	tmrMode: "obsidian",
@@ -174,8 +190,10 @@ const DEFAULT_SETTINGS: ThirdMindReaderSettings = {
 	systemPrompts: { ...DEFAULT_SYSTEM_PROMPTS },
 	libraryOverrides: {},
 	libraryCollectionOrder: [],
-	feedbackHintShown: false,
-	helpShown: false,
+	libraryRoot: DEFAULT_LIBRARY_ROOT,
+	annotationsFolder: "",
+	seenOnce: {},
+	quickHighlight: { desktop: true, mobile: false },
 	readerFontSize: null,
 };
 
@@ -349,8 +367,127 @@ function helpGroups(touch: boolean): { heading: string; rows: HelpRow[] }[] {
 
 /** "How to use the Reader" — a keyboard/action cheat sheet recreated from the
  *  3C DLS `HelpPopoup` component. Auto-opens once on first book open (gated by
- *  `settings.helpShown`); re-openable any time from the help button beside the
+ *  `seenOnce["help-modal"]`); re-openable any time from the help button beside the
  *  ToC toggle. Pure presentation — reads no plugin state. */
+/** Vault-folder autocomplete for the library-path inputs. */
+class FolderSuggest extends AbstractInputSuggest<TFolder> {
+	constructor(app: App, private input: HTMLInputElement) {
+		super(app, input);
+	}
+
+	protected getSuggestions(query: string): TFolder[] {
+		const q = query.trim().toLowerCase();
+		const annotations = annotationsFolderPath();
+		const folders = this.app.vault.getAllLoadedFiles()
+			.filter((f): f is TFolder => f instanceof TFolder && f.path !== "/"
+				&& f.path !== annotations && !f.path.startsWith(`${annotations}/`));
+		return folders.filter((f) => f.path.toLowerCase().includes(q)).slice(0, 50);
+	}
+
+	renderSuggestion(folder: TFolder, el: HTMLElement): void {
+		el.setText(folder.path);
+	}
+
+	selectSuggestion(folder: TFolder): void {
+		this.input.value = folder.path;
+		this.input.dispatchEvent(new Event("input"));
+		this.close();
+	}
+}
+
+/** Fires before the Library folder is created, so an existing epub folder can be
+ *  named instead of getting a second one. Dismissing accepts the default. */
+class LibrarySetupModal extends Modal {
+	private value = DEFAULT_LIBRARY_ROOT;
+	private submitted = false;
+
+	constructor(app: App, private onChoose: (folder: string) => Promise<void>) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		this.setTitle("Where do you keep your books?");
+		contentEl.createEl("p", {
+			text: "Third Mind Reader shows the EPUBs and PDFs in one vault folder. Point it at a folder you already use, or keep the default and it will be created for you.",
+		});
+
+		new Setting(contentEl).setName("Library folder").addText((t) => {
+			t.setPlaceholder(DEFAULT_LIBRARY_ROOT)
+				.setValue(this.value)
+				.onChange((v) => (this.value = v));
+			new FolderSuggest(this.app, t.inputEl);
+			t.inputEl.addEventListener("keydown", (e) => {
+				if (e.key === "Enter") {
+					e.preventDefault();
+					void this.submit();
+				}
+			});
+		});
+
+		new Setting(contentEl).addButton((b) => {
+			b.setButtonText("Use this folder").setCta().onClick(() => void this.submit());
+			// Modal focuses the first input on open, which pops the folder list
+			// straight over this button; start on the button instead.
+			window.setTimeout(() => b.buttonEl.focus(), 0);
+		});
+	}
+
+	private async submit(): Promise<void> {
+		if (this.submitted) return;
+		this.submitted = true;
+		this.close();
+		await this.onChoose(this.value);
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+		if (!this.submitted) {
+			this.submitted = true;
+			void this.onChoose(DEFAULT_LIBRARY_ROOT);
+		}
+	}
+}
+
+/** Declining is a real answer, not a no-op: the old path gets pinned into
+ *  settings so existing books keep their annotations. Closing without choosing
+ *  declines, because the root has already changed by the time this opens. */
+class MoveAnnotationsModal extends Modal {
+	private decided = false;
+
+	constructor(
+		app: App,
+		private from: string,
+		private to: string,
+		private onDecide: (move: boolean) => Promise<void>,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		this.setTitle("Move your annotations too?");
+		contentEl.createEl("p", {
+			text: `Your notes for each book live in ${this.from}. Move them to ${this.to} to sit alongside the new library folder, or leave them where they are — either way nothing is lost.`,
+		});
+		new Setting(contentEl)
+			.addButton((b) => b.setButtonText("Leave them").onClick(() => this.decide(false)))
+			.addButton((b) => b.setButtonText("Move them").setCta().onClick(() => this.decide(true)));
+	}
+
+	private decide(move: boolean): void {
+		if (this.decided) return;
+		this.decided = true;
+		this.close();
+		void this.onDecide(move);
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+		this.decide(false);
+	}
+}
+
 class HelpModal extends Modal {
 	constructor(app: App, private glossSettings: GlossHostSettings) { super(app); }
 
@@ -428,6 +565,7 @@ interface CapacitorGlobal {
 // ─── REGION: ReaderView — Fields ────────────────────────────────────────────
 export class ReaderView extends ItemView {
 	private currentFile: TFile | null = null;
+	private popoutGuardEl: HTMLElement | null = null;
 	private book: EpubBook | null = null;
 
 	private spineIndex = 0;
@@ -470,6 +608,8 @@ export class ReaderView extends ItemView {
 	/** Where the current pointer gesture began, so the click that ends it can be
 	 *  classified as a tap or discarded as a drag. Null between gestures. */
 	private tapStart: { x: number; y: number; t: number } | null = null;
+	/** Set at `pointerdown`: iOS has collapsed the selection by the time `click` runs. */
+	private tapDismisses = false;
 	/** The footnote or citation whose floater a first tap has raised, so the next
 	 *  tap on it is understood as "follow it" rather than "show it again". Null
 	 *  whenever no reference floater is up. Touch only. */
@@ -597,6 +737,9 @@ export class ReaderView extends ItemView {
 	/** Shared hover-preview floater for saved highlights. Child component, so
 	 *  its DOM dies with the view; the PDF controller drives its own instance. */
 	private annotationPreview!: AnnotationPreview;
+	/** Saved-highlight index whose note the open gloss input is editing, or null
+	 *  when the input belongs to a live selection. */
+	private editingNoteIdx: number | null = null;
 
 	private positionSaveTimer: number | null = null;
 
@@ -667,7 +810,10 @@ export class ReaderView extends ItemView {
 			onInputOpen: () => this.syncScrim(),
 		});
 		this.addChild(this.glossSurface);
-		this.annotationPreview = new AnnotationPreview(() => this.plugin.settings);
+		this.annotationPreview = new AnnotationPreview(
+			() => this.plugin.settings,
+			(idx) => this.beginAddNote(idx),
+		);
 		this.addChild(this.annotationPreview);
 		this.pane = new HighlightsPane(this.paneHost());
 		this.addChild(this.pane);
@@ -754,6 +900,8 @@ export class ReaderView extends ItemView {
 		}
 
 		this.renderShell();
+		this.registerEvent(this.app.workspace.on("layout-change", () => this.syncPopoutGuard()));
+		this.syncPopoutGuard();
 
 		this.registerDomEvent(document, "mouseup", () => {
 			this.isDraggingProgress = false;
@@ -884,7 +1032,7 @@ export class ReaderView extends ItemView {
 			// a click there is a suggestion pick, not an outside click.
 			if (
 				this.glossSurface.suggestOpen &&
-				target instanceof Element &&
+				target.instanceOf(Element) &&
 				target.closest(".suggestion-container")
 			)
 				return;
@@ -920,6 +1068,7 @@ export class ReaderView extends ItemView {
 		if (this.mobilePagesTimer !== null) window.clearTimeout(this.mobilePagesTimer);
 		this.mobilePagesTimer = null;
 		this.tapStart = null;
+		this.tapDismisses = false;
 		// Leaving the reader must never strand the user in a view with no navbar —
 		// and now that the hidden state is a body class we own outright, nothing
 		// else will ever take it off. Restored unconditionally rather than via
@@ -943,7 +1092,7 @@ export class ReaderView extends ItemView {
 		this.extendAnchor = null;
 		this.annotationPreview.hide();
 		this.clearHighlightOverlay();
-		if (this.progressTooltipRaf !== null) cancelAnimationFrame(this.progressTooltipRaf);
+		if (this.progressTooltipRaf !== null) window.cancelAnimationFrame(this.progressTooltipRaf);
 		this.progressTooltipRaf = null;
 		// Flush any pending debounced save so the last position isn't lost on close.
 		if (this.positionSaveTimer !== null) {
@@ -1006,7 +1155,7 @@ export class ReaderView extends ItemView {
 					const originatingLeaf = this.leaf;
 					const restoreState = hist.back[hist.back.length - 1].state;
 					void this.plugin.openEpubInNewTab(filePath);
-					setTimeout(() => {
+					window.setTimeout(() => {
 						void originatingLeaf.setViewState(restoreState);
 					}, 0);
 					return;
@@ -1071,7 +1220,7 @@ export class ReaderView extends ItemView {
 		this.annotationPreview.syncTheme();
 		this.pane.syncTheme();
 		this.updateTocFooter();
-		requestAnimationFrame(() => this.renderSavedHighlights());
+		window.requestAnimationFrame(() => this.renderSavedHighlights());
 	}
 
 	private updateTocFooter(): void {
@@ -1099,7 +1248,7 @@ export class ReaderView extends ItemView {
 		// Survive `empty()` — the controls they hide are about to be rebuilt.
 		root.removeClass("tmr-pane-open");
 		root.removeClass("tmr-search-open");
-		root.createEl("div", { cls: "tmr-loading", text: "Opening…" });
+		root.createDiv({ cls: "tmr-loading", text: "Opening…" });
 
 		// Phone toolbar. Deliberately a sibling, not a wrapper: the four corner
 		// controls keep their own absolute positions, and this is only the plate
@@ -1107,14 +1256,14 @@ export class ReaderView extends ItemView {
 		// bar's morph and the pane's toggle mounting untouched. Created before
 		// the controls so it sits under them in paint order as well as z-index,
 		// and it's `pointer-events: none` — never a tap target.
-		const toolbar = root.createEl("div", { cls: "tmr-toolbar" });
-		const toolbarTitle = toolbar.createEl("div", { cls: "tmr-toolbar-title" });
-		this.toolbarChapterEl = toolbarTitle.createEl("span", { cls: "tmr-toolbar-chapter" });
-		this.toolbarBookEl = toolbarTitle.createEl("span", { cls: "tmr-toolbar-book" });
+		const toolbar = root.createDiv({ cls: "tmr-toolbar" });
+		const toolbarTitle = toolbar.createDiv({ cls: "tmr-toolbar-title" });
+		this.toolbarChapterEl = toolbarTitle.createSpan({ cls: "tmr-toolbar-chapter" });
+		this.toolbarBookEl = toolbarTitle.createSpan({ cls: "tmr-toolbar-book" });
 
 		const tocToggle = root.createEl("button", { cls: "tmr-toc-toggle" });
 		setIcon(tocToggle, "table-of-contents");
-		tocToggle.ariaLabel = "Table of Contents";
+		tocToggle.ariaLabel = "Table of contents";
 		this.registerDomEvent(tocToggle, "click", () => this.toggleToc());
 
 		// Paired with the Highlights toggle in the right corner: a bookmark is
@@ -1139,21 +1288,21 @@ export class ReaderView extends ItemView {
 		nextPage.ariaLabel = "Next page";
 		this.registerDomEvent(nextPage, "click", () => void this.advance());
 
-		const tocPanel = root.createEl("div", { cls: "tmr-toc" });
+		const tocPanel = root.createDiv({ cls: "tmr-toc" });
 		// Closed slide-in panels are translated off-canvas but stay rendered
 		// and focusable; inert keeps Tab out of them. Without it, focusing a
 		// hidden control makes the browser scroll .view-content sideways to
 		// reveal it, shoving the whole reader (overflow:hidden doesn't stop
 		// focus-scroll). Synced in toggleToc / toggleHighlightsPanel.
 		tocPanel.inert = true;
-		const tocHeader = tocPanel.createEl("div", { cls: "tmr-toc-header" });
-		this.tocTitleEl = tocHeader.createEl("span", { cls: "tmr-toc-title", text: "Contents" });
+		const tocHeader = tocPanel.createDiv({ cls: "tmr-toc-header" });
+		this.tocTitleEl = tocHeader.createSpan({ cls: "tmr-toc-title", text: "Contents" });
 		const tocClose = tocHeader.createEl("button", { cls: "tmr-pane-hdr-btn tmr-toc-close" });
 		setIcon(tocClose, "x");
 		this.registerDomEvent(tocClose, "click", () => this.toggleToc());
-		this.tocListEl = tocPanel.createEl("div", { cls: "tmr-toc-list" });
+		this.tocListEl = tocPanel.createDiv({ cls: "tmr-toc-list" });
 
-		const tocFooter = tocPanel.createEl("div", { cls: "tmr-toc-footer" });
+		const tocFooter = tocPanel.createDiv({ cls: "tmr-toc-footer" });
 		// Leftmost by design: the theme button hides itself outside 3C mode, so
 		// anything to its right would shift position whenever 3C is toggled.
 		const helpBtn = tocFooter.createEl("button", { cls: "tmr-toc-help-btn" });
@@ -1161,8 +1310,7 @@ export class ReaderView extends ItemView {
 		helpBtn.ariaLabel = "How to use the reader";
 		this.registerDomEvent(helpBtn, "click", () => new HelpModal(this.app, this.plugin.settings).open());
 		const modeBtn = tocFooter.createEl("button", { cls: "tmr-toc-mode-btn" });
-		// eslint-disable-next-line no-unsanitized/property -- Safe: LOGO_3C_SVG is a compile-time SVG constant.
-		modeBtn.innerHTML = LOGO_3C_SVG;
+		modeBtn.appendChild(sanitizeHTMLToDom(LOGO_3C_SVG));
 		this.registerDomEvent(modeBtn, "click", () => void this.toggleTmrMode());
 		const themeBtn = tocFooter.createEl("button", { cls: "tmr-toc-theme-btn" });
 		this.registerDomEvent(themeBtn, "click", async () => {
@@ -1172,7 +1320,7 @@ export class ReaderView extends ItemView {
 
 		this.makePaneResizable(tocPanel, "right");
 
-		const tocBackdrop = root.createEl("div", { cls: "tmr-toc-backdrop" });
+		const tocBackdrop = root.createDiv({ cls: "tmr-toc-backdrop" });
 		this.registerDomEvent(tocBackdrop, "click", () => this.toggleToc());
 
 		// Book search — one morphing element (the library-search pattern): a
@@ -1180,9 +1328,9 @@ export class ReaderView extends ItemView {
 		// into the field on open (right-anchored, so width growth IS leftward
 		// expansion). Results drop into a separate card beneath it. See the
 		// In-Book Search spec + BookSearchButton components.
-		const searchBar = root.createEl("div", { cls: "tmr-search-bar" });
+		const searchBar = root.createDiv({ cls: "tmr-search-bar" });
 		searchBar.ariaLabel = "Search in book";
-		const searchIcon = searchBar.createEl("span", { cls: "tmr-search-bar-icon" });
+		const searchIcon = searchBar.createSpan({ cls: "tmr-search-bar-icon" });
 		setIcon(searchIcon, "tmr-icon-book-search");
 		this.searchInputEl = searchBar.createEl("input", {
 			cls: "tmr-book-search-input",
@@ -1195,7 +1343,7 @@ export class ReaderView extends ItemView {
 		const searchClear = searchBar.createEl("button", { cls: "tmr-book-search-clear" });
 		setIcon(searchClear, "x");
 		searchClear.ariaLabel = "Clear search";
-		this.searchResultsEl = root.createEl("div", { cls: "tmr-book-search tmr-hidden" });
+		this.searchResultsEl = root.createDiv({ cls: "tmr-book-search tmr-hidden" });
 		this.searchBarEl = searchBar;
 		this.searchOpen = false;
 		this.searchQuery = "";
@@ -1257,13 +1405,13 @@ export class ReaderView extends ItemView {
 		this.pane.mount(root);
 		this.applyAiFeaturesState();
 
-		this.spreadEl = root.createEl("div", { cls: "tmr-spread tmr-hidden" });
-		this.contentNode = this.spreadEl.createEl("div", { cls: "tmr-content" });
+		this.spreadEl = root.createDiv({ cls: "tmr-spread tmr-hidden" });
+		this.contentNode = this.spreadEl.createDiv({ cls: "tmr-content" });
 		this.syncSpreadLayoutMode(this.spreadEl);
 
-		this.cacheHost = root.createEl("div", { cls: "tmr-hidden" });
-		this.prevHost = this.cacheHost.createEl("div");
-		this.nextHost = this.cacheHost.createEl("div");
+		this.cacheHost = root.createDiv({ cls: "tmr-hidden" });
+		this.prevHost = this.cacheHost.createDiv();
+		this.nextHost = this.cacheHost.createDiv();
 
 		this.resizeObserver?.disconnect();
 		// Observe the BORDER box, not the default content box. The spread's
@@ -1402,26 +1550,32 @@ export class ReaderView extends ItemView {
 		// already claimed link and highlight taps via preventDefault.
 		this.registerDomEvent(root, "pointerdown", (e: PointerEvent) => {
 			this.tapStart = { x: e.clientX, y: e.clientY, t: Date.now() };
+			const sel = window.getSelection();
+			this.tapDismisses = this.glossSurface.barVisible || !!(sel && !sel.isCollapsed);
 		});
 		this.registerDomEvent(root, "click", (e: MouseEvent) => {
 			const start = this.tapStart;
+			const dismissing = this.tapDismisses;
 			this.tapStart = null;
+			this.tapDismisses = false;
 			if (!Platform.isMobile || !start || e.defaultPrevented) return;
 			if (Date.now() - start.t > ReaderView.TAP_MAX_MS) return;
 			if (Math.abs(e.clientX - start.x) > ReaderView.TAP_SLOP_PX) return;
 			if (Math.abs(e.clientY - start.y) > ReaderView.TAP_SLOP_PX) return;
+			// After the drag tests: a selection-handle drag is discarded, not consumed.
+			if (dismissing) return;
 			this.handleReaderTap(e);
 		});
 
-		const footer = root.createEl("div", { cls: "tmr-footer" });
-		this.localPageEl = footer.createEl("span", { cls: "tmr-page-info" });
-		this.progressBarEl = footer.createEl("div", { cls: "tmr-progress-bar" });
+		const footer = root.createDiv({ cls: "tmr-footer" });
+		this.localPageEl = footer.createSpan({ cls: "tmr-page-info" });
+		this.progressBarEl = footer.createDiv({ cls: "tmr-progress-bar" });
 		// Phone track: one chapter-scoped bar where desktop has a segment per
 		// section. Lives inside `.tmr-progress-bar` so it shares a coordinate
 		// space with the back pill and its marker, which carry over unchanged.
-		const mobileTrack = this.progressBarEl.createEl("div", { cls: "tmr-mobile-progress" });
-		this.mobileFillEl = mobileTrack.createEl("div", { cls: "tmr-mobile-progress-fill" });
-		const backMarker = this.progressBarEl.createEl("div", { cls: "tmr-progress-back-marker tmr-hidden" });
+		const mobileTrack = this.progressBarEl.createDiv({ cls: "tmr-mobile-progress" });
+		this.mobileFillEl = mobileTrack.createDiv({ cls: "tmr-mobile-progress-fill" });
+		const backMarker = this.progressBarEl.createDiv({ cls: "tmr-progress-back-marker tmr-hidden" });
 		// The dot marks the return point on the bar and clicking it returns there.
 		// It lives and dies with the pill (see registerReadingTurn) — there is no
 		// state where one is on screen without the other.
@@ -1430,24 +1584,24 @@ export class ReaderView extends ItemView {
 			void this.goBack();
 		});
 		const backBtn = this.progressBarEl.createEl("button", { cls: "tmr-progress-back tmr-hidden" });
-		const backIcon = backBtn.createEl("span", { cls: "tmr-progress-back-icon" });
+		const backIcon = backBtn.createSpan({ cls: "tmr-progress-back-icon" });
 		setIcon(backIcon, "redo-2");
-		backBtn.createEl("span", { cls: "tmr-progress-back-label", text: "Back" });
+		backBtn.createSpan({ cls: "tmr-progress-back-label", text: "Back" });
 		this.registerDomEvent(backBtn, "click", (e) => {
 			e.stopPropagation();
 			void this.goBack();
 		});
-		this.progressTipEl = this.progressBarEl.createEl("div", { cls: "tmr-progress-tooltip tmr-hidden" });
+		this.progressTipEl = this.progressBarEl.createDiv({ cls: "tmr-progress-tooltip tmr-hidden" });
 		this.registerDomEvent(this.progressBarEl, "mousedown", (e) => this.onProgressMouseDown(e));
 		this.registerDomEvent(this.progressBarEl, "mousemove", (e) => this.onProgressMouseMove(e));
 		this.registerDomEvent(this.progressBarEl, "mouseleave", () => {
 			this.progressTipEl?.addClass("tmr-hidden");
 		});
-		this.globalPageEl = footer.createEl("span", { cls: "tmr-global-page" });
+		this.globalPageEl = footer.createSpan({ cls: "tmr-global-page" });
 		// Hangs off the root, not the footer: the footer *is* the bar on a phone
 		// and moves and resizes with it, while this line has to hold still
 		// relative to the screen (above the bar, then below the navbar).
-		this.mobilePagesEl = root.createEl("span", { cls: "tmr-mobile-pages" });
+		this.mobilePagesEl = root.createSpan({ cls: "tmr-mobile-pages" });
 
 		this.applyThemeClasses();
 	}
@@ -1476,7 +1630,7 @@ export class ReaderView extends ItemView {
 			// focus (`t` is gated on `!typing`, and Escape closes the search
 			// before it reaches the ToC).
 			this.searchBarEl?.addClass("tmr-search-bar-hidden");
-			requestAnimationFrame(() => {
+			window.requestAnimationFrame(() => {
 				const active = this.contentEl.querySelector(".tmr-toc-item.tmr-toc-active");
 				active?.scrollIntoView({ block: "center", behavior: "smooth" });
 			});
@@ -1543,7 +1697,7 @@ export class ReaderView extends ItemView {
 
 	private renderTocItems(items: EpubTocItem[], container: HTMLElement, level: number): void {
 		for (const item of items) {
-			const el = container.createEl("div", { cls: "tmr-toc-item", text: item.label });
+			const el = container.createDiv({ cls: "tmr-toc-item", text: item.label });
 			el.dataset.href = item.href;
 			el.dataset.level = String(level);
 			el.style.paddingLeft = `${1 + level * 1.25}rem`;
@@ -1669,14 +1823,14 @@ export class ReaderView extends ItemView {
 		const hits = this.runBookSearch(index, query);
 		this.searchHits = hits;
 		if (hits.length === 0) {
-			host.createEl("div", { cls: "tmr-book-search-empty", text: "No matches" });
+			host.createDiv({ cls: "tmr-book-search-empty", text: "No matches" });
 			return;
 		}
 		const hlRanges = this.savedHighlights.length > 0
 			? this.buildSearchHighlightRanges(index)
 			: null;
 		hits.slice(0, SEARCH_RENDER_CAP).forEach((hit, i) => {
-			const row = host.createEl("div", { cls: "tmr-book-search-row" });
+			const row = host.createDiv({ cls: "tmr-book-search-row" });
 			row.dataset.hitIdx = String(i);
 			// Hits inside a saved highlight re-add the annotation card's accent
 			// bar + mode icon slots; plain hits stay bare.
@@ -1684,16 +1838,16 @@ export class ReaderView extends ItemView {
 				?.find((r) => hit.start < r.end && hit.end > r.start);
 			if (overlap) {
 				row.dataset.glossMode = overlap.mode;
-				const iconEl = row.createEl("span", { cls: "tmr-book-search-row-icon" });
+				const iconEl = row.createSpan({ cls: "tmr-book-search-row-icon" });
 				const modeMeta = GLOSS_MODES.find((m) => m.id === overlap.mode);
 				if (modeMeta) setIcon(iconEl, modeMeta.icon);
 			}
-			const rowBody = row.createEl("div", { cls: "tmr-book-search-row-body" });
-			rowBody.createEl("div", {
+			const rowBody = row.createDiv({ cls: "tmr-book-search-row-body" });
+			rowBody.createDiv({
 				cls: "tmr-book-search-row-section",
 				text: this.sections[hit.entry.sectionIdx]?.label ?? "—",
 			});
-			const snippet = rowBody.createEl("div", { cls: "tmr-book-search-row-snippet" });
+			const snippet = rowBody.createDiv({ cls: "tmr-book-search-row-snippet" });
 			const parts = this.searchSnippet(hit);
 			snippet.appendText(parts.before);
 			snippet.createEl("strong", { text: parts.match });
@@ -1701,7 +1855,7 @@ export class ReaderView extends ItemView {
 		});
 		if (hits.length > SEARCH_RENDER_CAP) {
 			const capped = hits.length >= SEARCH_MAX_HITS;
-			host.createEl("div", {
+			host.createDiv({
 				cls: "tmr-book-search-more",
 				text: `${hits.length - SEARCH_RENDER_CAP}${capped ? "+" : ""} more — refine your search`,
 			});
@@ -1816,7 +1970,7 @@ export class ReaderView extends ItemView {
 		else if (entry?.element) this.scrollToTarget(entry.element);
 		// Flash on the next frame so the rects measure against settled layout
 		// (same reason renderSavedHighlights paints in rAF after a mount).
-		requestAnimationFrame(() => this.flashSearchMatch(resolvedId, hit));
+		window.requestAnimationFrame(() => this.flashSearchMatch(resolvedId, hit));
 		// Keep the walk-every-mention flow: focus returns to the field so the
 		// next keystroke refines the query instead of firing a reader hotkey.
 		this.searchInputEl?.focus();
@@ -1831,11 +1985,11 @@ export class ReaderView extends ItemView {
 	private flashSearchMatch(paraId: string, hit: BookSearchHit): void {
 		if (!this.contentNode) return;
 		this.contentNode.querySelectorAll(".tmr-search-flash-overlay").forEach((n) => n.remove());
-		const overlay = document.createElement("div");
+		const overlay = createDiv();
 		overlay.className = "tmr-search-flash-overlay";
 		const contentRect = this.contentNode.getBoundingClientRect();
 		for (const r of this.rectsForCharRange(paraId, hit.start, hit.end)) {
-			const rectEl = document.createElement("div");
+			const rectEl = createDiv();
 			rectEl.className = "tmr-search-flash-rect";
 			rectEl.style.left = `${r.left - contentRect.left}px`;
 			rectEl.style.top = `${r.top - contentRect.top}px`;
@@ -2027,9 +2181,9 @@ export class ReaderView extends ItemView {
 			// and the book is already readable. It repaints itself when it lands.
 			void this.processQueuedExchanges();
 			// First book open ever: surface the cheat sheet once, then remember.
-			if (!this.plugin.settings.helpShown) {
-				this.plugin.settings.helpShown = true;
-				void this.plugin.saveSettings();
+			// Left unmarked while setup is showing, so the next book open shows it.
+			if (!this.plugin.hasSeen("help-modal") && !this.plugin.librarySetupPending) {
+				void this.plugin.markSeen("help-modal");
 				new HelpModal(this.app, this.plugin.settings).open();
 			}
 		} catch (err) {
@@ -2143,7 +2297,7 @@ export class ReaderView extends ItemView {
 		let lastW = -1;
 		let lastH = -1;
 		for (let i = 0; i < maxFrames; i++) {
-			await new Promise<void>((r) => requestAnimationFrame(() => r()));
+			await new Promise<void>((r) => window.requestAnimationFrame(() => r()));
 			if (!this.spreadEl) return;
 			const w = this.spreadEl.clientWidth;
 			const h = this.spreadEl.clientHeight;
@@ -2160,8 +2314,8 @@ export class ReaderView extends ItemView {
 
 	private ensureMeasurementNodes(): void {
 		if (!this.contentEl || this.measurementSpreadEl) return;
-		const spread = this.contentEl.createEl("div", { cls: "tmr-spread tmr-measure-host" });
-		const content = spread.createEl("div", { cls: "tmr-content" });
+		const spread = this.contentEl.createDiv({ cls: "tmr-spread tmr-measure-host" });
+		const content = spread.createDiv({ cls: "tmr-content" });
 		this.measurementSpreadEl = spread;
 		this.measurementContentEl = content;
 	}
@@ -2275,7 +2429,7 @@ export class ReaderView extends ItemView {
 			this.sectionColumnCounts[i] = measured.columns;
 			// Yield a frame only when real measurement work happened — a cache-hit
 			// rebuild (returning to a known pane size) runs without pacing.
-			if (!measured.fromCache) await new Promise<void>((r) => requestAnimationFrame(() => r()));
+			if (!measured.fromCache) await new Promise<void>((r) => window.requestAnimationFrame(() => r()));
 		}
 
 		for (let i = 0; i < this.sections.length; i++) {
@@ -2356,7 +2510,7 @@ export class ReaderView extends ItemView {
 		const existing = this.unitDomCache.get(key);
 		if (existing) return existing;
 
-		const node = document.createElement("div");
+		const node = createDiv();
 		node.className = "tmr-unit";
 		await renderSpineRange(this.book, unit.startSpine, unit.endSpine, node);
 		this.annotateItalicBlocks(node);
@@ -2877,7 +3031,7 @@ export class ReaderView extends ItemView {
 	private getZoomFactor(): number {
 		if (Platform.isMobile) return 1;
 		try {
-			// eslint-disable-next-line @typescript-eslint/no-require-imports -- Electron's webFrame is only reachable via require() in Obsidian's renderer.
+			// eslint-disable-next-line @typescript-eslint/no-require-imports, no-undef -- Electron's webFrame is only reachable via require() in Obsidian's renderer.
 			const { webFrame } = require("electron") as { webFrame: { getZoomFactor: () => number } };
 			const factor = webFrame.getZoomFactor();
 			return Number.isFinite(factor) && factor > 0 ? factor : 1;
@@ -3331,7 +3485,13 @@ export class ReaderView extends ItemView {
 		this.activeSelectionRect = anchorRect;
 		this.renderHighlightOverlay(cursorRange);
 		this.glossSurface.hideInput();
-		this.glossSurface.showBar(anchorRect, this.selectionReachesSpreadEnd(sel));
+		// The bar still wins at the page end — extend is the only cross-boundary path.
+		const canExtend = this.selectionReachesSpreadEnd(sel);
+		if (quickHighlightOn(this.plugin.settings) && !canExtend) {
+			this.glossSurface.openInput("emphasise", anchorRect, true);
+			return;
+		}
+		this.glossSurface.showBar(anchorRect, canExtend);
 	}
 
 	/** True when the selection ends on the last visible line of the spread —
@@ -3470,7 +3630,7 @@ export class ReaderView extends ItemView {
 
 	private ensureExtendHint(): HTMLElement {
 		if (this.extendHintEl) return this.extendHintEl;
-		const el = document.body.createEl("div", {
+		const el = document.body.createDiv({
 			cls: "tmr-extend-hint tmr-hidden",
 			text: "Turn the page, then click where the highlight should end · Esc to cancel",
 		});
@@ -3495,6 +3655,11 @@ export class ReaderView extends ItemView {
 	/** A gloss tile was submitted. `text` is already trimmed and validated by the
 	 *  surface (only Emphasise may be empty). */
 	private async onGlossSubmit(mode: string, userText: string): Promise<void> {
+		if (this.editingNoteIdx !== null) {
+			await this.pane.commitNoteEdit(this.editingNoteIdx, userText);
+			this.dismissGloss();
+			return;
+		}
 		const highlight = this.activeHighlight;
 		if (!highlight) return;
 		const quote = this.activeSelectionText ?? "";
@@ -3861,7 +4026,7 @@ export class ReaderView extends ItemView {
 		this.contentNode.querySelectorAll(".tmr-saved-highlight-overlay").forEach((n) => n.remove());
 		if (this.savedHighlights.length === 0) return;
 
-		const overlay = document.createElement("div");
+		const overlay = createDiv();
 		overlay.className = "tmr-saved-highlight-overlay";
 		const contentRect = this.contentNode.getBoundingClientRect();
 
@@ -3886,7 +4051,7 @@ export class ReaderView extends ItemView {
 			if (!entry || !this.contentNode.contains(entry.element)) continue;
 
 			for (const r of this.savedHighlightRects(saved, resolvedId)) {
-				const rectEl = document.createElement("div");
+				const rectEl = createDiv();
 				rectEl.className = "tmr-saved-highlight-rect";
 				if (idx === this.pane.activeConversationIdx) {
 					rectEl.classList.add("tmr-saved-highlight-rect-active");
@@ -3919,14 +4084,14 @@ export class ReaderView extends ItemView {
 			!overlay ||
 			this.savedHighlights.length === 0
 		) {
-			this.hideAnnotationPreview();
+			this.hideAnnotationPreview(true);
 			return;
 		}
 
 		const matchedIdx = hitTestHighlightRects(overlay, e.clientX, e.clientY);
 		const saved = matchedIdx === -1 ? null : this.savedHighlights[matchedIdx];
 		if (!saved) {
-			this.hideAnnotationPreview();
+			this.hideAnnotationPreview(true);
 			return;
 		}
 		this.annotationPreview.showFor(matchedIdx, saved, e.clientX, e.clientY);
@@ -3989,8 +4154,22 @@ export class ReaderView extends ItemView {
 		return true;
 	}
 
-	private hideAnnotationPreview(): void {
-		if (this.annotationPreview.hoveredIdx !== -1) this.annotationPreview.hide();
+	/** `soft` is the pointer-left-the-rect case, which gives a floater carrying
+	 *  the add-note line time to be reached. Every other caller means it. */
+	private hideAnnotationPreview(soft = false): void {
+		if (this.annotationPreview.hoveredIdx === -1) return;
+		if (soft) this.annotationPreview.hideSoft();
+		else this.annotationPreview.hide();
+	}
+
+	/** "+ Add a note" on a note-less Emphasise preview. `editingNoteIdx` is what
+	 *  routes the submit to that highlight instead of to a live selection. */
+	private beginAddNote(idx: number): void {
+		if (!this.savedHighlights[idx]) return;
+		const rect = this.annotationPreview.anchorRect;
+		this.annotationPreview.hide();
+		this.editingNoteIdx = idx;
+		this.glossSurface.openInput("emphasise", rect, true);
 	}
 
 	private getCompanionDocPath(): string | null {
@@ -4043,13 +4222,13 @@ export class ReaderView extends ItemView {
 		const ranges = this.offsetMap.cursorsToRanges(cursorRange);
 		if (ranges.length === 0) return;
 
-		const overlay = document.createElement("div");
+		const overlay = createDiv();
 		overlay.className = "tmr-highlight-overlay";
 		const contentRect = this.contentNode.getBoundingClientRect();
 		for (const range of ranges) {
 			for (const r of Array.from(range.getClientRects())) {
 				if (r.width === 0 || r.height === 0) continue;
-				const rectEl = document.createElement("div");
+				const rectEl = createDiv();
 				rectEl.className = "tmr-highlight-rect";
 				rectEl.style.left = `${r.left - contentRect.left}px`;
 				rectEl.style.top = `${r.top - contentRect.top}px`;
@@ -4070,6 +4249,7 @@ export class ReaderView extends ItemView {
 
 	private dismissGloss(): void {
 		this.glossSurface.hide();
+		this.editingNoteIdx = null;
 		this.activeSelectionText = null;
 		this.activeSelectionRect = null;
 		// Tear down any armed extend (Escape-cancel, outside-click, or a unit
@@ -4086,7 +4266,7 @@ export class ReaderView extends ItemView {
 
 	private ensureTooltipNode(): HTMLElement {
 		if (this.tooltipEl) return this.tooltipEl;
-		const el = document.body.createEl("div", { cls: "tmr-tooltip tmr-hidden" });
+		const el = document.body.createDiv({ cls: "tmr-tooltip tmr-hidden" });
 		this.tooltipEl = el;
 		applyGlossTheme(el, this.plugin.settings);
 		return el;
@@ -4189,11 +4369,11 @@ export class ReaderView extends ItemView {
 		this.progressBarEl.querySelectorAll(".tmr-progress-segment").forEach((el) => el.remove());
 		const backBtn = this.progressBarEl.querySelector(".tmr-progress-back");
 		for (let i = 0; i < this.sections.length; i++) {
-			const seg = createEl("div", { cls: "tmr-progress-segment" });
+			const seg = createDiv({ cls: "tmr-progress-segment" });
 			seg.dataset.section = String(i);
 			seg.dataset.label = this.sections[i].label;
 			seg.style.flexGrow = String(this.sectionSpreadCounts[i] ?? 1);
-			seg.createEl("div", { cls: "tmr-progress-segment-fill" });
+			seg.createDiv({ cls: "tmr-progress-segment-fill" });
 			this.progressBarEl.insertBefore(seg, backBtn);
 		}
 	}
@@ -4280,7 +4460,7 @@ export class ReaderView extends ItemView {
 		if (Platform.isMobile) return;
 		this.pendingProgressMouseEvent = e;
 		if (this.progressTooltipRaf !== null) return;
-		this.progressTooltipRaf = requestAnimationFrame(() => {
+		this.progressTooltipRaf = window.requestAnimationFrame(() => {
 			this.progressTooltipRaf = null;
 			const ev = this.pendingProgressMouseEvent;
 			this.pendingProgressMouseEvent = null;
@@ -4432,9 +4612,9 @@ export class ReaderView extends ItemView {
 			el.empty();
 			el.toggleClass("tmr-mobile-pages-marked", marked);
 			if (marked) {
-				setIcon(el.createEl("span", { cls: "tmr-mobile-pages-icon" }), BOOKMARK_MODE.icon);
+				setIcon(el.createSpan({ cls: "tmr-mobile-pages-icon" }), BOOKMARK_MODE.icon);
 			}
-			el.createEl("span", {
+			el.createSpan({
 				text: !chromeUp
 					? String(this.mobileLocalPage)
 					: left === 0
@@ -4773,12 +4953,51 @@ export class ReaderView extends ItemView {
 			loading.addClass("tmr-error");
 		}
 	}
+
+	/** Pop-out windows are unsupported: the reader's listeners and floaters all
+	 *  live on the main window, so a popped-out book is covered rather than left
+	 *  half-working. Re-run on layout change, since tabs move between windows. */
+	private syncPopoutGuard(): void {
+		const poppedOut = this.containerEl.win !== window;
+		if (!poppedOut) {
+			this.popoutGuardEl?.remove();
+			this.popoutGuardEl = null;
+			return;
+		}
+		if (this.popoutGuardEl) return;
+		const guard = this.containerEl.createDiv({ cls: "tmr-popout-guard" });
+		this.popoutGuardEl = guard;
+		guard.createDiv({ cls: "tmr-popout-guard-title", text: "Third Mind Reader only works in the main window" });
+		guard.createDiv({
+			cls: "tmr-popout-guard-text",
+			text: "Pop-out windows aren't supported yet. Move this book back to keep reading.",
+		});
+		const btn = guard.createEl("button", { cls: "mod-cta", text: "Move to main window" });
+		this.registerDomEvent(btn, "click", () => void this.moveToMainWindow());
+	}
+
+	private async moveToMainWindow(): Promise<void> {
+		const file = this.currentFile;
+		if (!file) return;
+		const { workspace } = this.app;
+		const mainLeaf = workspace.getMostRecentLeaf(workspace.rootSplit);
+		if (mainLeaf) workspace.setActiveLeaf(mainLeaf, { focus: true });
+		// Detached first so the position flush on close lands before the new tab reads it.
+		this.leaf.detach();
+		await workspace.getLeaf("tab").openFile(file);
+	}
 }
 
 // ─── REGION: ThirdMindReader Plugin ──────────────────────────────────────────
 export default class ThirdMindReader extends Plugin {
 	_openingEpub = false;
 	settings: ThirdMindReaderSettings = { ...DEFAULT_SETTINGS };
+	/** True when this load found no data.json — the only reliable "never been
+	 *  set up" signal, since every other field has a default. */
+	private freshInstall = false;
+	/** Set before any view can open, so a book restored at launch can't stack the
+	 *  cheat sheet on top of the setup prompt. */
+	librarySetupPending = false;
 	/** Debounce timer collapsing a burst of vault events (e.g. a folder move) into
 	 *  a single Library re-scan. */
 	private _libraryRefreshTimer: number | null = null;
@@ -4789,6 +5008,7 @@ export default class ThirdMindReader extends Plugin {
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
+		this.librarySetupPending = !this.hasSeen("library-setup");
 		// Obsidian's bundled Lucide set predates `book-search` — register the
 		// glyph ourselves (Lucide 24-grid paths scaled onto Obsidian's 100-grid).
 		// setIcon stamps this id as a class on the svg, so it must not collide
@@ -4805,10 +5025,8 @@ export default class ThirdMindReader extends Plugin {
 		this.addRibbonIcon("library", "Open Library", () => this.activateLibraryView());
 		this.addReaderCommands();
 
-		// Make sure the Library folder exists so the empty-state prompt ("drop
-		// .epub files into your Library folder") points somewhere real on a fresh
-		// install. Non-blocking — failure just falls back to lazy creation.
-		void this.ensureLibraryFolder();
+		// Layout-ready, so the prompt never races Obsidian's own startup UI.
+		this.app.workspace.onLayoutReady(() => void this.runLibrarySetup());
 
 		// Intercept epub clicks so a book always lands in its own tab instead of
 		// replacing the active leaf (mirrors Cmd+Click). Two sources: the file
@@ -4877,7 +5095,7 @@ export default class ThirdMindReader extends Plugin {
 	 *  had no graph edge to its book. Quote the value wherever the old form
 	 *  survives. Runs each load; no-ops once every doc is migrated. */
 	private async repairCompanionSourceLinks(): Promise<void> {
-		const folder = this.app.vault.getFolderByPath(LIBRARY_ROOT + "/Annotations");
+		const folder = this.app.vault.getFolderByPath(annotationsFolderPath());
 		if (!folder) return;
 		for (const child of folder.children) {
 			if (!(child instanceof TFile) || child.extension !== "md") continue;
@@ -4895,13 +5113,69 @@ export default class ThirdMindReader extends Plugin {
 		}
 	}
 
+	/** Marked seen up front: a prompt that reappears because the answer wasn't
+	 *  saved is worse than one missed once. */
+	private async runLibrarySetup(): Promise<void> {
+		if (this.hasSeen("library-setup")) {
+			await this.ensureLibraryFolder();
+			return;
+		}
+		await this.markSeen("library-setup");
+		new LibrarySetupModal(this.app, (folder) => {
+			this.librarySetupPending = false;
+			return this.applyLibraryRoot(folder);
+		}).open();
+	}
+
+	/** Companion docs follow the root by default, so any already under the old one
+	 *  need a decision before they're left behind. */
+	async applyLibraryRoot(next: string): Promise<void> {
+		const target = normalizePath(next.trim() || DEFAULT_LIBRARY_ROOT);
+		const previousAnnotations = annotationsFolderPath();
+		const derived = this.settings.annotationsFolder === "";
+		this.settings.libraryRoot = target;
+		await this.saveSettings();
+		await this.ensureLibraryFolder();
+		invalidateMetaCache();
+		this.refreshLibraryViews();
+
+		if (!derived) return;
+		const nextAnnotations = annotationsFolderPath();
+		if (nextAnnotations === previousAnnotations) return;
+		const existing = this.app.vault.getFolderByPath(previousAnnotations);
+		if (!existing || existing.children.length === 0) return;
+		new MoveAnnotationsModal(this.app, previousAnnotations, nextAnnotations, (move) =>
+			this.resolveAnnotationsMove(move, previousAnnotations, nextAnnotations)).open();
+	}
+
+	private async resolveAnnotationsMove(move: boolean, from: string, to: string): Promise<void> {
+		const pinToOldLocation = async (notice?: string): Promise<void> => {
+			this.settings.annotationsFolder = from;
+			await this.saveSettings();
+			if (notice) new Notice(notice);
+		};
+		if (!move) return pinToOldLocation();
+
+		const folder = this.app.vault.getFolderByPath(from);
+		if (!folder) return;
+		try {
+			if (this.app.vault.getAbstractFileByPath(to)) throw new Error(`${to} already exists`);
+			// renameFile, not vault.rename: this one rewrites every link pointing
+			// into the folder, including each companion doc's `source:` wikilink.
+			await this.app.fileManager.renameFile(folder, to);
+			this.refreshLibraryViews();
+		} catch (e) {
+			await pinToOldLocation(`Couldn't move annotations: ${(e as Error).message}. They're still in ${from}.`);
+		}
+	}
+
 	/** Create the `Library/` root on load if it's missing, so a fresh install
 	 *  has the folder the empty-state prompt tells users to drop epubs into.
 	 *  Idempotent and tolerant of a parallel creation race. */
 	private async ensureLibraryFolder(): Promise<void> {
-		if (this.app.vault.getFolderByPath(LIBRARY_ROOT)) return;
+		if (this.app.vault.getFolderByPath(libraryRootPath())) return;
 		try {
-			await this.app.vault.createFolder(LIBRARY_ROOT);
+			await this.app.vault.createFolder(libraryRootPath());
 		} catch {
 			// Already created (race or pre-existing) — nothing to do.
 		}
@@ -4912,7 +5186,7 @@ export default class ThirdMindReader extends Plugin {
 	 *  metadata/marks caches honest, and refreshes any open Library view when its
 	 *  `Library/` contents change — no manual reload needed. */
 	private registerVaultEvents(): void {
-		const inLibrary = (p: string) => p === LIBRARY_ROOT || p.startsWith(LIBRARY_ROOT + "/");
+		const inLibrary = (p: string) => p === libraryRootPath() || p.startsWith(libraryRootPath() + "/");
 
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
@@ -5007,13 +5281,18 @@ export default class ThirdMindReader extends Plugin {
 		this.addCommand({
 			id: "open-library",
 			name: "Open Library",
-			hotkeys: [{ modifiers: ["Mod", "Shift"], key: "l" }],
 			callback: () => this.activateLibraryView(),
+		});
+		this.addCommand({
+			// Unscoped, unlike every other reader command: the way back in must not
+			// require a book already open.
+			id: "show-reader-help",
+			name: "How to use the reader",
+			callback: () => new HelpModal(this.app, this.settings).open(),
 		});
 		this.addCommand({
 			id: "open-annotations",
 			name: "Open annotation notes",
-			hotkeys: [{ modifiers: ["Mod", "Shift"], key: "a" }],
 			checkCallback: (checking) => {
 				const v = this.activeReaderView();
 				if (!v) return false;
@@ -5165,7 +5444,7 @@ export default class ThirdMindReader extends Plugin {
 		// eslint.config.mjs because of this one site: the @font-face data-URLs
 		// are compiled into main.js (esbuild dataurl loader), so this CSS only
 		// exists at runtime and can't live in styles.css.
-		const el = document.createElement("style");
+		const el = createEl("style");
 		el.id = "tmr-bundled-fonts";
 		el.textContent = css;
 		document.head.appendChild(el);
@@ -5220,10 +5499,9 @@ export default class ThirdMindReader extends Plugin {
 	async loadSettings(): Promise<void> {
 		const data = (await this.loadData()) as Partial<ThirdMindReaderSettings> | null;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
-		// Beta-only: re-show the Library feedback hint after every reload/update so
-		// testers are reminded where to report. Reset in-memory on each load (no
-		// persist needed); drop this line together with FEEDBACK_BETA for 1.0.
-		this.settings.feedbackHintShown = false;
+		this.freshInstall = data === null;
+		this.settings.seenOnce = { ...this.settings.seenOnce };
+		configureLibraryPaths(this.settings.libraryRoot, this.settings.annotationsFolder);
 		// Fresh object with every mode filled — guards against a shared
 		// reference to DEFAULT_SETTINGS and forward-compat for new modes.
 		this.settings.systemPrompts = { ...DEFAULT_SYSTEM_PROMPTS, ...this.settings.systemPrompts };
@@ -5248,7 +5526,36 @@ export default class ThirdMindReader extends Plugin {
 			this.settings.aiFeaturesEnabled = true;
 			needsPersist = true;
 		}
+		// Object.assign copies unknown stored keys onto settings, so the migrated
+		// booleans have to be deleted after reading or they persist forever.
+		const legacy = (data ?? {}) as Record<string, unknown>;
+		const stored = this.settings as unknown as Record<string, unknown>;
+		if (legacy.helpShown === true) { this.settings.seenOnce["help-modal"] = true; needsPersist = true; }
+		if ("feedbackHintShown" in stored || "helpShown" in stored) {
+			delete stored.feedbackHintShown;
+			delete stored.helpShown;
+			needsPersist = true;
+		}
+		// An install that already has settings on disk has been through setup, so
+		// the first-run folder prompt must never fire retroactively.
+		if (!this.freshInstall && !this.settings.seenOnce["library-setup"]) {
+			this.settings.seenOnce["library-setup"] = true;
+			needsPersist = true;
+		}
 		if (needsPersist) await this.persistSettings();
+	}
+
+	/** Whether this prompt has already fired in this vault. */
+	hasSeen(key: OneTimeKey): boolean {
+		return this.settings.seenOnce[key] === true;
+	}
+
+	/** Record a one-shot prompt as fired. Awaited *before* the prompt is shown,
+	 *  so a crash between showing and saving can't resurrect it. */
+	async markSeen(key: OneTimeKey): Promise<void> {
+		if (this.settings.seenOnce[key]) return;
+		this.settings.seenOnce[key] = true;
+		await this.persistSettings();
 	}
 
 	/** Move any legacy plaintext API keys out of data.json and into Obsidian's
@@ -5279,6 +5586,7 @@ export default class ThirdMindReader extends Plugin {
 	/** Write settings to disk with resolved API keys stripped — only the
 	 *  `apiKeyId` reference is persisted, never the key itself. */
 	persistSettings(): Promise<void> {
+		configureLibraryPaths(this.settings.libraryRoot, this.settings.annotationsFolder);
 		const data: ThirdMindReaderSettings = {
 			...this.settings,
 			aiProviders: this.settings.aiProviders.map((p) => {
@@ -5328,11 +5636,9 @@ export default class ThirdMindReader extends Plugin {
  *  button (calls `probeProvider()`) and a delete affordance. The default-
  *  model picker selects which provider new conversations use; every mode
  *  falls through to `primaryProviderId`. */
-// ─── Beta feedback form ──────────────────────────────────────────────────────
-// Opens an anonymous Google Form in the browser with the plugin/Obsidian/OS
-// versions prefilled. Flip FEEDBACK_BETA to false (or delete the Setting block in
-// display()) for the public 1.0 build.
-const FEEDBACK_BETA = true;
+// ─── Feedback form ───────────────────────────────────────────────────────────
+// Anonymous Google Form opened in the browser, with plugin/Obsidian/OS versions prefilled.
+const KOFI_URL = "https://ko-fi.com/M7I223W2ID";
 const FEEDBACK_FORM_BASE =
 	"https://docs.google.com/forms/d/e/1FAIpQLSeHKYS9X0lG4ty2ZiRTry5FDBl2GOCbeeBxBBsGbRKdHVBlRg/viewform";
 const FEEDBACK_ENTRY = {
@@ -5365,12 +5671,40 @@ class TmrSettingTab extends PluginSettingTab {
 		super(app, plugin);
 	}
 
+	/** Which vault folder holds the user's books. Committed on blur/Enter rather
+	 *  than per keystroke, so a half-typed path never becomes the library. */
+	private renderLibraryFolderSetting(parent: HTMLElement): void {
+		const pinned = this.plugin.settings.annotationsFolder;
+		const setting = new Setting(parent)
+			.setName("Library folder")
+			.setDesc(pinned
+				? `Vault folder holding your books. Annotations stay in ${pinned}.`
+				: "Vault folder holding your books. Point this at a folder you already keep EPUBs and PDFs in — it will be created if it doesn't exist.");
+
+		setting.addText((t) => {
+			t.setPlaceholder(DEFAULT_LIBRARY_ROOT).setValue(this.plugin.settings.libraryRoot);
+			new FolderSuggest(this.app, t.inputEl);
+			const commit = (): void => {
+				const target = normalizePath(t.inputEl.value.trim() || DEFAULT_LIBRARY_ROOT);
+				if (target === this.plugin.settings.libraryRoot) return;
+				void this.plugin.applyLibraryRoot(target).then(() => this.display());
+			};
+			t.inputEl.addEventListener("blur", commit);
+			t.inputEl.addEventListener("keydown", (e) => {
+				if (e.key === "Enter") {
+					e.preventDefault();
+					t.inputEl.blur();
+				}
+			});
+		});
+	}
+
 	/** Reader text size: a "use Obsidian's" switch, plus the slider that appears
 	 *  only once it's off. Repaints its own block rather than calling `display()`
 	 *  on toggle — a full redraw would collapse every expanded provider panel
 	 *  further down the tab. */
 	private renderTextSizeSetting(parent: HTMLElement): void {
-		const block = parent.createEl("div");
+		const block = parent.createDiv();
 		const paint = (): void => {
 			block.empty();
 			const following = this.plugin.settings.readerFontSize === null;
@@ -5404,7 +5738,7 @@ class TmrSettingTab extends PluginSettingTab {
 					}));
 			// Created between the reset button and the slider so the row reads
 			// [reset] [18] [────●────], the same order as Obsidian's own.
-			const value = setting.controlEl.createEl("span", {
+			const value = setting.controlEl.createSpan({
 				cls: "tmr-setting-slider-value",
 				text: String(current),
 			});
@@ -5430,18 +5764,9 @@ class TmrSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 
-		// ── Beta feedback (kept at the top so testers don't miss it) ──────
-		if (FEEDBACK_BETA) {
-			new Setting(containerEl)
-				.setName("Beta feedback")
-				.setDesc("Opens an anonymous feedback form in your browser, with your plugin version, Obsidian version, and OS filled in automatically.")
-				.addButton(b => b
-					.setButtonText("Send feedback")
-					.setCta()
-					.onClick(() => {
-						window.open(buildFeedbackUrl(this.plugin.manifest.version), "_blank");
-					}));
-		}
+		// ── Library ──────────────────────────────────────────────────────
+		new Setting(containerEl).setName("Library").setHeading();
+		this.renderLibraryFolderSetting(containerEl);
 
 		// ── Reading ──────────────────────────────────────────────────────
 		new Setting(containerEl).setName("Reading").setHeading();
@@ -5455,8 +5780,57 @@ class TmrSettingTab extends PluginSettingTab {
 				.onChange(async (v) => {
 					this.plugin.settings.aiFeaturesEnabled = v;
 					await this.plugin.saveSettings();
+					this.display();
 				}));
 
+		if (this.plugin.settings.aiFeaturesEnabled) {
+			this.renderAiSections(containerEl);
+		} else {
+			const quickKey = Platform.isMobile ? "mobile" : "desktop";
+			new Setting(containerEl)
+				.setName("Quick highlight")
+				.setDesc(
+					"Selecting text opens the Emphasise note straight away instead of showing the one-tile GlossBar. Press Enter on an empty note to just highlight. "
+					+ (Platform.isMobile
+						? "Set per device — off here by default, since a stray selection would raise the keyboard."
+						: "Set per device — on here by default, off on phones and tablets."),
+				)
+				.addToggle(t => t
+					.setValue(this.plugin.settings.quickHighlight[quickKey])
+					.onChange(async (v) => {
+						this.plugin.settings.quickHighlight[quickKey] = v;
+						await this.plugin.saveSettings();
+					}));
+		}
+
+		// ── Apple Books Import ───────────────────────────────────────────
+		// Desktop-only by nature, not just by policy: the flow reads the Books
+		// container off disk through an Electron folder dialog, neither of which
+		// exists on mobile. Gate on isDesktopApp (capability), never isMobile —
+		// under `emulateMobile` Node is still present and this must keep working.
+		if (Platform.isDesktopApp) this.renderImportSection(containerEl);
+
+		this.renderFooterButtons(containerEl);
+	}
+
+	private renderFooterButtons(containerEl: HTMLElement): void {
+		const row = containerEl.createDiv({ cls: "tmr-settings-footer" });
+
+		const tile = (label: string, icon: string, onClick: () => void): void => {
+			const btn = row.createEl("button", { cls: "tmr-settings-footer-btn" });
+			setIcon(btn.createSpan({ cls: "tmr-settings-footer-icon" }), icon);
+			btn.createSpan({ cls: "tmr-settings-footer-label", text: label });
+			btn.addEventListener("click", onClick);
+		};
+
+		tile("How to use", "circle-help", () => new HelpModal(this.app, this.plugin.settings).open());
+		tile("Feedback", "message-square", () => {
+			window.open(buildFeedbackUrl(this.plugin.manifest.version), "_blank");
+		});
+		tile("Tip jar", "coffee", () => { window.open(KOFI_URL, "_blank"); });
+	}
+
+	private renderAiSections(containerEl: HTMLElement): void {
 		// ── Providers list ───────────────────────────────────────────────
 		new Setting(containerEl).setName("AI providers").setHeading();
 
@@ -5488,7 +5862,7 @@ class TmrSettingTab extends PluginSettingTab {
 			}));
 
 		if (this.plugin.settings.aiProviders.length === 0) {
-			containerEl.createEl("div", {
+			containerEl.createDiv({
 				cls: "setting-item-description",
 				text: "No providers configured. Add one above — local providers (LM Studio, Ollama) need only an endpoint URL; Anthropic and OpenAI need an API key.",
 			});
@@ -5505,7 +5879,7 @@ class TmrSettingTab extends PluginSettingTab {
 			.setName("Primary provider")
 			.setDesc("Used for new AI conversations unless a per-mode override is set.")
 			.addDropdown(dd => {
-				dd.addOption("", "(none)");
+				dd.addOption("", "(None)");
 				for (const p of this.plugin.settings.aiProviders) {
 					dd.addOption(p.id, `${p.id} (${p.kind})`);
 				}
@@ -5557,13 +5931,6 @@ class TmrSettingTab extends PluginSettingTab {
 
 		// ── AI system prompts ────────────────────────────────────────────
 		this.renderSystemPromptsSection(containerEl);
-
-		// ── Apple Books Import ───────────────────────────────────────────
-		// Desktop-only by nature, not just by policy: the flow shells out to
-		// `zip` and opens an Electron folder dialog, neither of which exists on
-		// mobile. Gate on isDesktopApp (capability), never isMobile — under
-		// `emulateMobile` Node is still present and this must keep working.
-		if (Platform.isDesktopApp) this.renderImportSection(containerEl);
 	}
 
 	private renderProviderEditor(parent: HTMLElement, idx: number): void {
@@ -5637,7 +6004,7 @@ class TmrSettingTab extends PluginSettingTab {
 		const isRemote = provider.kind !== "openai-compatible"
 			|| !isLocalEndpoint(provider.endpoint);
 		if (isRemote) {
-			const note = wrap.createEl("div", { cls: "setting-item-description tmr-settings-privacy" });
+			const note = wrap.createDiv({ cls: "setting-item-description tmr-settings-privacy" });
 			note.createSpan({
 				text: "Remote inference sends the selected passage and your annotation off this device.",
 			});
@@ -5652,7 +6019,7 @@ class TmrSettingTab extends PluginSettingTab {
 		let modelText: TextComponent | null = null;
 		new Setting(wrap)
 			.setName("Default model")
-			.setDesc("Model id sent in chat requests when this provider is selected. Examples: claude-haiku-4-5-20251001 / gpt-4o-mini / llama-3-8b-instruct.")
+			.setDesc("Model ID sent in chat requests when this provider is selected. Examples: claude-haiku-4-5-20251001 / gpt-4o-mini / llama-3-8b-instruct.")
 			.addText(t => {
 				modelText = t;
 				t.setValue(provider.defaultModel ?? "").onChange(async v => {
@@ -5756,7 +6123,7 @@ class TmrSettingTab extends PluginSettingTab {
 		this.plugin.settings.aiProviders.push(provider);
 		// ...and becomes the primary if nothing valid holds that slot. Resolution
 		// already falls back to the first provider, so this changes no behaviour
-		// — it stops the dropdown reading "(none)" while an exchange is quietly
+		// — it stops the dropdown reading "(None)" while an exchange is quietly
 		// being routed to that very provider. Written as "no valid primary"
 		// rather than "first provider" so it also repairs the dangling id left
 		// behind when the primary is deleted.
@@ -5821,10 +6188,10 @@ class TmrSettingTab extends PluginSettingTab {
 	private importEntries: ImportEntry[] = [];
 
 	private renderImportSection(container: HTMLElement): void {
-		const section = container.createEl("div", { cls: "tmr-settings-import-section" });
+		const section = container.createDiv({ cls: "tmr-settings-import-section" });
 
 		const head = new Setting(section)
-			.setName("Apple Books Import")
+			.setName("Apple Books import")
 			.setDesc("Import exploded epub folders from Apple Books as proper .epub files. "
 				+ "Select one or more book folders — each must contain a mimetype file.")
 			.addButton(b => b
@@ -5838,7 +6205,7 @@ class TmrSettingTab extends PluginSettingTab {
 				}));
 		head.settingEl.addClass("tmr-settings-import-head");
 
-		const resultsEl = section.createEl("div", { cls: "tmr-settings-import-results" });
+		const resultsEl = section.createDiv({ cls: "tmr-settings-import-results" });
 	}
 
 	private renderImportResults(container: HTMLElement): void {
@@ -5856,7 +6223,7 @@ class TmrSettingTab extends PluginSettingTab {
 		});
 
 		for (const entry of this.importEntries) {
-			const row = container.createEl("div", { cls: "tmr-settings-import-entry" });
+			const row = container.createDiv({ cls: "tmr-settings-import-entry" });
 			const cb = row.createEl("input");
 			cb.type = "checkbox";
 			cb.checked = entry.checked;
@@ -5870,8 +6237,8 @@ class TmrSettingTab extends PluginSettingTab {
 			nameInput.addEventListener("input", () => { entry.finalName = nameInput.value; });
 		}
 
-		const footer = container.createEl("div", { cls: "tmr-settings-import-footer" });
-		const statusEl = footer.createEl("div", { cls: "tmr-settings-import-status" });
+		const footer = container.createDiv({ cls: "tmr-settings-import-footer" });
+		const statusEl = footer.createDiv({ cls: "tmr-settings-import-status" });
 		const btn = footer.createEl("button", { cls: "mod-cta", text: "Import selected" });
 		const onImportClick = async () => {
 			const toImport = this.importEntries.filter(e => e.checked);
@@ -5886,12 +6253,13 @@ class TmrSettingTab extends PluginSettingTab {
 	}
 
 	private validateEpubFolders(paths: string[]): ImportEntry[] {
-		/* eslint-disable @typescript-eslint/no-require-imports -- Node builtins must
+		if (!Platform.isDesktop) return [];
+		/* eslint-disable @typescript-eslint/no-require-imports, no-undef -- Node builtins must
 		   stay inside the function body: a module-scope import becomes a top-of-bundle
 		   require(), which kills the plugin at load on mobile (no require there at all). */
 		const nodePath = require("path") as typeof import("path");
 		const fs = require("fs") as typeof import("fs");
-		/* eslint-enable @typescript-eslint/no-require-imports -- end of the deliberately
+		/* eslint-enable @typescript-eslint/no-require-imports, no-undef -- end of the deliberately
 		   lazy Node requires; normal import rules apply again below. */
 		const results: ImportEntry[] = [];
 		for (const folderPath of paths) {
@@ -5917,58 +6285,62 @@ class TmrSettingTab extends PluginSettingTab {
 	}
 
 	private async importBooks(entries: ImportEntry[], statusEl: HTMLElement): Promise<number> {
-		/* eslint-disable @typescript-eslint/no-require-imports -- see validateEpubFolders. */
+		if (!Platform.isDesktop) return 0;
+		/* eslint-disable @typescript-eslint/no-require-imports, no-undef -- see validateEpubFolders. */
 		const nodePath = require("path") as typeof import("path");
 		const fs = require("fs") as typeof import("fs");
-		const { exec } = require("child_process") as typeof import("child_process");
-		/* eslint-enable @typescript-eslint/no-require-imports -- end of the deliberately
+		/* eslint-enable @typescript-eslint/no-require-imports, no-undef -- end of the deliberately
 		   lazy Node requires; normal import rules apply again below. */
-		const adapter = this.plugin.app.vault.adapter;
-		const vaultBase = adapter instanceof FileSystemAdapter ? adapter.getBasePath() : "";
-		const outputDir = nodePath.join(vaultBase, "Library", "Imported");
-		try {
-			fs.mkdirSync(outputDir, { recursive: true });
-		} catch (e) {
-			new Notice(`Could not create output folder: ${(e as Error).message}`);
-			return 0;
+		const fsx: EpubPackFs = {
+			join: (...parts) => nodePath.join(...parts),
+			list: dir => fs.readdirSync(dir, { withFileTypes: true })
+				.map(d => ({ name: d.name, isDirectory: d.isDirectory() })),
+			readFile: path => fs.readFileSync(path),
+		};
+
+		const vault = this.plugin.app.vault;
+		const outputDir = normalizePath(`${libraryRootPath()}/Imported`);
+		if (!vault.getFolderByPath(outputDir)) {
+			try {
+				await vault.createFolder(outputDir);
+			} catch (e) {
+				new Notice(`Could not create output folder: ${(e as Error).message}`);
+				return 0;
+			}
 		}
 
 		statusEl.empty();
 		let imported = 0;
 		for (const entry of entries) {
 			const safe = sanitizeFileName(entry.finalName || entry.name);
-			let outputPath = nodePath.join(outputDir, `${safe}.epub`);
+			let outputPath = normalizePath(`${outputDir}/${safe}.epub`);
 			let n = 2;
-			while (fs.existsSync(outputPath)) {
-				outputPath = nodePath.join(outputDir, `${safe} ${n++}.epub`);
+			while (vault.getAbstractFileByPath(outputPath)) {
+				outputPath = normalizePath(`${outputDir}/${safe} ${n++}.epub`);
 			}
 			try {
-				await new Promise<void>((resolve, reject) => {
-					exec(`zip -X -r "${outputPath}" mimetype *`, { cwd: entry.folderPath }, err => {
-						err ? reject(err) : resolve();
-					});
-				});
+				await vault.createBinary(outputPath, await packEpubFolder(entry.folderPath, fsx));
 				imported++;
 			} catch (e) {
-				statusEl.createEl("div", {
+				statusEl.createDiv({
 					cls: "tmr-settings-import-status-line tmr-settings-import-err",
-					text: `✗ ${safe}: ${(e as Error).message?.slice(0, 120) ?? "unknown error"}`,
+					text: `\u2717 ${safe}: ${(e as Error).message?.slice(0, 120) ?? "unknown error"}`,
 				});
 			}
 		}
 
 		if (imported > 0) {
-			const ok = statusEl.createEl("div", { cls: "tmr-settings-import-status-line tmr-settings-import-ok" });
+			const ok = statusEl.createDiv({ cls: "tmr-settings-import-status-line tmr-settings-import-ok" });
 			setIcon(ok.createSpan({ cls: "tmr-settings-import-status-icon" }), "book-check");
 			ok.createSpan({ text: `${imported} book${imported === 1 ? "" : "s"} imported` });
-			new Notice("Import complete — check Library/Imported/ in your vault.");
+			new Notice(`Import complete \u2014 check ${outputDir}/ in your vault.`);
 		}
 		return imported;
 	}
 
 	private async pickEpubFolders(): Promise<string[]> {
 		try {
-			// eslint-disable-next-line @typescript-eslint/no-require-imports -- Electron's remote dialog is only reachable via require() in Obsidian's renderer.
+			// eslint-disable-next-line @typescript-eslint/no-require-imports, no-undef -- Electron's remote dialog is only reachable via require() in Obsidian's renderer.
 			const electron = require("electron") as {
 				remote?: {
 					dialog?: {

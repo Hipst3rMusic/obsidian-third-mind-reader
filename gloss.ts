@@ -12,6 +12,7 @@ import {
 	TFile,
 	AbstractInputSuggest,
 	prepareFuzzySearch,
+	sanitizeHTMLToDom,
 	setIcon,
 } from "obsidian";
 
@@ -63,6 +64,14 @@ export interface GlossHostSettings {
 	tmrMode: "obsidian" | "3c";
 	tmrTheme: "light" | "dark";
 	aiFeaturesEnabled: boolean;
+	quickHighlight: { desktop: boolean; mobile: boolean };
+}
+
+/** Lite mode only — with the AI tiles live there is a real choice to make. */
+export function quickHighlightOn(settings: GlossHostSettings): boolean {
+	if (settings.aiFeaturesEnabled) return false;
+	const quick = settings.quickHighlight;
+	return Platform.isMobile ? quick.mobile : quick.desktop;
 }
 
 /** Stamp 3C mode + theme onto an element that lives outside `.tmr-root`.
@@ -543,12 +552,12 @@ function setInlineMarkdown(el: HTMLElement, text: string): void {
 	const esc = text
 		.replace(/&/g, "&amp;").replace(/</g, "&lt;")
 		.replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-	// eslint-disable-next-line no-unsanitized/property -- Safe: the text is fully HTML-escaped above, so the only markup that can reach the DOM is the tags these replaces emit.
-	el.innerHTML = esc
+	el.empty();
+	el.appendChild(sanitizeHTMLToDom(esc
 		.replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>")
 		.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
 		.replace(/\*(.+?)\*/g, "<em>$1</em>")
-		.replace(/`([^`]+)`/g, "<code>$1</code>");
+		.replace(/`([^`]+)`/g, "<code>$1</code>")));
 }
 
 /** Strip footnote markers and definitions from an AI turn for preview display. */
@@ -563,12 +572,20 @@ function stripFootnotes(content: string): string {
 export class AnnotationPreview extends Component {
 	private el: HTMLElement | null = null;
 	private idx = -1;
+	private actionable = false;
+	private hideTimer: number | null = null;
 
-	constructor(private settings: () => GlossHostSettings) {
+	/** Omitting `onAddNote` gives the read-only placeholder instead of the
+	 *  "+ Add a note" line on note-less Emphasise highlights. */
+	constructor(
+		private settings: () => GlossHostSettings,
+		private onAddNote?: (idx: number) => void,
+	) {
 		super();
 	}
 
 	onunload(): void {
+		this.clearHideTimer();
 		this.el?.remove();
 		this.el = null;
 		this.idx = -1;
@@ -579,9 +596,16 @@ export class AnnotationPreview extends Component {
 		return this.idx;
 	}
 
+	/** Screen box of the floater, for anchoring a panel where it stood. Read it
+	 *  before hiding — `.tmr-hidden` collapses the box to zeros. */
+	get anchorRect(): DOMRect {
+		return this.el?.getBoundingClientRect() ?? new DOMRect();
+	}
+
 	/** Surface the preview for highlight `idx`. Repopulates only when the index
 	 *  actually changes; otherwise just tracks the pointer. */
 	showFor(idx: number, saved: SavedHighlight, clientX: number, clientY: number): void {
+		this.clearHideTimer();
 		if (idx !== this.idx) {
 			this.idx = idx;
 			this.populate(saved);
@@ -590,8 +614,27 @@ export class AnnotationPreview extends Component {
 	}
 
 	hide(): void {
+		this.clearHideTimer();
 		this.idx = -1;
+		this.actionable = false;
 		this.el?.addClass("tmr-hidden");
+	}
+
+	/** Grace period for an actionable floater only: the pointer crosses bare page
+	 *  to reach the add-note line, and the host reads that gap as a hover-off. */
+	hideSoft(): void {
+		if (!this.actionable) { this.hide(); return; }
+		if (this.hideTimer !== null) return;
+		this.hideTimer = window.setTimeout(() => {
+			this.hideTimer = null;
+			this.hide();
+		}, 140);
+	}
+
+	private clearHideTimer(): void {
+		if (this.hideTimer === null) return;
+		window.clearTimeout(this.hideTimer);
+		this.hideTimer = null;
 	}
 
 	syncTheme(): void {
@@ -600,7 +643,16 @@ export class AnnotationPreview extends Component {
 
 	private ensureEl(): HTMLElement {
 		if (this.el) return this.el;
-		this.el = document.body.createEl("div", { cls: "tmr-annotation-preview tmr-hidden" });
+		this.el = document.body.createDiv({ cls: "tmr-annotation-preview tmr-hidden" });
+		this.registerDomEvent(this.el, "mouseenter", () => this.clearHideTimer());
+		this.registerDomEvent(this.el, "mouseleave", () => this.hide());
+		// Delegated, not bound per populate: the floater repopulates on every
+		// hover and a listener per pass would accumulate for the view's life.
+		this.registerDomEvent(this.el, "click", (e) => {
+			if (!(e.target as Element | null)?.closest(".tmr-highlights-item-add-note")) return;
+			e.stopPropagation();
+			this.onAddNote?.(this.idx);
+		});
 		this.syncTheme();
 		return this.el;
 	}
@@ -609,7 +661,7 @@ export class AnnotationPreview extends Component {
 		const el = this.ensureEl();
 		el.empty();
 		el.dataset.glossMode = saved.mode;
-		el.createEl("div", { cls: "tmr-annotation-preview-mode",
+		el.createDiv({ cls: "tmr-annotation-preview-mode",
 			text: saved.mode[0].toUpperCase() + saved.mode.slice(1) });
 
 		const CHARS = PREVIEW_MAX_CHARS;
@@ -645,17 +697,25 @@ export class AnnotationPreview extends Component {
 			body = saved.userText.trim();
 		}
 
+		this.actionable = false;
 		if (body.length > 0) {
-			setInlineMarkdown(el.createEl("div", { cls: "tmr-annotation-preview-body" }), body);
+			setInlineMarkdown(el.createDiv({ cls: "tmr-annotation-preview-body" }), body);
+		} else if (this.onAddNote && saved.mode === "emphasise") {
+			// Styled by the Annotations row's own class — same action, same look.
+			el.createDiv({ cls: "tmr-highlights-item-add-note", text: "+ Add a note" });
+			this.actionable = true;
 		} else {
 			const emptyText = GLOSS_AI_MODES.has(saved.mode) && isComplete
 				? "(no response)"
 				: "No note yet — add one from the Highlights panel";
-			el.createEl("div", {
+			el.createDiv({
 				cls: "tmr-annotation-preview-body tmr-annotation-preview-empty",
 				text: emptyText,
 			});
 		}
+		// Pointer-transparent by default so a preview never eats a click meant
+		// for the page; only one with something to click needs to catch it.
+		el.toggleClass("tmr-annotation-preview-actionable", this.actionable);
 
 		el.removeClass("tmr-hidden");
 	}
@@ -1056,11 +1116,14 @@ export class GlossSurface extends Component {
 		}
 	}
 
-	openInput(modeId: string, selectionRect: DOMRect): void {
+	/** `standalone` opens the panel with no GlossBar behind it, for a host that
+	 *  already knows what the text will be written to — editing a saved
+	 *  annotation, or a Lite-mode selection under `quickHighlightOn`. */
+	openInput(modeId: string, selectionRect: DOMRect, standalone = false): void {
 		// The raised bar *is* the "there is a live selection" signal — without it
 		// the host has nothing to anchor a submit to, and the input would collect
 		// text that silently goes nowhere.
-		if (!this.barVisible) return;
+		if (!this.barVisible && !standalone) return;
 		if (!GLOSS_MODES.some((m) => m.id === modeId)) return;
 		if (this.opts.disabledModes?.().has(modeId)) return;
 		this.activeMode = modeId;
@@ -1160,7 +1223,7 @@ export class GlossSurface extends Component {
 
 	private ensureBar(): HTMLElement {
 		if (this.barEl) return this.barEl;
-		const bar = document.body.createEl("div", { cls: "tmr-gloss-bar tmr-hidden" });
+		const bar = document.body.createDiv({ cls: "tmr-gloss-bar tmr-hidden" });
 		GLOSS_MODES.forEach((mode, idx) => {
 			const tile = bar.createEl("button", { cls: "tmr-gloss-tile" });
 			tile.dataset.glossMode = mode.id;
@@ -1186,7 +1249,7 @@ export class GlossSurface extends Component {
 			this.registerDomEvent(tile, "mouseleave", () => this.hideTileTooltip());
 			// Separator stroke after the standard-highlight tile (Emphasise),
 			// before the AI tiles. Hidden in Lite mode along with those tiles.
-			if (idx === 0) bar.createEl("div", { cls: "tmr-gloss-sep" });
+			if (idx === 0) bar.createDiv({ cls: "tmr-gloss-sep" });
 		});
 
 		// Extend-across-pages action (not a gloss mode). Stays visible in Lite
@@ -1194,7 +1257,7 @@ export class GlossSurface extends Component {
 		// without a cross-page model (PDF) omit `onExtend` and get no tile.
 		const onExtend = this.opts.onExtend;
 		if (onExtend) {
-			bar.createEl("div", { cls: "tmr-gloss-sep tmr-gloss-sep-extend" });
+			bar.createDiv({ cls: "tmr-gloss-sep tmr-gloss-sep-extend" });
 			const extendTile = bar.createEl("button", { cls: "tmr-gloss-tile tmr-gloss-tile-extend" });
 			setIcon(extendTile, "unfold-horizontal");
 			this.registerDomEvent(extendTile, "mousedown", (e: MouseEvent) => e.preventDefault());
@@ -1216,7 +1279,7 @@ export class GlossSurface extends Component {
 
 	private ensureInput(): HTMLElement {
 		if (this.inputEl) return this.inputEl;
-		const panel = document.body.createEl("div", { cls: "tmr-gloss-input tmr-hidden" });
+		const panel = document.body.createDiv({ cls: "tmr-gloss-input tmr-hidden" });
 		const input = panel.createEl("input", {
 			cls: "tmr-gloss-input-field",
 			attr: { type: "text" },
@@ -1304,7 +1367,7 @@ export class GlossSurface extends Component {
 
 	private ensureTileTooltip(): HTMLElement {
 		if (this.tooltipEl) return this.tooltipEl;
-		const el = document.body.createEl("div", { cls: "tmr-gloss-tooltip tmr-hidden" });
+		const el = document.body.createDiv({ cls: "tmr-gloss-tooltip tmr-hidden" });
 		this.tooltipEl = el;
 		this.syncTheme();
 		return el;

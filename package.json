@@ -1,6 +1,6 @@
 {
   "name": "third-mind-reader",
-  "version": "0.6.0-beta",
+  "version": "1.0.0",
   "description": "Third Mind Reader — Obsidian Plugin",
   "main": "main.js",
   "scripts": {
@@ -17,8 +17,8 @@
     "@types/node": "^16.11.6",
     "esbuild": "0.17.3",
     "eslint": "^10.6.0",
-    "eslint-plugin-obsidianmd": "^0.4.1",
-    "obsidian": "latest",
+    "eslint-plugin-obsidianmd": "^0.4.2",
+    "obsidian": "^1.13.1",
     "tslib": "2.4.0",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.62.1"

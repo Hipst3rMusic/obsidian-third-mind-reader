@@ -28,6 +28,7 @@ import {
 	hitTestHighlightRects,
 	isTextInputFocused,
 	parseSavedHighlights,
+	quickHighlightOn,
 	registerTouchSelectionRaise,
 } from "./gloss";
 import {
@@ -141,6 +142,7 @@ export class PdfGlossManager extends Component {
 	 *  four direct children, so childList on it is a precise "viewer rebuilt"
 	 *  signal. */
 	private observers = new Map<View, MutationObserver>();
+	private popoutWarned = new WeakSet<View>();
 
 	constructor(
 		private app: App,
@@ -157,7 +159,7 @@ export class PdfGlossManager extends Component {
 	 *  the plugin's commands reach the pane the same way `activeReaderView`
 	 *  reaches the reader's. */
 	activeController(): PdfGlossController | null {
-		const view = this.app.workspace.activeLeaf?.view;
+		const view = this.app.workspace.getActiveViewOfType(View);
 		return (view && this.controllers.get(view)) ?? null;
 	}
 
@@ -194,14 +196,29 @@ export class PdfGlossManager extends Component {
 				this.observers.delete(view);
 			}
 		}
-		for (const leaf of this.app.workspace.getLeavesOfType("pdf")) this.consider(leaf.view as PdfView);
+		for (const leaf of this.app.workspace.getLeavesOfType("pdf")) {
+			// layout-change fires before focus moves into a new pop-out.
+			window.setTimeout(() => this.warnIfPoppedOut(leaf.view), 0);
+			this.consider(leaf.view as PdfView);
+		}
+	}
+
+	private warnIfPoppedOut(view: View): void {
+		if (view.containerEl.win === window) {
+			this.popoutWarned.delete(view);
+			return;
+		}
+		// Notices render in the focused window; wait until that's the pop-out.
+		if (this.popoutWarned.has(view) || activeDocument !== view.containerEl.doc) return;
+		this.popoutWarned.add(view);
+		new Notice("Annotations aren't available in a pop-out. Move this PDF back to the main window to annotate it.", 8000);
 	}
 
 	/** Re-run {@link consider} whenever the viewer's DOM is rebuilt under us.
 	 *  Idempotent; the observer outlives any individual controller, which is the
 	 *  point — the controller is what gets orphaned. */
 	private watch(view: PdfView): void {
-		if (this.observers.has(view) || !(view.contentEl instanceof HTMLElement)) return;
+		if (this.observers.has(view) || !view.contentEl?.instanceOf(HTMLElement)) return;
 		const observer = new MutationObserver(() => this.consider(view));
 		observer.observe(view.contentEl, { childList: true });
 		this.observers.set(view, observer);
@@ -269,6 +286,9 @@ export class PdfGlossController extends Component {
 	private surface: GlossSurface | null = null;
 	private preview: AnnotationPreview | null = null;
 	private pane: HighlightsPane | null = null;
+	/** Saved-highlight index whose note the open gloss input is editing, or null
+	 *  when the input belongs to a live selection. */
+	private editingNoteIdx: number | null = null;
 	/** Body-scoped floater for `[N]` citation pills. The reader hands the pane
 	 *  its own richer tooltip; a PDF has none, so the controller owns this one. */
 	private citationTipEl: HTMLElement | null = null;
@@ -343,7 +363,7 @@ export class PdfGlossController extends Component {
 			onDismiss: () => this.dismiss(),
 		});
 		this.addChild(this.surface);
-		this.preview = new AnnotationPreview(this.settings);
+		this.preview = new AnnotationPreview(this.settings, (idx) => this.beginAddNote(idx));
 		this.addChild(this.preview);
 		this.mountPane();
 
@@ -413,8 +433,10 @@ export class PdfGlossController extends Component {
 
 	onunload(): void {
 		this.unloaded = true;
-		this.child.pdfViewer.eventBus.off?.("textlayerrendered", this.onTextLayerRendered);
-		this.child.pdfViewer.eventBus.off?.("pagechanging", this.onPageChanging);
+		// Obsidian nulls `pdfViewer` while tearing the view down, so this runs
+		// against a dead viewer whenever the view closes before the controller.
+		this.child.pdfViewer?.eventBus?.off?.("textlayerrendered", this.onTextLayerRendered);
+		this.child.pdfViewer?.eventBus?.off?.("pagechanging", this.onPageChanging);
 		if (this.progressTimer !== null) window.clearTimeout(this.progressTimer);
 		this.clearOverlays();
 		// Everything we grafted onto Obsidian's own DOM comes back off: the pane
@@ -624,7 +646,12 @@ export class PdfGlossController extends Component {
 			text,
 			rect: range.getBoundingClientRect(),
 		};
-		this.surface?.showBar(this.pending.rect);
+		// No extend on this surface, so nothing holds the bar back.
+		if (quickHighlightOn(this.settings())) {
+			this.surface?.openInput("emphasise", this.pending.rect, true);
+		} else {
+			this.surface?.showBar(this.pending.rect);
+		}
 	}
 
 	private onDocMouseDown(e: MouseEvent): void {
@@ -638,7 +665,7 @@ export class PdfGlossController extends Component {
 		// click there is a suggestion pick, not an outside click.
 		if (
 			this.surface.suggestOpen &&
-			target instanceof Element &&
+			target.instanceOf(Element) &&
 			target.closest(".suggestion-container")
 		)
 			return;
@@ -681,7 +708,7 @@ export class PdfGlossController extends Component {
 	}
 
 	private isActiveView(): boolean {
-		return this.app.workspace.activeLeaf?.view === this.view;
+		return this.app.workspace.getActiveViewOfType(View) === this.view;
 	}
 
 	/** Hit-test a click against the painted rects. A click on an AI-bearing
@@ -723,13 +750,13 @@ export class PdfGlossController extends Component {
 		const preview = this.preview;
 		if (!preview) return;
 		if (this.saved.length === 0) {
-			if (preview.hoveredIdx !== -1) preview.hide();
+			if (preview.hoveredIdx !== -1) preview.hideSoft();
 			return;
 		}
 		const idx = hitTestHighlightRects(this.child.containerEl, e.clientX, e.clientY);
 		const saved = idx === -1 ? null : this.saved[idx];
 		if (!saved) {
-			if (preview.hoveredIdx !== -1) preview.hide();
+			if (preview.hoveredIdx !== -1) preview.hideSoft();
 			return;
 		}
 		preview.showFor(idx, saved, e.clientX, e.clientY);
@@ -738,6 +765,17 @@ export class PdfGlossController extends Component {
 	private dismiss(): void {
 		this.surface?.hide();
 		this.pending = null;
+		this.editingNoteIdx = null;
+	}
+
+	/** "+ Add a note" on a note-less Emphasise preview. `editingNoteIdx` is what
+	 *  routes the submit to that highlight instead of to a live selection. */
+	private beginAddNote(idx: number): void {
+		if (!this.saved[idx] || !this.preview) return;
+		const rect = this.preview.anchorRect;
+		this.preview.hide();
+		this.editingNoteIdx = idx;
+		this.surface?.openInput("emphasise", rect, true);
 	}
 
 	// ── Persistent highlight painting ───────────────────────────────────────
@@ -862,6 +900,11 @@ export class PdfGlossController extends Component {
 	}
 
 	private async persist(modeId: string, userText: string): Promise<void> {
+		if (this.editingNoteIdx !== null) {
+			await this.pane?.commitNoteEdit(this.editingNoteIdx, userText);
+			this.dismiss();
+			return;
+		}
 		const pending = this.pending;
 		const file = this.child.file;
 		const path = this.companionPath();
@@ -1011,6 +1054,6 @@ function prefixStillMatches(
 /** The `.page` element a DOM node sits inside, or null. pdf.js stamps each with
  *  `data-page-number`; that's the page the selection anchors to. */
 function pageElOf(node: Node): HTMLElement | null {
-	const el = node instanceof Element ? node : node.parentElement;
+	const el = node.instanceOf(Element) ? node : node.parentElement;
 	return el?.closest<HTMLElement>(".page") ?? null;
 }

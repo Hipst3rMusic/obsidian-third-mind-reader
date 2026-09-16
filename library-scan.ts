@@ -46,8 +46,25 @@ export interface LibraryBook {
 	hasCompanion: boolean;
 }
 
-export const LIBRARY_ROOT = "Library";
-const ANNOTATIONS_PREFIX = "Library/Annotations/";
+export const DEFAULT_LIBRARY_ROOT = "Library";
+
+let configuredRoot = DEFAULT_LIBRARY_ROOT;
+let configuredAnnotations = `${DEFAULT_LIBRARY_ROOT}/Annotations`;
+
+/** A blank value falls back to the default rather than the vault root, which
+ *  would sweep every epub in the vault into the Library. */
+export function configureLibraryPaths(root: string, annotations: string): void {
+	configuredRoot = normalizePath(root.trim() || DEFAULT_LIBRARY_ROOT);
+	configuredAnnotations = normalizePath(annotations.trim() || `${configuredRoot}/Annotations`);
+}
+
+export function libraryRootPath(): string {
+	return configuredRoot;
+}
+
+export function annotationsFolderPath(): string {
+	return configuredAnnotations;
+}
 
 interface MetaCacheEntry {
 	mtime: number;
@@ -79,7 +96,7 @@ export function sanitizeFileName(raw: string): string {
  *  `getCompanionDocPath` and the Library scan, so the write and read paths can
  *  never drift apart. */
 export function companionDocPath(rawTitle: string): string {
-	return normalizePath(`${ANNOTATIONS_PREFIX}${sanitizeFileName(rawTitle)}-Annotations.md`);
+	return normalizePath(`${annotationsFolderPath()}/${sanitizeFileName(rawTitle)}-Annotations.md`);
 }
 
 /** Each Gloss entry begins with a `> [!mode]-` header line (see `buildCallout`),
@@ -126,12 +143,13 @@ export async function scanLibrary(
 	overrides: Record<string, LibraryOverride> = {},
 	positions: Record<string, BookProgress> = {}
 ): Promise<LibraryBook[]> {
-	const prefix = LIBRARY_ROOT + "/";
+	const prefix = libraryRootPath() + "/";
+	const annotationsPrefix = annotationsFolderPath() + "/";
 	const files = vault.getFiles().filter(
 		(f) =>
 			(f.extension === "epub" || f.extension === "pdf") &&
 			f.path.startsWith(prefix) &&
-			!f.path.startsWith(ANNOTATIONS_PREFIX)
+			!f.path.startsWith(annotationsPrefix)
 	);
 
 	const books: LibraryBook[] = [];
@@ -193,7 +211,7 @@ export async function scanLibrary(
 
 /** `Library/Eastern/foo.epub` → "Eastern"; `Library/foo.epub` → "" (root). */
 function collectionOf(path: string): string {
-	const rest = path.slice(LIBRARY_ROOT.length + 1);
+	const rest = path.slice(libraryRootPath().length + 1);
 	const slash = rest.indexOf("/");
 	return slash === -1 ? "" : rest.slice(0, slash);
 }
@@ -208,10 +226,10 @@ function collectionOf(path: string): string {
  * come first, the rest alphabetically. Names of dead folders are ignored.
  */
 export function computeCollections(vault: Vault, order: string[]): string[] {
-	const root = vault.getAbstractFileByPath(LIBRARY_ROOT);
+	const root = vault.getAbstractFileByPath(libraryRootPath());
 	const folders = root instanceof TFolder
 		? root.children
-			.filter((c): c is TFolder => c instanceof TFolder && c.name !== "Annotations")
+			.filter((c): c is TFolder => c instanceof TFolder && c.path !== annotationsFolderPath())
 			.map((c) => c.name)
 		: [];
 
@@ -242,7 +260,7 @@ export async function detectExplodedEpubs(vault: Vault): Promise<string[]> {
 			return;
 		}
 		for (const folder of folders) {
-			if (folder === "Library/Annotations" || folder.startsWith(ANNOTATIONS_PREFIX)) continue;
+			if (folder === annotationsFolderPath() || folder.startsWith(annotationsFolderPath() + "/")) continue;
 			const isExploded =
 				(await adapter.exists(`${folder}/META-INF/container.xml`)) ||
 				(await adapter.exists(`${folder}/mimetype`));
@@ -251,6 +269,6 @@ export async function detectExplodedEpubs(vault: Vault): Promise<string[]> {
 		}
 	};
 
-	await walk(LIBRARY_ROOT);
+	await walk(libraryRootPath());
 	return found;
 }

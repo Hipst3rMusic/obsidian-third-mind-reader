@@ -1,6 +1,8 @@
 import tsparser from "@typescript-eslint/parser";
 import { defineConfig } from "eslint/config";
 import obsidianmd from "eslint-plugin-obsidianmd";
+import { DEFAULT_ACRONYMS } from "eslint-plugin-obsidianmd/dist/lib/rules/ui/acronyms.js";
+import { DEFAULT_BRANDS } from "eslint-plugin-obsidianmd/dist/lib/rules/ui/brands.js";
 
 export default defineConfig([
 	// `scripts/` holds build tooling that runs under Node, not plugin code that
@@ -14,6 +16,17 @@ export default defineConfig([
 		languageOptions: {
 			parser: tsparser,
 			parserOptions: { project: "./tsconfig.json" },
+		},
+		rules: {
+			// Each list replaces the rule's built-in one rather than extending it,
+			// so the defaults must be spread back in.
+			"obsidianmd/ui/sentence-case": ["warn", {
+				brands: [...DEFAULT_BRANDS, "Third Mind Reader", "LM Studio", "Ollama", "OpenRouter", "Apple Books"],
+				acronyms: [...DEFAULT_ACRONYMS, "3C"],
+				ignoreWords: ["EPUBs", "PDFs"],
+				// Literal model IDs contain brand names the rule would capitalise.
+				ignoreRegex: ["claude-haiku-4-5-20251001"],
+			}],
 		},
 	},
 	{

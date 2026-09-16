@@ -260,7 +260,7 @@ async function chatAnthropic(
 	req: ChatRequest,
 ): Promise<ChatResponse> {
 	if (!provider.apiKey) throw new Error("Anthropic API key not configured");
-	const body: Record<string, any> = {
+	const body: Record<string, unknown> = {
 		model,
 		// No `reasoningTokens` headroom: extended thinking is opt-in on this API
 		// and we never send the `thinking` block, so the whole budget is answer.
@@ -314,7 +314,7 @@ async function chatAnthropic(
  *  effort level, and a 1024-token budget can map *below* the model's own
  *  default (60 reasoning tokens against 98 unconstrained), making it think less
  *  than it would unconstrained. Headroom alone is the fix. */
-function applyTokenBudget(req: ChatRequest, body: Record<string, any>): void {
+function applyTokenBudget(req: ChatRequest, body: Record<string, unknown>): void {
 	if (!req.maxTokens) return;
 	body.max_tokens = req.maxTokens + (req.reasoningTokens ?? 0);
 }
@@ -328,7 +328,7 @@ async function chatOpenAILike(
 	if (!endpoint) throw new Error("Endpoint not configured");
 	const messages = [...req.messages];
 	if (req.systemPrompt) messages.unshift({ role: "system", content: req.systemPrompt });
-	const body: Record<string, any> = {
+	const body: Record<string, unknown> = {
 		model,
 		messages: messages.map(m => ({ role: m.role, content: m.content })),
 	};
@@ -383,7 +383,7 @@ async function chatOpenAILikeStreaming(
 	if (!endpoint) throw new Error("Endpoint not configured");
 	const messages = [...req.messages];
 	if (req.systemPrompt) messages.unshift({ role: "system", content: req.systemPrompt });
-	const body: Record<string, any> = {
+	const body: Record<string, unknown> = {
 		model,
 		messages: messages.map(m => ({ role: m.role, content: m.content })),
 		stream: true,

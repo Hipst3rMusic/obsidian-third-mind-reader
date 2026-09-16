@@ -1,10 +1,11 @@
 {
   "id": "third-mind-reader",
   "name": "Third Mind Reader",
-  "version": "0.6.0-beta",
+  "version": "1.0.0",
   "minAppVersion": "1.13.0",
-  "description": "Read EPUBs with an opinionated reading experience: highlights, linked companion notes, and an inline AI librarian.",
+  "description": "An opinionated EPUB and PDF reader: highlights, linked companion notes, and an inline AI librarian.",
   "author": "Rohan Bell",
   "authorUrl": "https://github.com/Hipst3rMusic",
+  "fundingUrl": "https://ko-fi.com/M7I223W2ID",
   "isDesktopOnly": false
 }

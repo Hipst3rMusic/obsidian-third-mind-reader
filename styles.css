@@ -1607,46 +1607,6 @@ body.is-mobile .tmr-gloss-bar .tmr-gloss-tile:hover {
 	color: inherit !important;
 }
 
-/* One-time first-run hint above the Library settings gear. Shape mirrors the
-   reader's progress "Back" pill (.tmr-progress-back), but uses Obsidian's global
-   theme vars (it's body-scoped, outside .tmr-root) and fixed positioning (so the
-   strip's overflow can't clip it). */
-.tmr-lib-feedback-hint {
-	position: fixed;
-	z-index: 60;
-	display: inline-flex;
-	align-items: center;
-	max-width: 300px;
-	background: var(--background-secondary);
-	border: 1px solid var(--background-modifier-border);
-	border-radius: var(--radius-s, 6px);
-	color: var(--text-normal);
-	font-size: 12px;
-	line-height: 1.35;
-	padding: 6px 10px;
-	box-shadow: var(--shadow-s);
-	cursor: pointer;
-	opacity: 0;
-	transform: translateY(4px);
-	transition: opacity 200ms ease, transform 200ms ease;
-}
-
-.tmr-lib-feedback-hint-visible {
-	opacity: 1;
-	transform: translateY(0);
-}
-
-.tmr-lib-feedback-hint-caret {
-	position: absolute;
-	top: 100%;
-	width: 8px;
-	height: 8px;
-	background: var(--background-secondary);
-	border-right: 1px solid var(--background-modifier-border);
-	border-bottom: 1px solid var(--background-modifier-border);
-	transform: translate(-50%, -50%) rotate(45deg);
-}
-
 /* Return-point marker dot sitting on the progress bar itself. */
 .tmr-progress-back-marker {
 	position: absolute;
@@ -2073,6 +2033,32 @@ body.is-mobile .tmr-gloss-bar .tmr-gloss-tile:hover {
 	color: #9a9799;
 }
 
+/* The sheet should read without scrolling. Obsidian caps modals at 85% of the
+   window, so take nearly all of it, and tighten the rhythm on shorter windows
+   rather than letting the list scroll. Scroll stays as the last resort. */
+.modal.tmr-help-modal:not(.tmr-help-modal-touch) {
+	max-height: calc(100vh - 32px);
+}
+
+@media (max-height: 800px) {
+	.modal.tmr-help-modal:not(.tmr-help-modal-touch) .modal-content {
+		padding: 18px 25px;
+		gap: 10px;
+	}
+
+	.tmr-help-modal:not(.tmr-help-modal-touch) .tmr-help-header {
+		gap: 4px;
+	}
+
+	.tmr-help-modal:not(.tmr-help-modal-touch) .tmr-help-row {
+		padding: 3px 0;
+	}
+
+	.tmr-help-modal:not(.tmr-help-modal-touch) .tmr-help-keycap {
+		padding: 2px 9px;
+	}
+}
+
 .tmr-toc {
 	position: absolute;
 	top: 0;
@@ -2383,6 +2369,42 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 
 .tmr-error { color: var(--destructive); }
 
+/* Covers a reader tab that has been moved into a pop-out window. Sits on the
+   leaf container, outside `.tmr-root`, so it survives shell re-renders. */
+.workspace-leaf-content:has(> .tmr-popout-guard) {
+	position: relative;
+}
+
+.tmr-popout-guard {
+	position: absolute;
+	inset: 0;
+	z-index: 100;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 8px;
+	padding: 24px;
+	text-align: center;
+	background: var(--background-primary);
+}
+
+.tmr-popout-guard-title {
+	font-size: var(--font-ui-large);
+	font-weight: var(--font-semibold);
+	color: var(--text-normal);
+}
+
+.tmr-popout-guard-text {
+	max-width: 36ch;
+	font-size: var(--font-ui-medium);
+	color: var(--text-muted);
+}
+
+.tmr-popout-guard button {
+	margin-top: 8px;
+}
+
 /* ── Annotation preview (hover over saved highlights) ────────────────────────
    Body-scoped floater (escapes .tmr-root's `contain`) that surfaces the
    annotation's user text when the pointer hovers a saved highlight. Mirrors
@@ -2476,6 +2498,12 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	color: var(--muted-foreground, #8c8787);
 	font-style: italic;
 	opacity: 0.8;
+}
+
+/* Only a floater with something to click takes the pointer; every other
+   preview stays transparent so it can't swallow a click meant for the page. */
+.tmr-annotation-preview-actionable {
+	pointer-events: auto;
 }
 
 /* ── Gloss callouts (companion doc) ──────────────────────────────────────────
@@ -2919,20 +2947,26 @@ body.is-mobile .tmr-highlights-panel {
 	   navbar is actually there. `tmr-immersive` is the navbar's own visibility
 	   (ReaderView.syncMobileChrome sets both), and a pane spends most of its
 	   life with the chrome down, where reserving for it holds 86px of dead
-	   space under a navbar that isn't on screen. The two states that *do* show
-	   it — a pane opening, and the chat box taking focus — are exactly the ones
-	   that want it. The transitions above match the navbar's own animation so
-	   nothing jumps.
+	   space under a navbar that isn't on screen. The state that *does* show it —
+	   a pane opening — is exactly the one that wants it. The transitions above
+	   match the navbar's own animation so nothing jumps.
 
-	   Zero, not the safe-area inset: the home indicator is never painted over
-	   the app on this platform, so reserving for it only shortens the list. */
+	   The navbar's height alone, never `--safe-area-inset-bottom`: the home
+	   indicator is never painted over the app on this platform, and Obsidian
+	   folds the on-screen keyboard's height into that inset while `.tmr-root`
+	   is already paying it as padding — so including it here charged the
+	   keyboard twice and collapsed the chat log to a strip. */
 	body.is-mobile {
-		--tmr-navbar-clear: calc(
-			var(--safe-area-inset-bottom, 0px) + var(--mobile-toolbar-height, 52px)
-		);
+		--tmr-navbar-clear: var(--mobile-toolbar-height, 52px);
 	}
 
 	body.is-mobile.tmr-immersive {
+		--tmr-navbar-clear: 0px;
+	}
+
+	/* Focus means the keyboard is up, and Obsidian does not draw the navbar
+	   above it — so there is nothing left to clear. */
+	body.is-mobile .tmr-conv-screen:focus-within {
 		--tmr-navbar-clear: 0px;
 	}
 
@@ -3920,7 +3954,11 @@ body.is-mobile .tmr-highlights-item-delete::after {
 	position: absolute;
 	left: 0.75rem;
 	right: 0.75rem;
-	bottom: 0.75rem;
+	/* Absolute offsets resolve against the containing block's *padding* box, so
+	   the screen's navbar clearance cannot move this box — it has to ride the
+	   same variable itself or it stays at the panel's floor. */
+	bottom: calc(0.75rem + var(--tmr-navbar-clear, 0px));
+	transition: bottom 240ms ease;
 	z-index: 2;
 	/* 80%-opacity sidebar surface (Update2) — lets the mode glow and the
 	   bubbles passing underneath breathe through, frosted by the blur. */
@@ -4097,6 +4135,45 @@ body.is-mobile .tmr-highlights-item-delete::after {
 .tmr-citation:hover {
 	background: color-mix(in srgb, var(--tmr-c-examine) 25%, transparent);
 	color: var(--text-accent-hover, var(--tmr-c-examine));
+}
+
+/* ── Settings: footer button row ───────────────────────────────────────── */
+.tmr-settings-footer {
+	display: flex;
+	gap: 0.5rem;
+	margin-top: 2rem;
+	padding-top: 1.25rem;
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+.tmr-settings-footer-btn {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 0.35rem;
+	padding: 0.85rem 0.5rem;
+	height: auto;
+	box-shadow: none;
+	color: var(--text-muted);
+	transition: color 120ms ease, background 120ms ease;
+}
+
+.tmr-settings-footer-btn:hover {
+	color: var(--text-normal);
+}
+
+.tmr-settings-footer-icon {
+	display: flex;
+}
+
+.tmr-settings-footer-icon .svg-icon {
+	width: 1.15rem;
+	height: 1.15rem;
+}
+
+.tmr-settings-footer-label {
+	font-size: var(--font-ui-smaller);
 }
 
 /* ── Settings: provider accordion ──────────────────────────────────────── */
@@ -4529,6 +4606,14 @@ body.is-mobile .tmr-highlights-item-delete::after {
 	line-height: 1.15;
 	color: var(--foreground);
 	transition: color 150ms ease;
+	/* `anywhere`, not `break-word`: it also feeds the grid's min-content sizing,
+	   so a filename-derived title can't widen its track. */
+	overflow-wrap: anywhere;
+	overflow: hidden;
+	display: -webkit-box;
+	-webkit-line-clamp: 2;
+	line-clamp: 2;
+	-webkit-box-orient: vertical;
 }
 
 .tmr-lib-card:hover .tmr-lib-card-title,
@@ -4541,6 +4626,12 @@ body.is-mobile .tmr-highlights-item-delete::after {
 	font-style: italic;
 	font-size: 13px;
 	color: var(--muted-foreground);
+	overflow-wrap: anywhere;
+	overflow: hidden;
+	display: -webkit-box;
+	-webkit-line-clamp: 2;
+	line-clamp: 2;
+	-webkit-box-orient: vertical;
 }
 
 .tmr-lib-card-foot {

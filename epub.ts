@@ -384,7 +384,7 @@ export async function renderSpineRange(
 
 	for (let i = start; i <= end; i++) {
 		const item = book.spine[i];
-		const wrapper = document.createElement("div");
+		const wrapper = createDiv();
 		wrapper.className = "tmr-spine-item";
 		wrapper.dataset.spineIndex = String(i);
 		container.appendChild(wrapper);
@@ -456,7 +456,7 @@ export async function renderSpineRange(
 		wrapCitations(wrapper, book.citations);
 
 		// Yield to the browser so Obsidian stays responsive
-		await new Promise<void>(r => requestAnimationFrame(() => r()));
+		await new Promise<void>(r => window.requestAnimationFrame(() => r()));
 	}
 }
 
@@ -830,7 +830,7 @@ function wrapCalloutGroups(root: HTMLElement): void {
 		let run: Element[] = [];
 		const flush = () => {
 			if (run.length === 0) return;
-			const group = document.createElement('div');
+			const group = createDiv();
 			group.className = 'tmr-callout-group';
 			parent.insertBefore(group, run[0]);
 			let prevWasContent = false;
@@ -898,7 +898,7 @@ function wrapCitations(root: HTMLElement, citations: Record<number, EpubCitation
 			const cite = citations[num];
 			if (cite === undefined) continue;
 			if (m.index > cursor) pieces.push(document.createTextNode(text.slice(cursor, m.index)));
-			const link = document.createElement('a');
+			const link = createEl('a');
 			link.className = 'tmr-citation';
 			link.setAttribute('href', cite.href);
 			link.dataset.cite = String(num);
@@ -1113,4 +1113,32 @@ function resolveTocHrefs(items: EpubTocItem[], baseDir: string): EpubTocItem[] {
 			children: resolveTocHrefs(item.children, baseDir),
 		};
 	});
+}
+
+/** Structural, not Node's own types: this module loads on mobile, where an
+ *  `fs`/`path` reference at module scope would break the bundle. */
+export interface EpubPackFs {
+	join(...parts: string[]): string;
+	list(dir: string): { name: string; isDirectory: boolean }[];
+	readFile(path: string): Uint8Array;
+}
+
+/** `mimetype` must be the first entry and stored uncompressed, or strict readers
+ *  reject the file. Dotfiles are skipped so OS junk stays out. */
+export async function packEpubFolder(folderPath: string, fsx: EpubPackFs): Promise<ArrayBuffer> {
+	const zip = new JSZip();
+	zip.file("mimetype", fsx.readFile(fsx.join(folderPath, "mimetype")), { compression: "STORE" });
+
+	const addDir = (dir: string, prefix: string): void => {
+		for (const entry of fsx.list(dir)) {
+			if (entry.name.startsWith(".")) continue;
+			const childPath = fsx.join(dir, entry.name);
+			const zipPath = prefix + entry.name;
+			if (entry.isDirectory) addDir(childPath, `${zipPath}/`);
+			else if (zipPath !== "mimetype") zip.file(zipPath, fsx.readFile(childPath), { compression: "DEFLATE" });
+		}
+	};
+	addDir(folderPath, "");
+
+	return zip.generateAsync({ type: "arraybuffer" });
 }
