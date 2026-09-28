@@ -2,6 +2,12 @@ import {
 	Plugin,
 	PluginSettingTab,
 	Setting,
+	SettingGroup,
+	SettingPage,
+	type SettingDefinition,
+	type SettingDefinitionItem,
+	type SettingDefinitionPage,
+	Menu,
 	App,
 	ItemView,
 	WorkspaceLeaf,
@@ -174,6 +180,60 @@ interface ThirdMindReaderSettings {
 	 *  to 22 should be able to get back to tracking without remembering what
 	 *  the app's value used to be. */
 	readerFontSize: number | null;
+	readerFont: ReaderFont;
+	/** The rest of Appearance follows the same rule as `readerFontSize`: `null`
+	 *  means "use the default", so retuning a default reaches everyone who never
+	 *  moved the slider. Line width and margins are scale factors, not lengths,
+	 *  because data.json syncs between a desktop and a phone. */
+	readerLineHeight: number | null;
+	readerParagraphSpacing: number | null;
+	readerLineWidth: number | null;
+	readerMargins: number | null;
+	/** How the neighbouring pages that bleed into the side margins are drawn.
+	 *  Desktop only: touch layouts always clip them. */
+	readerAdjacentPages: "default" | "muted" | "hidden";
+}
+
+/** `family: null` is the reader's own default: Labrada in 3C mode, Obsidian's
+ *  text font otherwise. */
+const READER_FONTS = {
+	default: { label: "Reader default", family: null },
+	obsidian: { label: "Obsidian's text font", family: "var(--font-text)" },
+	labrada: { label: "Labrada", family: "\"Labrada\", serif" },
+	rosarivo: { label: "Rosarivo", family: "\"Rosarivo\", serif" },
+	serif: { label: "System serif", family: "ui-serif, Georgia, serif" },
+	sans: { label: "System sans-serif", family: "system-ui, -apple-system, sans-serif" },
+} as const;
+type ReaderFont = keyof typeof READER_FONTS;
+
+/** Keep in sync with the fallbacks in styles.css (`--tmr-line-height`,
+ *  `--tmr-para-spacing`). */
+const APPEARANCE_DEFAULTS = {
+	lineHeight: 1.65,
+	paragraphSpacing: 1.1,
+	lineWidth: 1,
+	margins: 1,
+};
+
+/** The CSS variables the reader's appearance settings drive. `null` leaves the
+ *  stylesheet's default in force. */
+function appearanceVars(settings: ThirdMindReaderSettings): Record<string, string | null> {
+	const num = (n: number | null, unit = ""): string | null => (n === null ? null : `${n}${unit}`);
+	return {
+		"--tmr-font-size": num(settings.readerFontSize, "px"),
+		"--tmr-body-font": READER_FONTS[settings.readerFont]?.family ?? null,
+		"--tmr-line-height": num(settings.readerLineHeight),
+		"--tmr-para-spacing": num(settings.readerParagraphSpacing, "em"),
+		"--tmr-line-width-scale": num(settings.readerLineWidth),
+		"--tmr-margin-scale": num(settings.readerMargins),
+	};
+}
+
+function applyCssVars(el: HTMLElement, vars: Record<string, string | null>): void {
+	for (const [name, value] of Object.entries(vars)) {
+		if (value === null) el.style.removeProperty(name);
+		else el.style.setProperty(name, value);
+	}
 }
 
 /** Prompts that must fire at most once per vault. */
@@ -197,6 +257,12 @@ const DEFAULT_SETTINGS: ThirdMindReaderSettings = {
 	seenOnce: {},
 	quickHighlight: { desktop: true, mobile: false },
 	readerFontSize: null,
+	readerFont: "default",
+	readerLineHeight: null,
+	readerParagraphSpacing: null,
+	readerLineWidth: null,
+	readerMargins: null,
+	readerAdjacentPages: "default",
 };
 
 /** Bounds of the reader text-size override. Wider than Obsidian's own slider at
@@ -591,9 +657,9 @@ export class ReaderView extends ItemView {
 	private posAnchor: { sectionIdx: number; offset: number; count: number } | null = null;
 	private tocAnchorPageMap: Array<{ spreadOffset: number; href: string }> = [];
 
-	/** Last text size `applyReaderFontSize` resolved, in px; 0 before the first
-	 *  call. Guards the repaginate so unrelated settings saves are free. */
-	private appliedFontSize = 0;
+	/** Last `appearanceSignature()` applied; empty before the first call. Guards
+	 *  the repaginate so unrelated settings saves are free. */
+	private appliedAppearance = "";
 
 	private tocOpen = false;
 
@@ -1186,27 +1252,37 @@ export class ReaderView extends ItemView {
 	}
 
 	// ─── REGION: Theme ───────────────────────────────────────────────────────
-	/** Push the reader text-size setting onto the view root as `--tmr-font-size`,
-	 *  or clear it when following Obsidian's own size. Repaginates only when the
-	 *  *resolved* size actually moved: this runs from `saveSettings`, which fires
-	 *  for every settings change, and rebuilding a book because someone toggled
-	 *  streaming would be absurd. Measured rather than compared against the
-	 *  stored setting, so switching the override off at a value equal to the
-	 *  app's is correctly a no-op. */
-	applyReaderFontSize(): void {
-		const override = this.plugin.settings.readerFontSize;
-		if (typeof override === "number") {
-			this.contentEl.style.setProperty("--tmr-font-size", `${override}px`);
-		} else {
-			this.contentEl.style.removeProperty("--tmr-font-size");
-		}
-		const resolved = Math.round(this.getSpreadFontSize());
-		if (resolved === this.appliedFontSize) return;
-		const first = this.appliedFontSize === 0;
-		this.appliedFontSize = resolved;
+	/** Push the Appearance settings onto the view root as CSS variables.
+	 *  Repaginates only when the resulting layout inputs actually moved: this runs
+	 *  from `saveSettings`, which fires for every settings change, and rebuilding a
+	 *  book because someone toggled streaming would be absurd. */
+	applyReaderAppearance(): void {
+		applyCssVars(this.contentEl, appearanceVars(this.plugin.settings));
+		const adjacent = this.plugin.settings.readerAdjacentPages;
+		this.contentEl.toggleClass("tmr-adjacent-muted", adjacent === "muted");
+		this.contentEl.toggleClass("tmr-adjacent-hidden", adjacent === "hidden");
+		const signature = this.appearanceSignature();
+		if (signature === this.appliedAppearance) return;
+		const first = this.appliedAppearance === "";
+		this.appliedAppearance = signature;
 		// No book on screen yet (renderShell) — the load that follows measures at
-		// the new size anyway, so a layout pass here would be wasted work.
+		// the new values anyway, so a layout pass here would be wasted work.
 		if (!first) this.queueResize();
+	}
+
+	/** Everything Appearance changes that decides how much text fits a page. Text
+	 *  size is measured rather than read from settings, so switching the override
+	 *  off at the app's own size is correctly a no-op, and pinch-zoom counts. */
+	private appearanceSignature(): string {
+		const s = this.plugin.settings;
+		return [
+			Math.round(this.getSpreadFontSize()),
+			s.readerFont,
+			s.readerLineHeight,
+			s.readerParagraphSpacing,
+			s.readerLineWidth,
+			s.readerMargins,
+		].join("|");
 	}
 
 	applyThemeClasses(): void {
@@ -1246,7 +1322,7 @@ export class ReaderView extends ItemView {
 		root.addClass("tmr-root");
 		// Before the first paint, so the book is measured at its final text size
 		// rather than laid out at Obsidian's and repaginated a frame later.
-		this.applyReaderFontSize();
+		this.applyReaderAppearance();
 		// Survive `empty()` — the controls they hide are about to be rebuilt.
 		root.removeClass("tmr-pane-open");
 		root.removeClass("tmr-search-open");
@@ -2267,18 +2343,11 @@ export class ReaderView extends ItemView {
 		const h = rawH - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0);
 		const mode = this.resolveLayoutMode();
 		const gap = Math.round(this.getColumnGap(mode));
-		// Text size belongs in the key: it changes how much fits in a column, so
-		// two different sizes at one pane size are genuinely different layouts.
-		// It used to be absent and get away with it — Obsidian's own font-size
-		// setting also drives the document root, and our gutters are rem-based,
-		// so changing it moved the padding and therefore w/h. The reader font
-		// override (settings → Reading) has no such side effect: same pane, same
-		// w/h, bigger text, and every section would have served its stale spread
-		// count from the cache. Measured off the spread rather than read from
-		// settings, so it stays right however the size arrives — app setting,
-		// override, or Obsidian's pinch-to-zoom.
-		const fs = Math.round(this.getSpreadFontSize());
-		return `${Math.max(0, Math.round(w))}x${Math.max(0, Math.round(h))}@${mode}:${gap}:${fs}`;
+		// Appearance belongs in the key: text size, font and spacing change how much
+		// fits in a column without changing the pane, so without it every section
+		// would serve its stale spread count from the cache.
+		const appearance = this.appearanceSignature();
+		return `${Math.max(0, Math.round(w))}x${Math.max(0, Math.round(h))}@${mode}:${gap}:${appearance}`;
 	}
 
 	// Wait until the spread element's width and height remain unchanged for
@@ -2980,10 +3049,18 @@ export class ReaderView extends ItemView {
 		if (unit && spread >= 0 && spread < unit.spreadCount) this.goToSpread(spread);
 	}
 
+	/** Reads the base token and the scale separately: `--tmr-line-width` itself is
+	 *  a `calc()`, which a custom property's computed value leaves unevaluated. */
 	private getReadableLineWidth(): number {
-		const raw = getComputedStyle(this.contentEl).getPropertyValue("--tmr-line-width").trim();
+		const raw = getComputedStyle(this.contentEl).getPropertyValue("--tmr-line-width-base").trim();
 		const width = parseFloat(raw);
-		return Number.isFinite(width) && width > 0 ? width : 680;
+		const base = Number.isFinite(width) && width > 0 ? width : 680;
+		return base * this.cssScale(this.contentEl, "--tmr-line-width-scale");
+	}
+
+	private cssScale(el: HTMLElement, name: string): number {
+		const value = parseFloat(getComputedStyle(el).getPropertyValue(name));
+		return Number.isFinite(value) && value > 0 ? value : 1;
 	}
 
 	/** The spread's computed body size in px — Obsidian's own text-size setting
@@ -3003,6 +3080,10 @@ export class ReaderView extends ItemView {
 	 *  is converted here: rem against the document root, em against the spread. */
 	private getMinSidePaddingPx(spread: HTMLElement | null = this.spreadEl): number {
 		if (!spread) return 72;
+		return this.getBaseSidePaddingPx(spread) * this.cssScale(spread, "--tmr-margin-scale");
+	}
+
+	private getBaseSidePaddingPx(spread: HTMLElement): number {
 		const raw = getComputedStyle(spread).getPropertyValue("--tmr-side-pad-min").trim();
 		const value = parseFloat(raw);
 		if (!Number.isFinite(value)) return this.getSpreadFontSize(spread) * 4.5;
@@ -3433,8 +3514,10 @@ export class ReaderView extends ItemView {
 
 	// ─── REGION: Gloss UI ────────────────────────────────────────────────────
 
+	/** A note being added to a saved highlight counts: it has no live selection
+	 *  behind it, but outside clicks, Escape and page turns must still close it. */
 	private isGlossActive(): boolean {
-		return this.activeHighlight !== null;
+		return this.activeHighlight !== null || this.editingNoteIdx !== null;
 	}
 
 	/** The gloss mode a numeric shortcut (1–5) maps to right now, or null if the
@@ -4086,14 +4169,14 @@ export class ReaderView extends ItemView {
 			!overlay ||
 			this.savedHighlights.length === 0
 		) {
-			this.hideAnnotationPreview(true);
+			this.hideAnnotationPreview();
 			return;
 		}
 
 		const matchedIdx = hitTestHighlightRects(overlay, e.clientX, e.clientY);
 		const saved = matchedIdx === -1 ? null : this.savedHighlights[matchedIdx];
 		if (!saved) {
-			this.hideAnnotationPreview(true);
+			this.hideAnnotationPreview();
 			return;
 		}
 		this.annotationPreview.showFor(matchedIdx, saved, e.clientX, e.clientY);
@@ -4127,8 +4210,6 @@ export class ReaderView extends ItemView {
 			return true;
 		}
 
-		// The preview's add-note line is only reachable if the pointer crosses the
-		// gap to it before the grace period expires, so the click does the same job.
 		if (saved.mode === "emphasise" && !saved.userText.trim()) {
 			this.beginAddNote(matchedIdx, new DOMRect(e.clientX, e.clientY, 0, 0));
 			return true;
@@ -4163,16 +4244,14 @@ export class ReaderView extends ItemView {
 		return true;
 	}
 
-	/** `soft` is the pointer-left-the-rect case, which gives a floater carrying
-	 *  the add-note line time to be reached. Every other caller means it. */
-	private hideAnnotationPreview(soft = false): void {
+	private hideAnnotationPreview(): void {
 		if (this.annotationPreview.hoveredIdx === -1) return;
-		if (soft) this.annotationPreview.hideSoft();
-		else this.annotationPreview.hide();
+		this.annotationPreview.hide();
 	}
 
-	/** "+ Add a note" on a note-less Emphasise preview. `editingNoteIdx` is what
-	 *  routes the submit to that highlight instead of to a live selection. */
+	/** Note input for a note-less Emphasise highlight: a desktop click on it, or
+	 *  the touch preview's "+ Add a note". `editingNoteIdx` is what routes the
+	 *  submit to that highlight instead of to a live selection. */
 	private beginAddNote(idx: number, fallback?: DOMRect): void {
 		if (!this.savedHighlights[idx]) return;
 		// A click can arrive with no preview raised, whose rect then measures zero.
@@ -5616,7 +5695,7 @@ export default class ThirdMindReader extends Plugin {
 			if (view instanceof ReaderView) {
 				view.applyThemeClasses();
 				view.applyAiFeaturesState();
-				view.applyReaderFontSize();
+				view.applyReaderAppearance();
 			}
 		});
 		this.app.workspace.getLeavesOfType(LIBRARY_VIEW_TYPE).forEach((leaf) => {
@@ -5677,6 +5756,31 @@ function buildFeedbackUrl(pluginVersion: string): string {
 	return `${FEEDBACK_FORM_BASE}?${params.toString()}`;
 }
 
+/** Thoreau, Walden (1854). Book prose, not UI copy, so kept out of the
+ *  sentence-case lint, which would lowercase every "I". */
+const APPEARANCE_SAMPLE = [
+	"I went to the woods because I wished to live deliberately, to front only the essential facts of life, and see if I could not learn what it had to teach, and not, when I came to die, discover that I had not lived.",
+	"I did not wish to live what was not life, living is so dear; nor did I wish to practise resignation, unless it was quite necessary.",
+];
+
+const SYSTEM_PROMPT_MODES: { id: AiPromptMode; label: string; desc: string }[] = [
+	{ id: "explain", label: "Explain", desc: "Concise, knowledge-only answers." },
+	{ id: "examine", label: "Examine", desc: "In-depth research with cited footnotes." },
+	{ id: "exclaim", label: "Exclaim", desc: "Warm, empathetic response to a reaction." },
+	{ id: "enquiry", label: "Enquiry", desc: "Open-ended, conversational discussion." },
+];
+
+/** A settings sub-page drawn imperatively. Unlike a declarative page it isn't
+ *  re-resolved by name while open, so renaming what it edits can't blank it. */
+function customSettingPage(render: (el: HTMLElement) => void): SettingPage {
+	return new (class extends SettingPage {
+		display(): void {
+			this.containerEl.empty();
+			render(this.containerEl);
+		}
+	})();
+}
+
 class TmrSettingTab extends PluginSettingTab {
 	constructor(app: App, private plugin: ThirdMindReader) {
 		super(app, plugin);
@@ -5684,13 +5788,11 @@ class TmrSettingTab extends PluginSettingTab {
 
 	/** Which vault folder holds the user's books. Committed on blur/Enter rather
 	 *  than per keystroke, so a half-typed path never becomes the library. */
-	private renderLibraryFolderSetting(parent: HTMLElement): void {
+	private renderLibraryFolderSetting(setting: Setting): void {
 		const pinned = this.plugin.settings.annotationsFolder;
-		const setting = new Setting(parent)
-			.setName("Library folder")
-			.setDesc(pinned
-				? `Vault folder holding your books. Annotations stay in ${pinned}.`
-				: "Vault folder holding your books. Point this at a folder you already keep EPUBs and PDFs in — it will be created if it doesn't exist.");
+		setting.setDesc(pinned
+			? `Vault folder holding your books. Annotations stay in ${pinned}.`
+			: "Vault folder holding your books. Point this at a folder you already keep EPUBs and PDFs in — it will be created if it doesn't exist.");
 
 		setting.addText((t) => {
 			t.setPlaceholder(DEFAULT_LIBRARY_ROOT).setValue(this.plugin.settings.libraryRoot);
@@ -5698,7 +5800,7 @@ class TmrSettingTab extends PluginSettingTab {
 			const commit = (): void => {
 				const target = normalizePath(t.inputEl.value.trim() || DEFAULT_LIBRARY_ROOT);
 				if (target === this.plugin.settings.libraryRoot) return;
-				void this.plugin.applyLibraryRoot(target).then(() => this.display());
+				void this.plugin.applyLibraryRoot(target).then(() => this.update());
 			};
 			t.inputEl.addEventListener("blur", commit);
 			t.inputEl.addEventListener("keydown", (e) => {
@@ -5710,122 +5812,338 @@ class TmrSettingTab extends PluginSettingTab {
 		});
 	}
 
-	/** Reader text size: a "use Obsidian's" switch, plus the slider that appears
-	 *  only once it's off. Repaints its own block rather than calling `display()`
-	 *  on toggle — a full redraw would collapse every expanded provider panel
-	 *  further down the tab. */
-	private renderTextSizeSetting(parent: HTMLElement): void {
-		const block = parent.createDiv();
-		const paint = (): void => {
-			block.empty();
-			const following = this.plugin.settings.readerFontSize === null;
-
-			new Setting(block)
-				.setName("Use Obsidian's text size")
-				.setDesc("Book text matches Appearance → Font size, so it changes with the rest of the app. Turn this off to set a size for the reader alone.")
-				.addToggle(t => t
-					.setValue(following)
-					.onChange(async (v) => {
-						// Seeded with the size already on screen, so flipping the
-						// switch off changes nothing until the slider moves.
-						this.plugin.settings.readerFontSize = v ? null : appTextSize();
-						await this.plugin.saveSettings();
-						paint();
-					}));
-
-			if (following) return;
-
-			const current = this.plugin.settings.readerFontSize ?? appTextSize();
-			const setting = new Setting(block)
-				.setName("Reader text size")
-				.setDesc("Size of book text in pixels. Affects the reader only — notes and the rest of Obsidian are untouched.")
-				.addExtraButton(b => b
-					.setIcon("rotate-ccw")
-					.setTooltip("Match Obsidian's text size")
-					.onClick(async () => {
-						this.plugin.settings.readerFontSize = appTextSize();
-						await this.plugin.saveSettings();
-						paint();
-					}));
-			// Created between the reset button and the slider so the row reads
-			// [reset] [18] [────●────], the same order as Obsidian's own.
-			const value = setting.controlEl.createSpan({
-				cls: "tmr-setting-slider-value",
-				text: String(current),
-			});
-			setting.addSlider(s => {
-				s.setLimits(READER_FONT_MIN, READER_FONT_MAX, 1)
-					.setValue(current)
-					// Commit on release, not on every drag tick: each change
-					// repaginates the open book.
-					.setInstant(false)
-					.onChange(async (n) => {
-						this.plugin.settings.readerFontSize = n;
-						await this.plugin.saveSettings();
-					});
-				// The number still tracks the thumb while dragging, so the slider
-				// reads live even though nothing has been committed yet.
-				s.sliderEl.addEventListener("input", () => value.setText(s.sliderEl.value));
-			});
+	private appearancePage(): SettingDefinitionPage {
+		const fontOptions: Record<string, string> = {};
+		for (const [id, font] of Object.entries(READER_FONTS)) fontOptions[id] = font.label;
+		const percent = (n: number): string => `${Math.round(n * 100)}%`;
+		return {
+			type: "page",
+			name: "Appearance",
+			desc: "Font, text size, spacing and margins for book text.",
+			displayValue: () => {
+				const settings = this.plugin.settings;
+				const font = (READER_FONTS[settings.readerFont] ?? READER_FONTS.default).label;
+				return `${font} · ${settings.readerFontSize === null ? "app size" : `${settings.readerFontSize}px`}`;
+			},
+			items: [
+				{
+					name: "Preview",
+					searchable: false,
+					render: (setting) => this.renderSample(setting),
+				},
+				{
+					type: "group",
+					heading: "Text",
+					items: [
+						{
+							name: "Font",
+							desc: "Reader default is Labrada in 3C mode and Obsidian's text font otherwise.",
+							control: { type: "dropdown", key: "readerFont", options: fontOptions },
+						},
+						{
+							name: "Use Obsidian's text size",
+							desc: "Book text matches Appearance → Font size, so it changes with the rest of the app. Turn this off to set a size for the reader alone.",
+							control: { type: "toggle", key: "followAppTextSize" },
+						},
+						{
+							name: "Reader text size",
+							desc: "Size of book text in pixels. Affects the reader only — notes and the rest of Obsidian are untouched.",
+							visible: () => this.plugin.settings.readerFontSize !== null,
+							render: (setting) => this.renderLiveSlider(setting, {
+								min: READER_FONT_MIN,
+								max: READER_FONT_MAX,
+								step: 1,
+								current: this.plugin.settings.readerFontSize ?? appTextSize(),
+								format: String,
+								resetTooltip: "Match Obsidian's text size",
+								save: (n) => { this.plugin.settings.readerFontSize = n ?? appTextSize(); },
+								sampleVar: ["--tmr-font-size", "px"],
+							}),
+						},
+						this.appearanceSlider({
+							key: "readerLineHeight",
+							name: "Line spacing",
+							desc: "Height of each line, as a multiple of the text size.",
+							fallback: APPEARANCE_DEFAULTS.lineHeight,
+							min: 1.2, max: 2.2, step: 0.05,
+							format: (n) => n.toFixed(2),
+							sampleVar: ["--tmr-line-height", ""],
+						}),
+						this.appearanceSlider({
+							key: "readerParagraphSpacing",
+							name: "Paragraph spacing",
+							desc: "Gap between paragraphs, as a multiple of the text size.",
+							fallback: APPEARANCE_DEFAULTS.paragraphSpacing,
+							min: 0, max: 2, step: 0.1,
+							format: (n) => n.toFixed(1),
+							sampleVar: ["--tmr-para-spacing", "em"],
+						}),
+					],
+				},
+				{
+					type: "group",
+					heading: "Page",
+					items: [
+						this.appearanceSlider({
+							key: "readerLineWidth",
+							name: "Line width",
+							desc: "Longest a line of text can run, relative to Obsidian's readable line length. Matters most in a wide window.",
+							fallback: APPEARANCE_DEFAULTS.lineWidth,
+							min: 0.6, max: 1.5, step: 0.05,
+							format: percent,
+						}),
+						this.appearanceSlider({
+							key: "readerMargins",
+							name: "Margins",
+							desc: "Space kept clear at the sides of the page. Matters most in a narrow window or on a phone.",
+							fallback: APPEARANCE_DEFAULTS.margins,
+							min: 0.5, max: 3, step: 0.1,
+							format: percent,
+						}),
+						{
+							name: "Neighbouring pages",
+							desc: "The edges of the previous and next pages that show in the side margins on desktop. Phones and tablets always hide them.",
+							control: {
+								type: "dropdown",
+								key: "readerAdjacentPages",
+								options: { default: "Default", muted: "Muted", hidden: "Hidden" },
+							},
+						},
+					],
+				},
+				{
+					type: "group",
+					items: [
+						{
+							name: "Reset appearance",
+							desc: "Return everything on this page to its default.",
+							action: () => void this.resetAppearance(),
+						},
+					],
+				},
+			],
 		};
-		paint();
 	}
 
-	display(): void {
-		const { containerEl } = this;
-		containerEl.empty();
+	private appearanceSlider(spec: {
+		key: "readerLineHeight" | "readerParagraphSpacing" | "readerLineWidth" | "readerMargins";
+		name: string;
+		desc: string;
+		fallback: number;
+		min: number;
+		max: number;
+		step: number;
+		format: (n: number) => string;
+		sampleVar?: [name: string, unit: string];
+	}): SettingDefinition {
+		return {
+			name: spec.name,
+			desc: spec.desc,
+			render: (setting) => this.renderLiveSlider(setting, {
+				min: spec.min,
+				max: spec.max,
+				step: spec.step,
+				current: this.plugin.settings[spec.key] ?? spec.fallback,
+				format: spec.format,
+				resetTooltip: "Restore default",
+				// Back at the default counts as "never moved", so a retuned default
+				// still reaches this user.
+				save: (n) => { this.plugin.settings[spec.key] = n === null || n === spec.fallback ? null : n; },
+				sampleVar: spec.sampleVar,
+			}),
+		};
+	}
 
-		// ── Library ──────────────────────────────────────────────────────
-		new Setting(containerEl).setName("Library").setHeading();
-		this.renderLibraryFolderSetting(containerEl);
-
-		// ── Reading ──────────────────────────────────────────────────────
-		new Setting(containerEl).setName("Reading").setHeading();
-		this.renderTextSizeSetting(containerEl);
-
-		new Setting(containerEl)
-			.setName("Enable AI features")
-			.setDesc("Master switch for the AI Gloss modes (Explain/Examine/Exclaim/Enquiry) and the Conversations pane. When off, the reader runs Lite: the GlossBar shows only Emphasise and the Highlights pane drops its tab bar. Auto-enables when you add your first provider.")
-			.addToggle(t => t
-				.setValue(this.plugin.settings.aiFeaturesEnabled)
-				.onChange(async (v) => {
-					this.plugin.settings.aiFeaturesEnabled = v;
+	/** Previews while dragging and saves on release: every save re-flows the open
+	 *  book. `save(null)` is the reset button. */
+	private renderLiveSlider(setting: Setting, spec: {
+		min: number;
+		max: number;
+		step: number;
+		current: number;
+		format: (n: number) => string;
+		resetTooltip: string;
+		save: (n: number | null) => void;
+		sampleVar?: [name: string, unit: string];
+	}): void {
+		setting.addExtraButton(b => b
+			.setIcon("rotate-ccw")
+			.setTooltip(spec.resetTooltip)
+			.onClick(async () => {
+				spec.save(null);
+				await this.plugin.saveSettings();
+				this.update();
+			}));
+		// Created between the reset button and the slider so the row reads
+		// [reset] [18] [────●────], the same order as Obsidian's own.
+		const value = setting.controlEl.createSpan({
+			cls: "tmr-setting-slider-value",
+			text: spec.format(spec.current),
+		});
+		setting.addSlider(s => {
+			s.setLimits(spec.min, spec.max, spec.step)
+				.setValue(spec.current)
+				.setInstant(false)
+				.onChange(async (n) => {
+					spec.save(n);
 					await this.plugin.saveSettings();
-					this.display();
-				}));
-
-		if (this.plugin.settings.aiFeaturesEnabled) {
-			this.renderAiSections(containerEl);
-		} else {
-			const quickKey = Platform.isMobile ? "mobile" : "desktop";
-			new Setting(containerEl)
-				.setName("Quick highlight")
-				.setDesc(
-					"Selecting text opens the Emphasise note straight away instead of showing the one-tile GlossBar. Press Enter on an empty note to just highlight. "
-					+ (Platform.isMobile
-						? "Set per device — off here by default, since a stray selection would raise the keyboard."
-						: "Set per device — on here by default, off on phones and tablets."),
-				)
-				.addToggle(t => t
-					.setValue(this.plugin.settings.quickHighlight[quickKey])
-					.onChange(async (v) => {
-						this.plugin.settings.quickHighlight[quickKey] = v;
-						await this.plugin.saveSettings();
-					}));
-		}
-
-		// ── Apple Books Import ───────────────────────────────────────────
-		// Desktop-only by nature, not just by policy: the flow reads the Books
-		// container off disk through an Electron folder dialog, neither of which
-		// exists on mobile. Gate on isDesktopApp (capability), never isMobile —
-		// under `emulateMobile` Node is still present and this must keep working.
-		if (Platform.isDesktopApp) this.renderImportSection(containerEl);
-
-		this.renderFooterButtons(containerEl);
+				});
+			s.sliderEl.addEventListener("input", () => {
+				const n = Number(s.sliderEl.value);
+				value.setText(spec.format(n));
+				if (spec.sampleVar) this.sampleEl?.style.setProperty(spec.sampleVar[0], `${n}${spec.sampleVar[1]}`);
+			});
+		});
 	}
 
-	private renderFooterButtons(containerEl: HTMLElement): void {
-		const row = containerEl.createDiv({ cls: "tmr-settings-footer" });
+	private sampleEl: HTMLElement | null = null;
+
+	private renderSample(setting: Setting): () => void {
+		setting.settingEl.addClass("tmr-settings-sample-row");
+		const sample = setting.controlEl.createDiv({ cls: "tmr-settings-sample" });
+		for (const text of APPEARANCE_SAMPLE) sample.createEl("p", { text });
+		this.sampleEl = sample;
+		this.styleSample();
+		return () => {
+			if (this.sampleEl === sample) this.sampleEl = null;
+		};
+	}
+
+	/** The sample sits outside the reader, so the reader's default font is
+	 *  resolved here rather than inherited from its 3C-mode tokens. */
+	private styleSample(): void {
+		if (!this.sampleEl) return;
+		const settings = this.plugin.settings;
+		const vars = appearanceVars(settings);
+		vars["--tmr-body-font"] ??= settings.tmrMode === "3c"
+			? READER_FONTS.labrada.family
+			: READER_FONTS.obsidian.family;
+		applyCssVars(this.sampleEl, vars);
+	}
+
+	private async resetAppearance(): Promise<void> {
+		const settings = this.plugin.settings;
+		settings.readerFont = DEFAULT_SETTINGS.readerFont;
+		settings.readerFontSize = DEFAULT_SETTINGS.readerFontSize;
+		settings.readerLineHeight = DEFAULT_SETTINGS.readerLineHeight;
+		settings.readerParagraphSpacing = DEFAULT_SETTINGS.readerParagraphSpacing;
+		settings.readerLineWidth = DEFAULT_SETTINGS.readerLineWidth;
+		settings.readerMargins = DEFAULT_SETTINGS.readerMargins;
+		settings.readerAdjacentPages = DEFAULT_SETTINGS.readerAdjacentPages;
+		await this.plugin.saveSettings();
+		this.update();
+	}
+
+	getSettingDefinitions(): SettingDefinitionItem[] {
+		return [
+			{
+				type: "group",
+				heading: "Library",
+				items: [
+					{
+						name: "Library folder",
+						desc: "Vault folder holding your books.",
+						render: (setting) => this.renderLibraryFolderSetting(setting),
+					},
+					{
+						type: "page",
+						name: "Apple Books import",
+						desc: "Import exploded epub folders from Apple Books as proper .epub files.",
+						visible: Platform.isDesktopApp,
+						page: () => customSettingPage((el) => this.renderImportSection(el)),
+					},
+				],
+			},
+			{
+				type: "group",
+				heading: "Reading",
+				items: [
+					this.appearancePage(),
+					{
+						name: "Enable AI features",
+						desc: "Master switch for the AI Gloss modes (Explain/Examine/Exclaim/Enquiry) and the Conversations pane. When off, the reader runs Lite: the GlossBar shows only Emphasise and the Highlights pane drops its tab bar. Auto-enables when you add your first provider.",
+						control: { type: "toggle", key: "aiFeaturesEnabled" },
+					},
+					this.aiPage(),
+					{
+						name: "Quick highlight",
+						desc: "Selecting text opens the Emphasise note straight away instead of showing the one-tile GlossBar. Press Enter on an empty note to just highlight. "
+							+ (Platform.isMobile
+								? "Set per device — off here by default, since a stray selection would raise the keyboard."
+								: "Set per device — on here by default, off on phones and tablets."),
+						visible: () => !this.plugin.settings.aiFeaturesEnabled,
+						control: { type: "toggle", key: "quickHighlight" },
+					},
+				],
+			},
+			{
+				type: "group",
+				items: [
+					{
+						name: "Help and feedback",
+						aliases: ["How to use", "Feedback", "Tip jar"],
+						render: (setting) => this.renderFooterButtons(setting),
+					},
+				],
+			},
+		];
+	}
+
+	getControlValue(key: string): unknown {
+		const settings = this.plugin.settings;
+		switch (key) {
+			case "followAppTextSize": return settings.readerFontSize === null;
+			case "readerFont": return settings.readerFont;
+			case "readerAdjacentPages": return settings.readerAdjacentPages;
+			case "quickHighlight": return settings.quickHighlight[Platform.isMobile ? "mobile" : "desktop"];
+			case "primaryProviderId": return settings.aiDefaults.primaryProviderId ?? "";
+			case "aiFeaturesEnabled":
+			case "streaming":
+			case "deferAiToDesktop":
+				return settings[key];
+			default: return undefined;
+		}
+	}
+
+	async setControlValue(key: string, value: unknown): Promise<void> {
+		const settings = this.plugin.settings;
+		switch (key) {
+			case "followAppTextSize":
+				// Seeded with the size already on screen, so flipping the switch
+				// off changes nothing until the slider moves.
+				settings.readerFontSize = value ? null : appTextSize();
+				break;
+			case "readerFont":
+				settings.readerFont = typeof value === "string" && value in READER_FONTS
+					? value as ReaderFont
+					: "default";
+				break;
+			case "readerAdjacentPages":
+				settings.readerAdjacentPages = value === "muted" || value === "hidden" ? value : "default";
+				break;
+			case "quickHighlight":
+				settings.quickHighlight[Platform.isMobile ? "mobile" : "desktop"] = value === true;
+				break;
+			case "primaryProviderId":
+				settings.aiDefaults.primaryProviderId = typeof value === "string" && value ? value : null;
+				break;
+			case "aiFeaturesEnabled":
+			case "streaming":
+			case "deferAiToDesktop":
+				settings[key] = value === true;
+				break;
+			default: return;
+		}
+		// Not the base class's saveData: saveSettings also pushes the change to
+		// every open reader, Library and PDF view.
+		await this.plugin.saveSettings();
+		this.styleSample();
+		if (key === "followAppTextSize") this.update();
+	}
+
+	private renderFooterButtons(setting: Setting): void {
+		setting.settingEl.addClass("tmr-settings-footer-row");
+		const row = setting.controlEl.createDiv({ cls: "tmr-settings-footer" });
 
 		const tile = (label: string, icon: string, onClick: () => void): void => {
 			const btn = row.createEl("button", { cls: "tmr-settings-footer-btn" });
@@ -5841,129 +6159,145 @@ class TmrSettingTab extends PluginSettingTab {
 		tile("Tip jar", "coffee", () => { window.open(KOFI_URL, "_blank"); });
 	}
 
-	private renderAiSections(containerEl: HTMLElement): void {
-		// ── Providers list ───────────────────────────────────────────────
-		new Setting(containerEl).setName("AI providers").setHeading();
-
-		// ── Add provider (cloud + local, one dropdown) ───────────────────
-		// Local-first: TMR prioritises on-device inference, so LM Studio /
-		// Ollama lead the list and LM Studio is the default selection.
-		let pendingProvider = "lm-studio";
-		new Setting(containerEl)
-			.setName("Add provider")
-			.setDesc("Local options use an OpenAI-compatible endpoint with the default port prefilled (LM Studio :1234, Ollama :11434). Anthropic, OpenAI and OpenRouter need an API key — OpenRouter carries free model variants, which is the cheapest way to run AI on a phone.")
-			.addDropdown(d => d
-				.addOption("lm-studio", "LM Studio (local)")
-				.addOption("ollama", "Ollama (local)")
-				.addOption("generic", "OpenAI-compatible (local)")
-				.addOption("anthropic", "Anthropic")
-				.addOption("openai", "OpenAI")
-				.addOption("openrouter", "OpenRouter")
-				.setValue(pendingProvider)
-				.onChange(v => { pendingProvider = v; }))
-			.addButton(b => b.setButtonText("Add").setCta().onClick(() => {
-				switch (pendingProvider) {
-					case "ollama": return this.addProvider("openai-compatible", "ollama");
-					case "generic": return this.addProvider("openai-compatible", "generic");
-					case "anthropic": return this.addProvider("anthropic");
-					case "openai": return this.addProvider("openai");
-					case "openrouter": return this.addProvider("openai-compatible", "generic", "openrouter");
-					default: return this.addProvider("openai-compatible", "lm-studio");
-				}
-			}));
-
-		if (this.plugin.settings.aiProviders.length === 0) {
-			containerEl.createDiv({
-				cls: "setting-item-description",
-				text: "No providers configured. Add one above — local providers (LM Studio, Ollama) need only an endpoint URL; Anthropic and OpenAI need an API key.",
-			});
-		}
-		for (let i = 0; i < this.plugin.settings.aiProviders.length; i++) {
-			this.renderProviderEditor(containerEl, i);
-		}
-
-		// ── Default model ────────────────────────────────────────────────
-		// Sits below the providers list: the natural flow is add a provider
-		// first, then pick which one is the default.
-		new Setting(containerEl).setName("Default model").setHeading();
-		new Setting(containerEl)
-			.setName("Primary provider")
-			.setDesc("Used for new AI conversations unless a per-mode override is set.")
-			.addDropdown(dd => {
-				dd.addOption("", "(None)");
-				for (const p of this.plugin.settings.aiProviders) {
-					dd.addOption(p.id, `${p.id} (${p.kind})`);
-				}
-				dd.setValue(this.plugin.settings.aiDefaults.primaryProviderId ?? "");
-				dd.onChange(async (v) => {
-					this.plugin.settings.aiDefaults.primaryProviderId = v || null;
-					await this.plugin.saveSettings();
-				});
-			});
-
-		new Setting(containerEl)
-			.setName("Stream responses")
-			.setDesc(
-				"Show AI replies token-by-token as they generate, with a live "
-				+ "\"Loading model…\" → \"Thinking…\" indicator. Applies to local "
-				+ "providers (LM Studio, Ollama); cloud providers always buffer."
-				+ (Platform.isMobileApp
-					// Streaming needs a raw fetch; mobile routes through Obsidian's
-					// `requestUrl`, which returns a complete response. A LAN server
-					// can still stream, so this is a caveat, not a hard "no".
-					? " On mobile, replies usually arrive complete rather than streaming."
-					: ""))
-			.addToggle(t => t
-				.setValue(this.plugin.settings.streaming)
-				.onChange(async (v) => {
-					this.plugin.settings.streaming = v;
-					await this.plugin.saveSettings();
-				}));
-
-		// Mobile only: there is nothing to defer *to* from a desktop session, and
-		// the automatic case (no provider reachable) needs no setting at all —
-		// this is only for a phone that *could* call out but would rather not.
-		if (Platform.isMobile) {
-			new Setting(containerEl)
-				.setName("Defer AI to desktop")
-				.setDesc(
-					"Queue AI requests into the companion doc instead of calling a "
-					+ "provider from this device. A desktop session answers them the "
-					+ "next time it opens the book, or via the \"Process pending AI "
-					+ "requests\" command. Requests are queued automatically when no "
-					+ "provider is reachable, whether or not this is on.")
-				.addToggle(t => t
-					.setValue(this.plugin.settings.deferAiToDesktop)
-					.onChange(async (v) => {
-						this.plugin.settings.deferAiToDesktop = v;
-						await this.plugin.saveSettings();
-					}));
-		}
-
-		// ── AI system prompts ────────────────────────────────────────────
-		this.renderSystemPromptsSection(containerEl);
+	private aiPage(): SettingDefinitionPage {
+		const settings = this.plugin.settings;
+		const primaryOptions: Record<string, string> = { "": "(None)" };
+		for (const p of settings.aiProviders) primaryOptions[p.id] = `${p.id} (${p.kind})`;
+		return {
+			type: "page",
+			name: "AI",
+			desc: "Providers, the default model, and the instructions each Gloss mode sends.",
+			displayValue: () => this.plugin.settings.aiDefaults.primaryProviderId
+				?? this.plugin.settings.aiProviders[0]?.id
+				?? "No provider",
+			visible: () => this.plugin.settings.aiFeaturesEnabled,
+			items: [
+				{
+					type: "list",
+					heading: "Providers",
+					emptyState: "No providers yet. Local options use an OpenAI-compatible endpoint with the default port prefilled (LM Studio :1234, Ollama :11434). Anthropic, OpenAI and OpenRouter need an API key — OpenRouter carries free model variants, which is the cheapest way to run AI on a phone.",
+					addItem: { name: "Add provider", action: (el) => this.openAddProviderMenu(el) },
+					onDelete: (idx) => void this.removeProvider(idx),
+					items: this.providerPages(),
+				},
+				{
+					type: "group",
+					heading: "Default model",
+					items: [
+						{
+							name: "Primary provider",
+							desc: "Used for new AI conversations unless a per-mode override is set.",
+							control: { type: "dropdown", key: "primaryProviderId", options: primaryOptions },
+						},
+						{
+							name: "Stream responses",
+							desc: "Show AI replies token-by-token as they generate, with a live "
+								+ "\"Loading model…\" → \"Thinking…\" indicator. Applies to local "
+								+ "providers (LM Studio, Ollama); cloud providers always buffer."
+								+ (Platform.isMobileApp
+									// Streaming needs a raw fetch; mobile routes through Obsidian's
+									// `requestUrl`, which returns a complete response.
+									? " On mobile, replies usually arrive complete rather than streaming."
+									: ""),
+							control: { type: "toggle", key: "streaming" },
+						},
+						{
+							// Nothing to defer *to* from a desktop session.
+							name: "Defer AI to desktop",
+							desc: "Queue AI requests into the companion doc instead of calling a "
+								+ "provider from this device. A desktop session answers them the "
+								+ "next time it opens the book, or via the \"Process pending AI "
+								+ "requests\" command. Requests are queued automatically when no "
+								+ "provider is reachable, whether or not this is on.",
+							visible: Platform.isMobile,
+							control: { type: "toggle", key: "deferAiToDesktop" },
+						},
+					],
+				},
+				{
+					type: "page",
+					name: "System prompts",
+					desc: "Instructions sent to the model for each AI Gloss mode. Use {book} as a "
+						+ "placeholder for the book title; the selected passage is appended automatically.",
+					items: SYSTEM_PROMPT_MODES.map(({ id, label, desc }) => ({
+						name: label,
+						desc,
+						render: (setting: Setting) => this.renderSystemPrompt(setting, id),
+					})),
+				},
+			],
+		};
 	}
 
-	private renderProviderEditor(parent: HTMLElement, idx: number): void {
-		const provider = this.plugin.settings.aiProviders[idx];
-		const details = parent.createEl("details", { cls: "tmr-settings-provider" });
-		const summary = details.createEl("summary", { cls: "tmr-settings-provider-summary" });
-		summary.createSpan({ cls: "tmr-settings-provider-name", text: provider.id || "(unnamed)" });
-		const runtimeLabel = provider.localRuntime === "lm-studio" ? " · LM Studio"
-			: provider.localRuntime === "ollama" ? " · Ollama" : "";
-		summary.createSpan({ cls: "tmr-settings-provider-kind", text: ` — ${provider.kind}${runtimeLabel}` });
-		const wrap = details;
+	private providerPages(): SettingDefinitionPage[] {
+		// Obsidian opens sub-pages by name, so two providers sharing an id would
+		// both open the first one.
+		const taken = new Set<string>();
+		return this.plugin.settings.aiProviders.map((provider) => {
+			const base = provider.id || "(unnamed)";
+			let name = base;
+			for (let n = 2; taken.has(name); n++) name = `${base} (${n})`;
+			taken.add(name);
+			const runtime = provider.localRuntime === "lm-studio" ? " · LM Studio"
+				: provider.localRuntime === "ollama" ? " · Ollama" : "";
+			return {
+				type: "page",
+				name,
+				desc: `${provider.kind}${runtime}`,
+				page: () => customSettingPage((el) => this.renderProviderEditor(el, provider)),
+			};
+		});
+	}
 
-		new Setting(wrap)
+	/** Local-first: on-device providers lead the menu. */
+	private openAddProviderMenu(anchor: HTMLElement): void {
+		const menu = new Menu();
+		const option = (title: string, add: () => Promise<void>): void => {
+			menu.addItem((item) => item.setTitle(title).onClick(() => void add()));
+		};
+		option("LM Studio (local)", () => this.addProvider("openai-compatible", "lm-studio"));
+		option("Ollama (local)", () => this.addProvider("openai-compatible", "ollama"));
+		option("OpenAI-compatible (local)", () => this.addProvider("openai-compatible", "generic"));
+		option("Anthropic", () => this.addProvider("anthropic"));
+		option("OpenAI", () => this.addProvider("openai"));
+		option("OpenRouter", () => this.addProvider("openai-compatible", "generic", "openrouter"));
+		const rect = anchor.getBoundingClientRect();
+		menu.showAtPosition({ x: rect.left, y: rect.bottom });
+	}
+
+	private async removeProvider(idx: number): Promise<void> {
+		const settings = this.plugin.settings;
+		const [removed] = settings.aiProviders.splice(idx, 1);
+		if (removed && settings.aiDefaults.primaryProviderId === removed.id) {
+			// Hand the slot to whoever resolution would have fallen back to anyway,
+			// so the dropdown keeps naming the provider actually in use.
+			settings.aiDefaults.primaryProviderId = settings.aiProviders[0]?.id ?? null;
+		}
+		await this.plugin.saveSettings();
+		this.update();
+	}
+
+	private renderProviderEditor(parent: HTMLElement, provider: AiProvider): void {
+		const group = new SettingGroup(parent);
+		const row = (): Setting => {
+			let setting!: Setting;
+			group.addSetting((s) => { setting = s; });
+			return setting;
+		};
+
+		row()
 			.setName("Identifier")
 			.setDesc("User-facing name shown in the model picker.")
 			.addText(t => t.setValue(provider.id).onChange(async v => {
+				const defaults = this.plugin.settings.aiDefaults;
+				if (defaults.primaryProviderId === provider.id) defaults.primaryProviderId = v;
 				provider.id = v;
 				await this.plugin.saveSettings();
+				this.update();
 			}));
 
 		if (provider.kind === "openai-compatible") {
-			new Setting(wrap)
+			row()
 				.setName("Endpoint")
 				.setDesc(Platform.isMobileApp
 					// A phone has no model server of its own, so the only local
@@ -5988,7 +6322,7 @@ class TmrSettingTab extends PluginSettingTab {
 			// `Authorization: Bearer` when one is set — only this field was
 			// missing, so those services were unconfigurable for no reason.
 			const optional = provider.kind === "openai-compatible";
-			new Setting(wrap)
+			row()
 				.setName("API key")
 				.setDesc(
 					(optional
@@ -6015,20 +6349,17 @@ class TmrSettingTab extends PluginSettingTab {
 		const isRemote = provider.kind !== "openai-compatible"
 			|| !isLocalEndpoint(provider.endpoint);
 		if (isRemote) {
-			const note = wrap.createDiv({ cls: "setting-item-description tmr-settings-privacy" });
-			note.createSpan({
-				text: "Remote inference sends the selected passage and your annotation off this device.",
-			});
-			if ((provider.defaultModel ?? "").endsWith(":free")) {
-				note.createEl("br");
-				note.createSpan({
-					text: "Free models may retain prompts and use them for training — check your provider's data policy.",
-				});
-			}
+			row().setDesc(createFragment((note) => {
+				note.appendText("Remote inference sends the selected passage and your annotation off this device.");
+				if ((provider.defaultModel ?? "").endsWith(":free")) {
+					note.createEl("br");
+					note.appendText("Free models may retain prompts and use them for training — check your provider's data policy.");
+				}
+			}));
 		}
 
 		let modelText: TextComponent | null = null;
-		new Setting(wrap)
+		row()
 			.setName("Default model")
 			.setDesc("Model ID sent in chat requests when this provider is selected. Examples: claude-haiku-4-5-20251001 / gpt-4o-mini / llama-3-8b-instruct.")
 			.addText(t => {
@@ -6047,34 +6378,20 @@ class TmrSettingTab extends PluginSettingTab {
 					void this.plugin.saveSettings();
 				})));
 
-		new Setting(wrap)
-			.then(s => s.settingEl.addClass("tmr-settings-provider-actions"))
+		row()
+			.setName("Test connection")
+			.setDesc("Ask the server which models it offers.")
 			.addButton(b => b
-				.setButtonText("Test connection")
+				.setButtonText("Test")
 				.onClick(async () => {
 					b.setDisabled(true).setButtonText("Testing…");
 					const result = await probeProvider(provider);
-					b.setDisabled(false).setButtonText("Test connection");
+					b.setDisabled(false).setButtonText("Test");
 					if (result.available) {
 						new Notice(`✓ ${provider.id}: ${result.models.length} models available`);
 					} else {
 						new Notice(`✗ ${provider.id}: ${result.error ?? "unreachable"}`);
 					}
-				}))
-			.addExtraButton(b => b
-				.setIcon("trash-2")
-				.setTooltip("Remove provider")
-				.onClick(async () => {
-					this.plugin.settings.aiProviders.splice(idx, 1);
-					if (this.plugin.settings.aiDefaults.primaryProviderId === provider.id) {
-						// Hand the slot to whoever resolution would have fallen
-						// back to anyway, so the dropdown keeps naming the
-						// provider actually in use. Null only when none is left.
-						this.plugin.settings.aiDefaults.primaryProviderId =
-							this.plugin.settings.aiProviders[0]?.id ?? null;
-					}
-					await this.plugin.saveSettings();
-					this.display();
 				}));
 	}
 
@@ -6144,54 +6461,31 @@ class TmrSettingTab extends PluginSettingTab {
 			defaults.primaryProviderId = provider.id;
 		}
 		await this.plugin.saveSettings();
-		this.display();
+		this.update();
 	}
 
-	// ── AI system prompts ───────────────────────────────────────────────────
-
-	private renderSystemPromptsSection(container: HTMLElement): void {
-		const details = container.createEl("details", { cls: "tmr-settings-accordion" });
-		const summary = details.createEl("summary", { cls: "tmr-settings-accordion-summary" });
-		summary.createSpan({ text: "AI system prompts" });
-
-		details.createEl("p", {
-			cls: "setting-item-description tmr-settings-accordion-intro",
-			text: "Instructions sent to the model for each AI Gloss mode. Use {book} as a "
-				+ "placeholder for the book title; the selected passage is appended automatically.",
-		});
-
-		const modes: { id: AiPromptMode; label: string; desc: string }[] = [
-			{ id: "explain", label: "Explain", desc: "Concise, knowledge-only answers." },
-			{ id: "examine", label: "Examine", desc: "In-depth research with cited footnotes." },
-			{ id: "exclaim", label: "Exclaim", desc: "Warm, empathetic response to a reaction." },
-			{ id: "enquiry", label: "Enquiry", desc: "Open-ended, conversational discussion." },
-		];
-
-		for (const { id, label, desc } of modes) {
-			let textArea!: TextAreaComponent;
-			const setting = new Setting(details)
-				.setName(label)
-				.setDesc(desc)
-				.addTextArea(t => {
-					textArea = t;
-					t.setValue(this.plugin.settings.systemPrompts[id]);
-					t.inputEl.rows = 5;
-					t.inputEl.addClass("tmr-settings-prompt-input");
-					t.onChange(async v => {
-						this.plugin.settings.systemPrompts[id] = v;
-						await this.plugin.saveSettings();
-					});
-				})
-				.addExtraButton(b => b
-					.setIcon("rotate-ccw")
-					.setTooltip("Reset to default")
-					.onClick(async () => {
-						this.plugin.settings.systemPrompts[id] = DEFAULT_SYSTEM_PROMPTS[id];
-						textArea.setValue(DEFAULT_SYSTEM_PROMPTS[id]);
-						await this.plugin.saveSettings();
-					}));
-			setting.settingEl.addClass("tmr-settings-prompt-row");
-		}
+	private renderSystemPrompt(setting: Setting, id: AiPromptMode): void {
+		let textArea!: TextAreaComponent;
+		setting
+			.addTextArea(t => {
+				textArea = t;
+				t.setValue(this.plugin.settings.systemPrompts[id]);
+				t.inputEl.rows = 5;
+				t.inputEl.addClass("tmr-settings-prompt-input");
+				t.onChange(async v => {
+					this.plugin.settings.systemPrompts[id] = v;
+					await this.plugin.saveSettings();
+				});
+			})
+			.addExtraButton(b => b
+				.setIcon("rotate-ccw")
+				.setTooltip("Reset to default")
+				.onClick(async () => {
+					this.plugin.settings.systemPrompts[id] = DEFAULT_SYSTEM_PROMPTS[id];
+					textArea.setValue(DEFAULT_SYSTEM_PROMPTS[id]);
+					await this.plugin.saveSettings();
+				}));
+		setting.settingEl.addClass("tmr-settings-prompt-row");
 	}
 
 	// ── Apple Books import ──────────────────────────────────────────────────
@@ -6199,24 +6493,21 @@ class TmrSettingTab extends PluginSettingTab {
 	private importEntries: ImportEntry[] = [];
 
 	private renderImportSection(container: HTMLElement): void {
-		const section = container.createDiv({ cls: "tmr-settings-import-section" });
-
-		const head = new Setting(section)
-			.setName("Apple Books import")
-			.setDesc("Import exploded epub folders from Apple Books as proper .epub files. "
-				+ "Choose a book folder, or a folder holding several — each must contain a mimetype file.")
-			.addButton(b => b
-				.setButtonText("Select folder…")
-				.setCta()
-				.onClick(async () => {
-					const picked = await this.pickEpubFolders();
-					if (!picked.length) return;
-					this.importEntries = await this.validateEpubFolders(picked);
-					if (this.importEntries.length) this.renderImportResults(resultsEl);
-				}));
-		head.settingEl.addClass("tmr-settings-import-head");
-
-		const resultsEl = section.createDiv({ cls: "tmr-settings-import-results" });
+		const group = new SettingGroup(container);
+		const resultsEl = container.createDiv({ cls: "tmr-settings-import-results" });
+		group.addSetting((s) => {
+			s.setName("Book folder")
+				.setDesc("Choose a book folder, or a folder holding several — each must contain a mimetype file.")
+				.addButton(b => b
+					.setButtonText("Select folder…")
+					.setCta()
+					.onClick(async () => {
+						const picked = await this.pickEpubFolders();
+						if (!picked.length) return;
+						this.importEntries = await this.validateEpubFolders(picked);
+						if (this.importEntries.length) this.renderImportResults(resultsEl);
+					}));
+		});
 	}
 
 	private renderImportResults(container: HTMLElement): void {

@@ -1,5 +1,96 @@
 /* ── Third Mind Reader ──────────────────────────────────────────────────────── */
 
+/* Read by the Style Settings plugin, which applies each choice as a variable on
+   <body>. Only options that can't change how much text fits a page belong here:
+   Style Settings never tells the reader to repaginate. Layout options live in
+   the plugin's own settings → Appearance. */
+/* @settings
+
+name: Third Mind Reader
+id: third-mind-reader
+settings:
+    -
+        id: tmr-style-intro
+        type: info-text
+        markdown: true
+        description: "Font, text size, spacing and margins are in **Settings → Third Mind Reader → Appearance**."
+    -
+        id: tmr-gloss-colours
+        title: Gloss colours
+        description: "The colour of each annotation mode, used for highlights, the GlossBar and the Highlights pane. Unset, each follows your theme, or the 3C palette in 3C mode."
+        type: heading
+        level: 2
+        collapsed: true
+    -
+        id: tmr-user-emphasise
+        title: Emphasise
+        type: variable-color
+        format: hex
+        opacity: false
+        default: '#50805c'
+    -
+        id: tmr-user-exclaim
+        title: Exclaim
+        type: variable-color
+        format: hex
+        opacity: false
+        default: '#7d2e2e'
+    -
+        id: tmr-user-explain
+        title: Explain
+        type: variable-color
+        format: hex
+        opacity: false
+        default: '#ac9c5d'
+    -
+        id: tmr-user-examine
+        title: Examine
+        type: variable-color
+        format: hex
+        opacity: false
+        default: '#6396a2'
+    -
+        id: tmr-user-enquiry
+        title: Enquiry
+        type: variable-color
+        format: hex
+        opacity: false
+        default: '#8c8787'
+    -
+        id: tmr-user-bookmark
+        title: Bookmark
+        type: variable-color
+        format: hex
+        opacity: false
+        default: '#90594e'
+    -
+        id: tmr-reading
+        title: Reading
+        type: heading
+        level: 2
+        collapsed: true
+    -
+        id: tmr-highlight-strength
+        title: Highlight strength
+        description: "How strongly saved highlights tint the text behind them."
+        type: variable-number-slider
+        default: 20
+        min: 5
+        max: 60
+        step: 5
+        format: '%'
+    -
+        id: tmr-page-turn-duration
+        title: Page turn speed
+        description: "How long the slide between pages takes. 0 turns instantly."
+        type: variable-number-slider
+        default: 250
+        min: 0
+        max: 800
+        step: 50
+        format: ms
+
+*/
 
 /* ── DLS token layer (Obsidian-mapped default) ────────────────────────────────
    Stylesheet reads DLS semantic names throughout. In default mode these names
@@ -52,16 +143,16 @@
 	--color-warning: var(--color-yellow, #AC9C5D);
 
 	/* gloss mode accent colours — theme token first, 3C DLS as fallback */
-	--tmr-c-exclaim:      var(--color-red, #7d2e2e);
-	--tmr-c-exclaim-icon: var(--color-red, #af4d4d);
-	--tmr-c-explain:      var(--color-yellow, #ac9c5d);
-	--tmr-c-examine:      var(--color-cyan, #6396a2);
-	--tmr-c-emphasise:    var(--color-green, #50805c);
-	--tmr-c-enquiry:      #8c8787;
+	--tmr-c-exclaim:      var(--tmr-user-exclaim, var(--color-red, #7d2e2e));
+	--tmr-c-exclaim-icon: var(--tmr-user-exclaim, var(--color-red, #af4d4d));
+	--tmr-c-explain:      var(--tmr-user-explain, var(--color-yellow, #ac9c5d));
+	--tmr-c-examine:      var(--tmr-user-examine, var(--color-cyan, #6396a2));
+	--tmr-c-emphasise:    var(--tmr-user-emphasise, var(--color-green, #50805c));
+	--tmr-c-enquiry:      var(--tmr-user-enquiry, #8c8787);
 	/* Bookmarks — DLS `--bookmark` / HipAnima. Obsidian's extended orange
 	   when 3C is off, the DLS shade itself when it's on (same in both 3C
 	   themes, which is why the two blocks below agree). */
-	--tmr-c-bookmark:     var(--color-orange, #90594e);
+	--tmr-c-bookmark:     var(--tmr-user-bookmark, var(--color-orange, #90594e));
 
 	/* Update2 conversation-card border tokens — mode colour (icon-bright red
 	   for Exclaim, Empire-800W for Enquiry) at 33% alpha. color-mix resolves
@@ -134,13 +225,13 @@
 	--color-warning: #ac9c5d29;      /* Look @ 16% */
 
 	/* gloss mode accents — locked to DLS primitives in 3C mode */
-	--tmr-c-exclaim:      #7d2e2e;
-	--tmr-c-exclaim-icon: #af4d4d;
-	--tmr-c-explain:      #ac9c5d;
-	--tmr-c-examine:      #6396a2;
-	--tmr-c-emphasise:    #50805c;
-	--tmr-c-enquiry:      #8c8787;
-	--tmr-c-bookmark:     #90594e;
+	--tmr-c-exclaim:      var(--tmr-user-exclaim, #7d2e2e);
+	--tmr-c-exclaim-icon: var(--tmr-user-exclaim, #af4d4d);
+	--tmr-c-explain:      var(--tmr-user-explain, #ac9c5d);
+	--tmr-c-examine:      var(--tmr-user-examine, #6396a2);
+	--tmr-c-emphasise:    var(--tmr-user-emphasise, #50805c);
+	--tmr-c-enquiry:      var(--tmr-user-enquiry, #8c8787);
+	--tmr-c-bookmark:     var(--tmr-user-bookmark, #90594e);
 
 	/* user-tunable vars from Minimal/Style-Settings: force-set in 3C so
 	   headings/emphasis/blockquote flip with the theme rather than leaking
@@ -199,13 +290,13 @@
 	--color-warning: #ac9c5d;        /* Look */
 
 	/* gloss mode accents — same DLS primitives in light 3C */
-	--tmr-c-exclaim:      #7d2e2e;
-	--tmr-c-exclaim-icon: #af4d4d;
-	--tmr-c-explain:      #ac9c5d;
-	--tmr-c-examine:      #6396a2;
-	--tmr-c-emphasise:    #50805c;
-	--tmr-c-enquiry:      #8c8787;
-	--tmr-c-bookmark:     #90594e;
+	--tmr-c-exclaim:      var(--tmr-user-exclaim, #7d2e2e);
+	--tmr-c-exclaim-icon: var(--tmr-user-exclaim, #af4d4d);
+	--tmr-c-explain:      var(--tmr-user-explain, #ac9c5d);
+	--tmr-c-examine:      var(--tmr-user-examine, #6396a2);
+	--tmr-c-emphasise:    var(--tmr-user-emphasise, #50805c);
+	--tmr-c-enquiry:      var(--tmr-user-enquiry, #8c8787);
+	--tmr-c-bookmark:     var(--tmr-user-bookmark, #90594e);
 	/* Enquiry's neutral border reads too faint on light Empire surfaces — the
 	   DLS doubles its alpha there (design token #a6a2a4a8 vs …54 in dark). */
 	--tmr-border-enquiry: color-mix(in srgb, #a7a3a5 66%, transparent);
@@ -262,8 +353,11 @@ body.is-phone .workspace-leaf-content[data-type="tmr-library"] .view-content {
 }
 
 .tmr-root {
-	/* Mirror Obsidian's Readable Line Length setting; fall back to 680px. */
-	--tmr-line-width: var(--file-line-width, 680px);
+	/* Mirror Obsidian's Readable Line Length setting; fall back to 680px. The
+	   scale is settings → Appearance → Line width, read back separately by
+	   getReadableLineWidth() in main.ts. */
+	--tmr-line-width-base: var(--file-line-width, 680px);
+	--tmr-line-width: calc(var(--tmr-line-width-base) * var(--tmr-line-width-scale, 1));
 	--tmr-gap: 48px;
 	/* Horizontal inset of the reading column(s) inside the pane. Shared by the
 	   spread and the footer so the progress bar spans exactly the page, not the
@@ -276,7 +370,7 @@ body.is-phone .workspace-leaf-content[data-type="tmr-library"] .view-content {
 	   the single source of truth for both, and overriding it (see the phone
 	   rule below) moves the layout maths with it. */
 	--tmr-side-pad-min: 4.5rem;
-	--tmr-side-pad: max(var(--tmr-side-pad-min), calc((100% - var(--tmr-line-width) * 2 - var(--tmr-gap)) / 2));
+	--tmr-side-pad: max(calc(var(--tmr-side-pad-min) * var(--tmr-margin-scale, 1)), calc((100% - var(--tmr-line-width) * 2 - var(--tmr-gap)) / 2));
 	/* Edge of the square corner controls (ToC, help, search, highlights, the
 	   page-turn chevrons), and their distance from the pane's corners. Every
 	   neighbour and the search results card are positioned *off* these rather
@@ -354,6 +448,24 @@ body.is-mobile .tmr-spread {
 	contain: paint;
 }
 
+/* Settings → Appearance → Neighbouring pages. */
+.tmr-root.tmr-adjacent-hidden .tmr-spread {
+	overflow-clip-margin: content-box;
+}
+
+/* Muted: fade the side margins rather than tint them. A colour layer can't work
+   here: with a translucent window the reader has no background to blend
+   against. At 0.6 the foreground lands within a few percent of the 3C muted
+   token over the 3C backgrounds, dark and light. */
+body:not(.is-mobile) .tmr-root.tmr-adjacent-muted .tmr-spread {
+	--tmr-adjacent-fade: rgb(0 0 0 / 0.6);
+	mask-image: linear-gradient(to right,
+		var(--tmr-adjacent-fade) var(--tmr-side-pad),
+		#000 var(--tmr-side-pad),
+		#000 calc(100% - var(--tmr-side-pad)),
+		var(--tmr-adjacent-fade) calc(100% - var(--tmr-side-pad)));
+}
+
 /* iOS memory, not style. `will-change: transform` on .tmr-content promotes the
    *whole book section* — measured at 15,909 × 617 CSS px, 88M device pixels at
    DPR 3, ~337MB rasterised — into one permanent layer. iOS tiles it and evicts
@@ -370,7 +482,7 @@ body.is-mobile .tmr-content {
    The class is mirrored onto .tmr-root (see syncSpreadLayoutMode) so the footer
    tracks the same inset — the token is declared there, not here. */
 .tmr-root.tmr-layout-single {
-	--tmr-side-pad: max(var(--tmr-side-pad-min), calc((100% - var(--tmr-line-width)) / 2));
+	--tmr-side-pad: max(calc(var(--tmr-side-pad-min) * var(--tmr-margin-scale, 1)), calc((100% - var(--tmr-line-width)) / 2));
 }
 
 /* Obsidian's mobile navbar is `position: fixed` and floats over the bottom of
@@ -522,7 +634,7 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 	column-rule: 1px solid var(--border);
 	height: 100%;
 	box-sizing: border-box;
-	transition: transform 250ms ease;
+	transition: transform var(--tmr-page-turn-duration, 250ms) ease;
 	will-change: transform;
 	position: relative;
 	user-select: text;
@@ -560,13 +672,15 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 
 /* ── Typography ────────────────────────────────────────────────────────────── */
 
+/* The --tmr-* fallbacks are the Appearance defaults; APPEARANCE_DEFAULTS in
+   main.ts must match them. */
 .tmr-content,
 .tmr-content p {
-	font-family: var(--font-secondary);
+	font-family: var(--tmr-body-font, var(--font-secondary));
 	/* Size comes from .tmr-spread; stated explicitly so source-epub rules that
 	   set a px size on <p> lose to ours. */
 	font-size: inherit;
-	line-height: 1.65;
+	line-height: var(--tmr-line-height, 1.65);
 	color: var(--foreground);
 }
 
@@ -600,7 +714,7 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 }
 
 .tmr-content p {
-	margin: 0 0 1.1em;
+	margin: 0 0 var(--tmr-para-spacing, 1.1em);
 	/* Paragraphs fragment across the column boundary, as in print. They were
 	   `break-inside: avoid-column` — a paragraph that didn't fit the space left
 	   in a column jumped whole to the next one, so each page ended with a gap
@@ -904,11 +1018,11 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 	background: color-mix(in srgb, var(--tmr-c-enquiry) 16%, transparent);
 }
 
-.tmr-saved-highlight-rect[data-mode="exclaim"]   { background: color-mix(in srgb, var(--tmr-c-exclaim) 20%, transparent); }
-.tmr-saved-highlight-rect[data-mode="explain"]   { background: color-mix(in srgb, var(--tmr-c-explain) 20%, transparent); }
-.tmr-saved-highlight-rect[data-mode="examine"]   { background: color-mix(in srgb, var(--tmr-c-examine) 20%, transparent); }
-.tmr-saved-highlight-rect[data-mode="emphasise"] { background: color-mix(in srgb, var(--tmr-c-emphasise) 20%, transparent); }
-.tmr-saved-highlight-rect[data-mode="enquiry"]   { background: color-mix(in srgb, var(--tmr-c-enquiry) 20%, transparent); }
+.tmr-saved-highlight-rect[data-mode="exclaim"]   { background: color-mix(in srgb, var(--tmr-c-exclaim) var(--tmr-highlight-strength, 20%), transparent); }
+.tmr-saved-highlight-rect[data-mode="explain"]   { background: color-mix(in srgb, var(--tmr-c-explain) var(--tmr-highlight-strength, 20%), transparent); }
+.tmr-saved-highlight-rect[data-mode="examine"]   { background: color-mix(in srgb, var(--tmr-c-examine) var(--tmr-highlight-strength, 20%), transparent); }
+.tmr-saved-highlight-rect[data-mode="emphasise"] { background: color-mix(in srgb, var(--tmr-c-emphasise) var(--tmr-highlight-strength, 20%), transparent); }
+.tmr-saved-highlight-rect[data-mode="enquiry"]   { background: color-mix(in srgb, var(--tmr-c-enquiry) var(--tmr-highlight-strength, 20%), transparent); }
 
 /* Active-conversation variant — pinned highlight while a conversation card is
    expanded in the Highlights pane. ~35% fill alpha (vs 20% standard) plus a
@@ -1006,12 +1120,12 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 .tmr-gloss-tooltip,
 .tmr-help-modal,
 .tmr-pdf-overlay {
-	--tmr-c-exclaim:      var(--color-red, #7d2e2e);
-	--tmr-c-exclaim-icon: var(--color-red, #af4d4d);
-	--tmr-c-explain:      var(--color-yellow, #ac9c5d);
-	--tmr-c-examine:      var(--color-cyan, #6396a2);
-	--tmr-c-emphasise:    var(--color-green, #50805c);
-	--tmr-c-enquiry:      #8c8787;
+	--tmr-c-exclaim:      var(--tmr-user-exclaim, var(--color-red, #7d2e2e));
+	--tmr-c-exclaim-icon: var(--tmr-user-exclaim, var(--color-red, #af4d4d));
+	--tmr-c-explain:      var(--tmr-user-explain, var(--color-yellow, #ac9c5d));
+	--tmr-c-examine:      var(--tmr-user-examine, var(--color-cyan, #6396a2));
+	--tmr-c-emphasise:    var(--tmr-user-emphasise, var(--color-green, #50805c));
+	--tmr-c-enquiry:      var(--tmr-user-enquiry, #8c8787);
 	/* Font tokens default to Obsidian's active fonts in non-3C mode. */
 	--font-primary:  var(--font-interface, sans-serif);
 	--font-secondary: var(--font-text, serif);
@@ -1024,12 +1138,12 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 .tmr-gloss-tooltip.tmr-3c-mode,
 .tmr-help-modal.tmr-3c-mode,
 .tmr-pdf-overlay.tmr-3c-mode {
-	--tmr-c-exclaim:      #7d2e2e;
-	--tmr-c-exclaim-icon: #af4d4d;
-	--tmr-c-explain:      #ac9c5d;
-	--tmr-c-examine:      #6396a2;
-	--tmr-c-emphasise:    #50805c;
-	--tmr-c-enquiry:      #8c8787;
+	--tmr-c-exclaim:      var(--tmr-user-exclaim, #7d2e2e);
+	--tmr-c-exclaim-icon: var(--tmr-user-exclaim, #af4d4d);
+	--tmr-c-explain:      var(--tmr-user-explain, #ac9c5d);
+	--tmr-c-examine:      var(--tmr-user-examine, #6396a2);
+	--tmr-c-emphasise:    var(--tmr-user-emphasise, #50805c);
+	--tmr-c-enquiry:      var(--tmr-user-enquiry, #8c8787);
 	--font-primary:  "Rosarivo", var(--font-interface, sans-serif);
 	--font-secondary: "Labrada", var(--font-text, serif);
 }
@@ -2889,6 +3003,12 @@ body.is-mobile .tmr-highlights-panel {
 	bottom: calc(var(--safe-area-inset-bottom, 0px) + var(--mobile-toolbar-height, 52px));
 }
 
+/* Focus means the keyboard is up: the host has already shrunk above it, the
+   navbar is gone, and Obsidian has folded the keyboard's height into the inset. */
+body.is-mobile .tmr-highlights-panel:focus-within {
+	bottom: 0;
+}
+
 /* Phones: a 340px pane over a 393pt screen leaves a 53pt sliver of reader —
    too narrow to read, wide enough to invite a mis-tap on the text underneath.
    The panel takes the screen, as Obsidian's own sidebars do; the backdrop and
@@ -4137,13 +4257,40 @@ body.is-mobile .tmr-highlights-item-delete::after {
 	color: var(--text-accent-hover, var(--tmr-c-examine));
 }
 
-/* ── Settings: footer button row ───────────────────────────────────────── */
+/* ── Settings: full-width custom rows (footer tiles, Appearance sample) ─── */
+.tmr-settings-footer-row .setting-item-info,
+.tmr-settings-sample-row .setting-item-info {
+	display: none;
+}
+
+.tmr-settings-footer-row .setting-item-control,
+.tmr-settings-sample-row .setting-item-control {
+	flex: 1;
+	justify-content: flex-start;
+}
+
+/* Reads the same variables the reader does, set inline by styleSample(). */
+.tmr-settings-sample {
+	font-family: var(--tmr-body-font);
+	font-size: var(--tmr-font-size, var(--font-text-size));
+	line-height: var(--tmr-line-height, 1.65);
+	color: var(--text-normal);
+	text-align: left;
+	user-select: text;
+}
+
+.tmr-settings-sample p {
+	margin: 0 0 var(--tmr-para-spacing, 1.1em);
+}
+
+.tmr-settings-sample p:last-child {
+	margin-bottom: 0;
+}
+
 .tmr-settings-footer {
+	flex: 1;
 	display: flex;
 	gap: 0.5rem;
-	margin-top: 2rem;
-	padding-top: 1.25rem;
-	border-top: 1px solid var(--background-modifier-border);
 }
 
 .tmr-settings-footer-btn {
@@ -4176,108 +4323,7 @@ body.is-mobile .tmr-highlights-item-delete::after {
 	font-size: var(--font-ui-smaller);
 }
 
-/* ── Settings: provider accordion ──────────────────────────────────────── */
-.tmr-settings-provider {
-	border-radius: var(--radius-s, 12px);
-	margin-bottom: 0.5rem;
-	overflow: hidden;
-}
-
-.tmr-settings-provider-summary {
-	display: flex;
-	align-items: center;
-	gap: 0.25rem;
-	padding: 0.625rem 0.875rem;
-	cursor: pointer;
-	font-weight: 600;
-	font-size: 0.9375rem;
-	list-style: none;
-	user-select: none;
-}
-
-.tmr-settings-provider-summary::-webkit-details-marker { display: none; }
-
-.tmr-settings-provider-summary::before {
-	content: "▶";
-	font-size: 0.6em;
-	opacity: 0.5;
-	transition: transform 150ms ease;
-	flex-shrink: 0;
-}
-
-.tmr-settings-provider[open] > .tmr-settings-provider-summary::before {
-	transform: rotate(90deg);
-}
-
-.tmr-settings-provider-kind {
-	font-weight: 400;
-	opacity: 0.6;
-	font-size: 0.85em;
-}
-
-.tmr-settings-provider > .setting-item {
-	border-top: 1px solid var(--background-modifier-border);
-}
-
-/* "Your data leaves this device" note under a remote provider's fields. Sits
-   between settings rows rather than inside one, so it reads as a statement
-   about the provider rather than help text for whichever field it follows. */
-.tmr-settings-privacy {
-	padding: 0.5rem 0 0.25rem;
-	line-height: 1.4;
-}
-
-.tmr-settings-provider-actions {
-	width: fit-content;
-	margin-left: auto;
-	border-top: none !important;
-	padding-top: 0.5rem;
-	padding-bottom: 0.5rem;
-}
-
-/* ── Settings: collapsible accordion (AI system prompts) ───────────────── */
-.tmr-settings-accordion {
-	border-radius: var(--radius-s, 12px);
-	margin-top: 1rem;
-	overflow: hidden;
-}
-
-.tmr-settings-accordion-summary {
-	display: flex;
-	align-items: center;
-	gap: 0.25rem;
-	padding: 0.625rem 0.875rem;
-	cursor: pointer;
-	font-weight: 600;
-	font-size: 0.9375rem;
-	list-style: none;
-	user-select: none;
-}
-
-.tmr-settings-accordion-summary::-webkit-details-marker { display: none; }
-
-.tmr-settings-accordion-summary::before {
-	content: "▶";
-	font-size: 0.6em;
-	opacity: 0.5;
-	transition: transform 150ms ease;
-	flex-shrink: 0;
-}
-
-.tmr-settings-accordion[open] > .tmr-settings-accordion-summary::before {
-	transform: rotate(90deg);
-}
-
-.tmr-settings-accordion-intro {
-	padding: 0 0.875rem;
-	margin: 0.25rem 0 0.5rem;
-}
-
-.tmr-settings-accordion > .setting-item {
-	border-top: 1px solid var(--background-modifier-border);
-	padding: 0.75rem 0.875rem;
-}
-
+/* ── Settings: system prompts ──────────────────────────────────────────── */
 .tmr-settings-prompt-row {
 	flex-direction: column;
 	align-items: stretch;
@@ -4299,21 +4345,6 @@ body.is-mobile .tmr-highlights-item-delete::after {
 }
 
 /* ── Settings: Apple Books import ──────────────────────────────────────── */
-.tmr-settings-import-section {
-	margin-top: 1rem;
-}
-
-/* The header is a single card: title + description on the left, folder
-   picker button on the right. The book list grows below it, uncontained. */
-.tmr-settings-import-head .setting-item-name {
-	font-size: 1.05rem;
-	font-weight: 700;
-}
-
-.tmr-settings-import-head .setting-item-info {
-	text-align: left;
-}
-
 .tmr-settings-import-results {
 	margin-top: 0.75rem;
 }

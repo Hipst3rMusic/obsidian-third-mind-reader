@@ -756,13 +756,13 @@ export class PdfGlossController extends Component {
 		const preview = this.preview;
 		if (!preview) return;
 		if (this.saved.length === 0) {
-			if (preview.hoveredIdx !== -1) preview.hideSoft();
+			if (preview.hoveredIdx !== -1) preview.hide();
 			return;
 		}
 		const idx = hitTestHighlightRects(this.child.containerEl, e.clientX, e.clientY);
 		const saved = idx === -1 ? null : this.saved[idx];
 		if (!saved) {
-			if (preview.hoveredIdx !== -1) preview.hideSoft();
+			if (preview.hoveredIdx !== -1) preview.hide();
 			return;
 		}
 		preview.showFor(idx, saved, e.clientX, e.clientY);
@@ -774,8 +774,9 @@ export class PdfGlossController extends Component {
 		this.editingNoteIdx = null;
 	}
 
-	/** "+ Add a note" on a note-less Emphasise preview. `editingNoteIdx` is what
-	 *  routes the submit to that highlight instead of to a live selection. */
+	/** Note input for a note-less Emphasise highlight: a desktop click on it, or
+	 *  the touch preview's "+ Add a note". `editingNoteIdx` is what routes the
+	 *  submit to that highlight instead of to a live selection. */
 	private beginAddNote(idx: number, fallback?: DOMRect): void {
 		if (!this.saved[idx] || !this.preview) return;
 		// A click can arrive with no preview raised, whose rect then measures zero.

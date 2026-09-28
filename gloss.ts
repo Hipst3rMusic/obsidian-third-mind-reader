@@ -572,11 +572,9 @@ function stripFootnotes(content: string): string {
 export class AnnotationPreview extends Component {
 	private el: HTMLElement | null = null;
 	private idx = -1;
-	private actionable = false;
-	private hideTimer: number | null = null;
 
-	/** Omitting `onAddNote` gives the read-only placeholder instead of the
-	 *  "+ Add a note" line on note-less Emphasise highlights. */
+	/** `onAddNote` backs the touch preview's "+ Add a note" line. On desktop the
+	 *  highlight itself is the click target, so the preview only says so. */
 	constructor(
 		private settings: () => GlossHostSettings,
 		private onAddNote?: (idx: number) => void,
@@ -585,7 +583,6 @@ export class AnnotationPreview extends Component {
 	}
 
 	onunload(): void {
-		this.clearHideTimer();
 		this.el?.remove();
 		this.el = null;
 		this.idx = -1;
@@ -605,7 +602,6 @@ export class AnnotationPreview extends Component {
 	/** Surface the preview for highlight `idx`. Repopulates only when the index
 	 *  actually changes; otherwise just tracks the pointer. */
 	showFor(idx: number, saved: SavedHighlight, clientX: number, clientY: number): void {
-		this.clearHideTimer();
 		if (idx !== this.idx) {
 			this.idx = idx;
 			this.populate(saved);
@@ -614,27 +610,8 @@ export class AnnotationPreview extends Component {
 	}
 
 	hide(): void {
-		this.clearHideTimer();
 		this.idx = -1;
-		this.actionable = false;
 		this.el?.addClass("tmr-hidden");
-	}
-
-	/** Grace period for an actionable floater only: the pointer crosses bare page
-	 *  to reach the add-note line, and the host reads that gap as a hover-off. */
-	hideSoft(): void {
-		if (!this.actionable) { this.hide(); return; }
-		if (this.hideTimer !== null) return;
-		this.hideTimer = window.setTimeout(() => {
-			this.hideTimer = null;
-			this.hide();
-		}, 140);
-	}
-
-	private clearHideTimer(): void {
-		if (this.hideTimer === null) return;
-		window.clearTimeout(this.hideTimer);
-		this.hideTimer = null;
 	}
 
 	syncTheme(): void {
@@ -644,8 +621,6 @@ export class AnnotationPreview extends Component {
 	private ensureEl(): HTMLElement {
 		if (this.el) return this.el;
 		this.el = document.body.createDiv({ cls: "tmr-annotation-preview tmr-hidden" });
-		this.registerDomEvent(this.el, "mouseenter", () => this.clearHideTimer());
-		this.registerDomEvent(this.el, "mouseleave", () => this.hide());
 		// Delegated, not bound per populate: the floater repopulates on every
 		// hover and a listener per pass would accumulate for the view's life.
 		this.registerDomEvent(this.el, "click", (e) => {
@@ -697,17 +672,19 @@ export class AnnotationPreview extends Component {
 			body = saved.userText.trim();
 		}
 
-		this.actionable = false;
+		let actionable = false;
 		if (body.length > 0) {
 			setInlineMarkdown(el.createDiv({ cls: "tmr-annotation-preview-body" }), body);
-		} else if (this.onAddNote && saved.mode === "emphasise") {
+		} else if (this.onAddNote && saved.mode === "emphasise" && Platform.isMobile) {
 			// Styled by the Annotations row's own class — same action, same look.
 			el.createDiv({ cls: "tmr-highlights-item-add-note", text: "+ Add a note" });
-			this.actionable = true;
+			actionable = true;
 		} else {
 			const emptyText = GLOSS_AI_MODES.has(saved.mode) && isComplete
 				? "(no response)"
-				: "No note yet — add one from the Highlights panel";
+				: this.onAddNote && saved.mode === "emphasise"
+					? "Click to add a note"
+					: "No note yet — add one from the Highlights panel";
 			el.createDiv({
 				cls: "tmr-annotation-preview-body tmr-annotation-preview-empty",
 				text: emptyText,
@@ -715,7 +692,7 @@ export class AnnotationPreview extends Component {
 		}
 		// Pointer-transparent by default so a preview never eats a click meant
 		// for the page; only one with something to click needs to catch it.
-		el.toggleClass("tmr-annotation-preview-actionable", this.actionable);
+		el.toggleClass("tmr-annotation-preview-actionable", actionable);
 
 		el.removeClass("tmr-hidden");
 	}
@@ -1095,9 +1072,20 @@ export class GlossSurface extends Component {
 			bar.style.top = `${slot.top}px`;
 			bar.style.width = `${slot.width}px`;
 			bar.style.height = `${slot.height}px`;
+			return;
+		}
+		bar.style.removeProperty("width");
+		bar.style.removeProperty("height");
+		if (Platform.isMobile) {
+			// No navbar to dock into (tablets): the OS selection menu still claims the
+			// space above the selection, so the bar takes the bottom edge instead.
+			this.lastRect = selectionRect;
+			bar.setCssProps({ left: "0px", top: "0px" });
+			const rect = bar.getBoundingClientRect();
+			const safe = getSafeViewport();
+			bar.style.left = `${(safe.left + safe.right - rect.width) / 2}px`;
+			bar.style.top = `${safe.bottom - rect.height - 16}px`;
 		} else {
-			bar.style.removeProperty("width");
-			bar.style.removeProperty("height");
 			this.positionFloater(bar, selectionRect);
 		}
 	}
