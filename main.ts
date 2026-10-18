@@ -2398,14 +2398,18 @@ export class ReaderView extends ItemView {
 	): { innerWidth: number; colWidth: number; gap: number } {
 		const cs = getComputedStyle(spread);
 		const fallbackWidth = this.spreadEl?.clientWidth ?? this.contentEl.clientWidth;
-		const spreadWidth = spread.clientWidth > 0 ? spread.clientWidth : fallbackWidth;
+		// `clientWidth` is rounded to whole pixels, but at a fractional device pixel
+		// ratio (e.g. 2.625 on many Android phones) or fractional UI zoom the boxes
+		// are laid out at sub-pixel widths. Measure the real width so the stride
+		// matches the column pitch the browser actually renders.
+		const spreadWidth = spread.clientWidth > 0 ? spread.getBoundingClientRect().width : fallbackWidth;
 		const innerWidth = Math.max(100, spreadWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight));
 		const gap = this.getColumnGap(mode, spread);
 		// `innerWidth` comes from float padding math and can run a sub-pixel wider
-		// than the pixel-snapped `.tmr-content` box the columns actually live in
-		// (this divergence only shows up at fractional UI zoom). Compute the column
-		// width against the real box so two columns are guaranteed to fit.
-		const usableInner = content.clientWidth > 0 ? Math.min(innerWidth, content.clientWidth) : innerWidth;
+		// than the `.tmr-content` box the columns actually live in (this divergence
+		// only shows up at fractional UI zoom or device pixel ratio). Compute the
+		// column width against the real box so two columns are guaranteed to fit.
+		const usableInner = content.clientWidth > 0 ? Math.min(innerWidth, content.getBoundingClientRect().width) : innerWidth;
 		const colWidth = Math.max(100, mode === "single" ? usableInner : (usableInner - gap) / 2);
 		// CSS `column-width` is a *minimum*: if the applied value rounds up even a
 		// hair past what fits, multicol drops from two columns to one full-width
@@ -2784,7 +2788,10 @@ export class ReaderView extends ItemView {
 	private getPageWidth(): number {
 		if (!this.spreadEl) return 0;
 		const cs = getComputedStyle(this.spreadEl);
-		return this.spreadEl.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+		// Sub-pixel width, not the rounded `clientWidth`: the navigation stride is
+		// derived from this, and a rounding error here accumulates with every page
+		// turn until the text is clipped at the right edge.
+		return this.spreadEl.getBoundingClientRect().width - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
 	}
 
 	private paginateVisibleContent(): void {
