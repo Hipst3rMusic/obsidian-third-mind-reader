@@ -295,6 +295,12 @@ export class OffsetMap {
 		return this.entries.get(paraId) ?? null;
 	}
 
+	/** Paragraph length in the offset space `charRangeToCursorRange` takes. */
+	charLength(paraId: string): number {
+		const entry = this.entries.get(paraId);
+		return entry ? entry.prepared.segments.reduce((n, s) => n + s.length, 0) : 0;
+	}
+
 	clear(): void {
 		this.entries.clear();
 		this.orderedIds = [];

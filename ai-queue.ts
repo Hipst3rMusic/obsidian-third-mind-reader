@@ -95,7 +95,7 @@ export async function processPendingInFile(
 				// buffered call is the one shape both cloud and local support.
 				stream: false,
 			});
-			entry.turns.push({ role: "assistant", content: res.content });
+			entry.turns.push({ role: "assistant", content: res.content, label: provider.id });
 			entry.aiState = "complete";
 			delete entry.aiError;
 			resolved++;

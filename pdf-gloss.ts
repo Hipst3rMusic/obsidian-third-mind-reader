@@ -12,18 +12,18 @@
  *  gloss", never to a broken PDF.
  */
 
-import { App, Component, Notice, Platform, TAbstractFile, TFile, View, setIcon, setTooltip } from "obsidian";
+import { App, Component, Notice, Platform, TAbstractFile, TFile, View, loadPdfJs, setIcon, setTooltip } from "obsidian";
 import {
 	ANCHOR_PREFIX_LEN,
 	AnnotationPreview,
 	GLOSS_AI_MODES,
 	GlossSurface,
 	type SavedHighlight,
-	appendCallout,
 	applyGlossTheme,
 	buildCallout,
 	calloutHeader,
 	ensureCompanionDoc,
+	fileCallout,
 	getSafeViewport,
 	hitTestHighlightRects,
 	isTextInputFocused,
@@ -38,7 +38,8 @@ import {
 	type HighlightsPaneHost,
 	type HighlightsPaneSettings,
 } from "./highlights-pane";
-import { companionDocPath } from "./library-scan";
+import { companionDocPath, findCompanionDoc } from "./library-scan";
+import type { NoteSection } from "./note-layout";
 
 // ─── Native viewer internals (undocumented; feature-detected before use) ─────
 
@@ -66,7 +67,7 @@ interface PdfViewerChild {
 	 *  no `container` of its own. */
 	pdfViewer: {
 		eventBus: PdfEventBus;
-		pdfViewer?: { container?: HTMLElement; pagesCount?: number };
+		pdfViewer?: { container?: HTMLElement; pagesCount?: number; pdfDocument?: PdfDocument };
 	};
 	/** Four comma-separated ints over the page's text divs —
 	 *  `beginIndex,beginOffset,endIndex,endOffset`. Null when the current
@@ -77,6 +78,74 @@ interface PdfViewerChild {
 	applySubpath(subpath: string): void;
 	getPage(page: number): PdfPageView | null;
 	getMarkdownLink?(subpath: string, alias?: string): string;
+}
+
+/** The pdf.js document calls the outline needs. */
+interface PdfDocument {
+	getOutline(): Promise<PdfOutlineItem[] | null>;
+	getDestination(id: string): Promise<unknown[] | null>;
+	getPageIndex(ref: unknown): Promise<number>;
+}
+
+interface PdfOutlineItem {
+	title: string;
+	dest: string | unknown[] | null;
+	items?: PdfOutlineItem[];
+}
+
+interface OutlineEntry {
+	title: string;
+	page: number;
+}
+
+/** Every outline level, one entry per page (the first wins, as with an EPUB's
+ *  TOC), sorted by 1-indexed page. Empty when the PDF has no usable outline. */
+async function readOutline(pdf: PdfDocument): Promise<OutlineEntry[]> {
+	try {
+		const flat: PdfOutlineItem[] = [];
+		const walk = (items: PdfOutlineItem[]): void => {
+			for (const item of items) {
+				flat.push(item);
+				walk(item.items ?? []);
+			}
+		};
+		walk((await pdf.getOutline()) ?? []);
+		const byPage = new Map<number, string>();
+		for (const item of flat) {
+			const dest = typeof item.dest === "string" ? await pdf.getDestination(item.dest) : item.dest;
+			const ref = dest?.[0];
+			if (ref === undefined || ref === null) continue;
+			// Some PDFs store a bare 0-based page index instead of a page reference.
+			const page = (typeof ref === "number" ? ref : await pdf.getPageIndex(ref)) + 1;
+			if (!byPage.has(page)) byPage.set(page, item.title.replace(/\s+/g, " ").trim() || "Untitled");
+		}
+		return [...byPage].map(([page, title]) => ({ title, page })).sort((a, b) => a.page - b.page);
+	} catch (err) {
+		console.error("[ThirdMindReader] PDF outline read failed", err);
+		return [];
+	}
+}
+
+/** Page → heading. A PDF without an outline gets no headings: the callout
+ *  header already carries the page. */
+function outlineSection(entries: OutlineEntry[], page: number): NoteSection | null {
+	if (!entries.length) return null;
+	let i = -1;
+	while (i + 1 < entries.length && entries[i + 1].page <= page) i++;
+	if (i === -1) return { title: "Front matter", start: 0, end: entries[0].page };
+	return { title: entries[i].title, start: entries[i].page, end: entries[i + 1]?.page ?? Infinity };
+}
+
+/** `outlineSection` for a PDF that isn't open, read through Obsidian's own pdf.js. */
+export async function pdfNoteSections(app: App, file: TFile): Promise<(page: number) => NoteSection | null> {
+	const pdfjs = (await loadPdfJs()) as { getDocument(src: { data: Uint8Array }): { promise: Promise<PdfDocument & { destroy(): Promise<void> }> } };
+	const pdf = await pdfjs.getDocument({ data: new Uint8Array(await app.vault.readBinary(file)) }).promise;
+	try {
+		const entries = await readOutline(pdf);
+		return (page) => outlineSection(entries, page);
+	} finally {
+		await pdf.destroy();
+	}
 }
 
 /** The native PDF toolbar. Only the right-hand button strip matters to us —
@@ -299,14 +368,15 @@ export class PdfGlossController extends Component {
 	private saved: SavedHighlight[] = [];
 	private unloaded = false;
 	/** Non-zero while a submit is in flight. `reloadHighlights` replaces `saved`
-	 *  wholesale, and the vault `modify` from our own `appendCallout` lands mid-
+	 *  wholesale, and the vault `modify` from our own `fileCallout` lands mid-
 	 *  flow, leaving the AI exchange mutating an object no longer in the list.
 	 *  Suppressing the reparse is safe — in-memory state is authoritative. */
 	private persisting = 0;
-	/** Companion path the current `saved` list was read for. `undefined` means
+	/** PDF path the current `saved` list was read for. `undefined` means
 	 *  "never loaded"; `null` means "loaded, but this view has no file yet".
 	 *  Distinguishing the two is what lets the first render trigger a load. */
 	private loadedPath: string | null | undefined = undefined;
+	private outline: Promise<OutlineEntry[]> | null = null;
 	private onTextLayerRendered = (e: { pageNumber?: number }): void => {
 		// A rendered page proves the toolbar exists, which it may not have when the
 		// child was handed to us. Cheap to re-assert; a no-op once the button is up.
@@ -315,7 +385,7 @@ export class PdfGlossController extends Component {
 		// the load in `onload` may have had no path to read. The first rendered
 		// text layer is the earliest reliable point at which the file is known —
 		// so treat a changed path as "load now, then repaint everything".
-		if (this.companionPath() !== this.loadedPath) {
+		if ((this.child.file?.path ?? null) !== this.loadedPath) {
 			void this.reloadHighlights();
 			return;
 		}
@@ -355,7 +425,8 @@ export class PdfGlossController extends Component {
 		this.surface = new GlossSurface({
 			app: this.app,
 			settings: this.settings,
-			sourcePath: () => this.companionPath() ?? "",
+			sourcePath: () => this.companionDoc()?.path
+				?? (this.child.file ? companionDocPath(this.child.file.basename) : ""),
 			// No `disabledModes`: the AI tiles are live now that the pane is here
 			// to receive their output. No `onExtend` either — same-page
 			// selections only in v1, so the tile is never built (spec decision 5).
@@ -419,7 +490,7 @@ export class PdfGlossController extends Component {
 		// Keep the overlays honest when the companion doc is edited directly —
 		// in another pane, on another device, or by our own writes.
 		this.registerEvent(this.app.vault.on("modify", (file: TAbstractFile) => {
-			if (file.path !== this.companionPath()) return;
+			if (file !== this.companionDoc()) return;
 			// A streaming AI exchange writes the doc on every turn — the event
 			// firing here. Re-parsing would swap the list out from under it, so
 			// skip until the chat closes; in-memory state is already current.
@@ -525,7 +596,7 @@ export class PdfGlossController extends Component {
 			settings: this.settings,
 			saveSettings: this.saveSettings,
 			savedHighlights: () => this.saved,
-			companionDocPath: () => this.companionPath(),
+			companionDoc: () => this.companionDoc(),
 			// Pages are the PDF's chapters: the Annotations tab groups by page and
 			// sorts by page then by position of the selection's first text div.
 			sectionOf: (saved) => {
@@ -793,19 +864,18 @@ export class PdfGlossController extends Component {
 	 *  to run on any change: parsing is a string scan and only a handful of
 	 *  pages are ever rendered at once. */
 	private async reloadHighlights(): Promise<void> {
-		const path = this.companionPath();
 		// Claimed up front, not after the await: several text layers can render
 		// while the read is in flight, and each would otherwise kick its own.
+		const path = this.child.file?.path ?? null;
+		if (path !== this.loadedPath) this.outline = null;
 		this.loadedPath = path;
 		let parsed: SavedHighlight[] = [];
-		if (path) {
-			const file = this.app.vault.getFileByPath(path);
-			if (file) {
-				try {
-					parsed = parseSavedHighlights(await this.app.vault.cachedRead(file));
-				} catch (err) {
-					console.error("[ThirdMindReader] PDF companion-doc read failed", err);
-				}
+		const doc = this.companionDoc();
+		if (doc) {
+			try {
+				parsed = parseSavedHighlights(await this.app.vault.cachedRead(doc));
+			} catch (err) {
+				console.error("[ThirdMindReader] PDF companion-doc read failed", err);
 			}
 		}
 		// The read is async — the leaf may have closed underneath us, in which
@@ -903,9 +973,27 @@ export class PdfGlossController extends Component {
 
 	// ── Persist ─────────────────────────────────────────────────────────────
 
-	private companionPath(): string | null {
+	private companionDoc(): TFile | null {
 		const file = this.child.file;
-		return file ? companionDocPath(file.basename) : null;
+		return file ? findCompanionDoc(file, file.basename) : null;
+	}
+
+	hasCompanionDoc(): boolean {
+		return this.companionDoc() !== null;
+	}
+
+	async organiseCompanionDoc(): Promise<void> {
+		if (!this.pane) return;
+		const sectionFor = await this.noteSections();
+		if (await this.pane.organiseCompanionDoc((key) => sectionFor(key[0]))) await this.reloadHighlights();
+	}
+
+	private async noteSections(): Promise<(page: number) => NoteSection | null> {
+		const pdf = this.child.pdfViewer.pdfViewer?.pdfDocument;
+		if (!pdf) return () => null;
+		this.outline ??= readOutline(pdf);
+		const entries = await this.outline;
+		return (page) => outlineSection(entries, page);
 	}
 
 	private async persist(modeId: string, userText: string): Promise<void> {
@@ -916,14 +1004,13 @@ export class PdfGlossController extends Component {
 		}
 		const pending = this.pending;
 		const file = this.child.file;
-		const path = this.companionPath();
-		if (!pending || !file || !path) {
+		if (!pending || !file) {
 			this.dismiss();
 			return;
 		}
 		this.persisting++;
 		try {
-			const doc = await ensureCompanionDoc(this.app, path, file.basename, `[[${file.path}]]`);
+			const doc = await ensureCompanionDoc(this.app, file, file.basename);
 			if (!doc) return;
 
 			const selStr = pending.sel.join(",");
@@ -943,25 +1030,27 @@ export class PdfGlossController extends Component {
 			// PDF pages don't reflow, so `pdfSel` is stable for the life of the
 			// document build; `prefix` is the drift check for a *replaced* file.
 			const anchor =
-				`<!-- tmr-anchor pdfPage:${pending.page} pdfSel:${selStr} prefix:"${prefix}" -->`;
+				`<!-- tmr-anchor pdfPage:${pending.page} pdfSel:${selStr} prefix:"${prefix}" at:${Date.now()} -->`;
 
-			await appendCallout(this.app, doc, buildCallout({
+			const callout = buildCallout({
 				modeId,
 				header: calloutHeader(pending.text, alias),
 				anchor,
 				quote: pending.text,
 				userText,
 				sourceLink,
-			}));
+				expanded: this.settings().annotationsExpanded,
+			});
+			const sectionFor = await this.noteSections();
+			await fileCallout(this.app, doc, callout, sectionFor(pending.page));
 			new Notice(`${modeId[0].toUpperCase()}${modeId.slice(1)} saved`);
 			// Paint it now rather than waiting on the vault `modify` event, which
 			// is debounced and would leave the new highlight invisible for a beat.
 			await this.reloadHighlights();
 			// AI modes land the reader in the chat surface straight away, then fire
-			// the first exchange into the now-open log so it streams like every
-			// follow-up. Callouts are appended, so the new entry is the last one.
-			if (GLOSS_AI_MODES.has(modeId) && this.pane) {
-				const idx = this.saved.length - 1;
+			// the first exchange into the now-open log so it streams like every follow-up.
+			const idx = this.saved.findIndex((h) => h.pdfPage === pending.page && h.pdfSel?.join(",") === selStr);
+			if (GLOSS_AI_MODES.has(modeId) && this.pane && idx !== -1) {
 				if (!this.pane.isOpen) this.pane.toggle();
 				this.pane.setTab("conversations");
 				this.pane.openConversation(idx);

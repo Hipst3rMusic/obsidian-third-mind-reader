@@ -12,7 +12,7 @@
     "importHelpers": true,
     "isolatedModules": true,
     "skipLibCheck": true,
-    "lib": ["ES6", "DOM"]
+    "lib": ["ES6", "DOM", "DOM.Iterable"]
   },
   "include": ["**/*.ts"]
 }

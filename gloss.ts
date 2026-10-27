@@ -15,6 +15,8 @@ import {
 	sanitizeHTMLToDom,
 	setIcon,
 } from "obsidian";
+import { companionDocPath, findCompanionDoc } from "./library-scan";
+import { type NoteSection, insertCallout } from "./note-layout";
 
 // ─── Modes ───────────────────────────────────────────────────────────────────
 
@@ -65,6 +67,8 @@ export interface GlossHostSettings {
 	tmrTheme: "light" | "dark";
 	aiFeaturesEnabled: boolean;
 	quickHighlight: { desktop: boolean; mobile: boolean };
+	/** New callouts are written unfolded (`[!mode]+`) rather than folded (`[!mode]-`). */
+	annotationsExpanded: boolean;
 }
 
 /** Lite mode only — with the AI tiles live there is a real choice to make. */
@@ -97,7 +101,12 @@ export function applyGlossTheme(el: HTMLElement | null, settings: GlossHostSetti
 export interface ConversationTurn {
 	role: "user" | "assistant";
 	content: string;
+	/** The provider name a reply is written under; absent on replies from before it was recorded. */
+	label?: string;
 }
+
+/** A reply's header in the note. Colons are stripped because the parser splits the header at the first one. */
+const replyLabel = (turn: ConversationTurn): string => turn.label?.replace(/[:\r\n]/g, "").trim() || "AI";
 
 /** A saved highlight as parsed from the companion doc. We keep raw char offsets
  *  and the text prefix rather than resolving to a CursorRange here — resolution
@@ -114,6 +123,9 @@ export interface SavedHighlight {
 	startChar: number;
 	endChar: number;
 	prefix: string;
+	/** Epoch ms from the anchor's `at:` field. Callouts are filed in book order,
+	 *  so note order no longer says which is newest. Absent on older callouts. */
+	createdAt?: number;
 	/** 1-indexed PDF page (`pageEl.dataset.pageNumber`). Present only on PDF
 	 *  anchors; its presence is what marks an entry as PDF-anchored. */
 	pdfPage?: number;
@@ -173,7 +185,7 @@ export function parseSavedHighlights(md: string): SavedHighlight[] {
 	const modeRe = /^>\s*\[!(exclaim|explain|examine|emphasise|enquiry|bookmark)\]/;
 	const anchorRe = /<!--\s*tmr-anchor\s+([^>]*?)-->/;
 	const fieldRe =
-		/(spine|para|chars|prefix|endPara|endChars|pdfPage|pdfSel):(?:"((?:[^"\\]|\\.)*)"|(\S+))/g;
+		/(?<!\w)(spine|para|chars|prefix|endPara|endChars|pdfPage|pdfSel|at):(?:"((?:[^"\\]|\\.)*)"|(\S+))/g;
 	const lines = md.split(/\r?\n/);
 
 	let pendingMode: string | null = null;
@@ -223,6 +235,7 @@ export function parseSavedHighlights(md: string): SavedHighlight[] {
 		}
 
 		const prefix = fields.prefix ? decodeURIComponent(fields.prefix) : "";
+		const createdAt = fields.at ? Number(fields.at) : NaN;
 
 		// Bare `> <text>` lines with no turn prefix are Phase 2 callouts, from
 		// before multi-turn — they collect into legacyUserText, not a turn.
@@ -233,6 +246,9 @@ export function parseSavedHighlights(md: string): SavedHighlight[] {
 		let aiError: string | undefined;
 		let currentTurn: ConversationTurn | null = null;
 		const turnHeaderRe = /^(User|AI):\s*(.*)$/;
+		// A labelled reply is only recognised after a blank line inside a prompt, which
+		// prompts are written without; answers often open lines with `**Point:**`.
+		const replyHeaderRe = /^([^:]{1,40}):(?:\s(.*))?$/;
 		const aiPendingRe = /<!--\s*ai response pending\s*-->/i;
 		const aiErrorRe = /<!--\s*ai error:\s*(.*?)\s*-->/i;
 		let j = i + 1;
@@ -264,11 +280,18 @@ export function parseSavedHighlights(md: string): SavedHighlight[] {
 				if (currentTurn) currentTurn.content += "\n";
 			} else {
 				const turnMatch = turnHeaderRe.exec(stripped);
+				const inPrompt: boolean = currentTurn !== null && turns[turns.length - 1].role === "user";
+				const reply: RegExpExecArray | null = !turnMatch && inPrompt && /^>\s*$/.test(lines[j - 1])
+					? replyHeaderRe.exec(stripped)
+					: null;
 				if (turnMatch) {
 					currentTurn = {
 						role: turnMatch[1] === "User" ? "user" : "assistant",
 						content: turnMatch[2],
 					};
+					turns.push(currentTurn);
+				} else if (reply) {
+					currentTurn = { role: "assistant", content: reply[2] ?? "", label: reply[1] };
 					turns.push(currentTurn);
 				} else if (currentTurn) {
 					currentTurn.content += "\n" + stripped;
@@ -298,6 +321,7 @@ export function parseSavedHighlights(md: string): SavedHighlight[] {
 			startChar,
 			endChar,
 			prefix,
+			createdAt: Number.isFinite(createdAt) ? createdAt : undefined,
 			pdfPage,
 			pdfSel,
 			userText,
@@ -314,17 +338,13 @@ export function parseSavedHighlights(md: string): SavedHighlight[] {
 
 // ─── Companion doc ───────────────────────────────────────────────────────────
 
-/** Resolve a companion doc's `TFile`, creating doc (and folder) on first use.
+/** Resolve a book's companion doc, creating doc (and folder) on first use.
  *  Null only if creation fails outright. Shared by every annotatable format —
  *  a PDF's annotations are a first-class vault node exactly like an EPUB's. */
-export async function ensureCompanionDoc(
-	app: App,
-	path: string,
-	title: string,
-	sourceLink: string,
-): Promise<TFile | null> {
-	const existing = app.vault.getFileByPath(path);
+export async function ensureCompanionDoc(app: App, book: TFile, title: string): Promise<TFile | null> {
+	const existing = findCompanionDoc(book, title);
 	if (existing) return existing;
+	const path = companionDocPath(title);
 	const folder = path.substring(0, path.lastIndexOf("/"));
 	if (folder && !app.vault.getFolderByPath(folder)) {
 		try {
@@ -338,7 +358,7 @@ export async function ensureCompanionDoc(
 		`title: "${title.replace(/"/g, '\\"')}"`,
 		// Quoted: YAML parses a bare `[[X]]` as a nested list, so Obsidian
 		// would never resolve the wikilink and the note gets no graph edge.
-		`source: "${sourceLink}"`,
+		`source: "[[${book.path}]]"`,
 		"tags: [annotations, third-mind-reader]",
 		`created: ${new Date().toISOString()}`,
 		"---",
@@ -354,15 +374,10 @@ export async function ensureCompanionDoc(
 	}
 }
 
-/** Append a freshly built callout to a companion doc, normalising the blank-line
- *  padding so consecutive entries never run together. */
-export async function appendCallout(app: App, file: TFile, callout: string): Promise<void> {
-	await app.vault.process(file, (existing) => {
-		const pad = existing.endsWith("\n\n") ? "" : existing.endsWith("\n") ? "\n" : "\n\n";
-		return existing + pad + callout + "\n";
-	});
+/** File a freshly built callout under its section heading (see `insertCallout`). */
+export async function fileCallout(app: App, file: TFile, callout: string, section: NoteSection | null): Promise<void> {
+	await app.vault.process(file, (existing) => insertCallout(existing, callout, section));
 }
-
 /** Maintain the companion doc's `ai-pending` frontmatter count.
  *
  *  A **discovery hint**, not state: it lets "Process pending AI requests" find
@@ -476,16 +491,23 @@ export function rewriteCalloutBody(doc: string, saved: SavedHighlight): string {
 	}
 	const sourceLink = existingSourceLink(lines, anchorIdx, endIdx);
 	if (sourceLink) body.push(sourceLink);
-	for (const turn of saved.turns) {
-		const prefix = turn.role === "user" ? "User" : "AI";
-		const contentLines = turn.content.split("\n");
+	// Without a bare `>` here, Markdown's lazy continuation pulls the first turn into the quote.
+	if (body.length && saved.turns.length) body.push(">");
+	saved.turns.forEach((turn, idx) => {
+		// The parser only reads a labelled reply after a prompt and a blank line, so
+		// prompts lose blank lines of their own.
+		const labelled = turn.role === "assistant" && saved.turns[idx - 1]?.role === "user";
+		if (labelled && body[body.length - 1] !== ">") body.push(">");
+		const prefix = turn.role === "user" ? "User" : labelled ? replyLabel(turn) : "AI";
+		const content = turn.role === "user" ? turn.content.replace(/\n\s*\n/g, "\n") : turn.content;
+		const contentLines = content.split("\n");
 		body.push(`> ${prefix}: ${contentLines[0]}`);
 		// Paragraph breaks emit a bare `>` (no trailing space) so the line
 		// round-trips through the parser unchanged.
 		for (let i = 1; i < contentLines.length; i++) {
 			body.push(contentLines[i].length ? `> ${contentLines[i]}` : ">");
 		}
-	}
+	});
 	if (saved.aiState === "pending") {
 		body.push(">");
 		body.push("> <!-- ai response pending -->");
@@ -513,9 +535,10 @@ export function buildCallout(opts: {
 	quote: string;
 	userText: string;
 	sourceLink?: string;
+	expanded: boolean;
 }): string {
 	const lines: string[] = [];
-	lines.push(`> [!${opts.modeId}]- ${opts.header}`);
+	lines.push(`> [!${opts.modeId}]${opts.expanded ? "+" : "-"} ${opts.header}`);
 	lines.push(`> ${opts.anchor}`);
 	if (opts.quote.length > 0) {
 		for (const ql of opts.quote.split(/\r?\n/)) lines.push(`> > ${ql}`);
@@ -648,7 +671,7 @@ export class AnnotationPreview extends Component {
 			const parts: string[] = [];
 			let used = 0;
 			for (const turn of saved.turns) {
-				const prefix = turn.role === "user" ? "You: " : "AI: ";
+				const prefix = turn.role === "user" ? "You: " : `${replyLabel(turn)}: `;
 				const content = stripFootnotes(turn.content);
 				const sep = parts.length > 0 ? 2 : 0; // "\n\n" between turns
 				const available = CHARS - used - sep;

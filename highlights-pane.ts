@@ -50,6 +50,7 @@ import {
 	type GlossHostSettings,
 	type SavedHighlight,
 } from "./gloss";
+import { type CalloutKey, type NoteSection, organiseNote, removeCallout } from "./note-layout";
 
 class ConfirmModal extends Modal {
 	private confirmed = false;
@@ -82,7 +83,7 @@ class ConfirmModal extends Modal {
 }
 
 /** Resolves false on Cancel, Escape, or clicking outside. */
-function confirmAction(app: App, heading: string, message: string, confirmLabel: string): Promise<boolean> {
+export function confirmAction(app: App, heading: string, message: string, confirmLabel: string): Promise<boolean> {
 	return new Promise((resolve) => new ConfirmModal(app, heading, message, confirmLabel, resolve).open());
 }
 
@@ -96,26 +97,51 @@ export const DEFAULT_SYSTEM_PROMPTS: Record<AiPromptMode, string> = {
 	explain:
 		`You are a concise reading assistant for "{book}". `
 		+ `Answer the reader's question using your training knowledge only. `
+		+ `If you aren't sure, say so, and point the reader to where they could find out, `
+		+ `as a good librarian would. `
 		+ `Be precise and brief, and reply in plain conversational prose — `
 		+ `no headings, tables, or diagrams.`,
 	examine:
 		`You are a thorough research assistant for "{book}". `
 		+ `Explore the reader's question in depth. Check the web and Cite sources with numbered `
 		+ `footnotes like [1], [2] and append each as "[^N]: Title — URL". `
+		+ `Where the evidence is thin or disputed, say so rather than smoothing it over, `
+		+ `and suggest where the reader could dig further. `
 		+ `Write your findings as flowing conversational prose; the only structure `
 		+ `should be those footnotes — no headings, tables, or diagrams.`,
 	exclaim:
 		`You are an empathetic reading companion for "{book}". `
 		+ `The reader has had a reaction to the passage. Respond warmly and `
 		+ `connect it to themes, context, or broader ideas. `
+		+ `If a connection is a guess, say so. `
 		+ `Talk like a person rather than a document: natural prose, `
 		+ `no headings, tables, or diagrams.`,
 	enquiry:
 		`You are a knowledgeable reading companion for "{book}". `
 		+ `Have a thoughtful, open-ended conversation about the reader's question. `
+		+ `If you aren't sure of something, say so, and either point the reader to where `
+		+ `they could find out or work it through with them, as a good librarian would. `
 		+ `Keep it substantive but conversational — natural prose, `
 		+ `no headings, tables, or diagrams.`,
 };
+
+/** FNV-1a hashes of every default that was saved as a full copy (0.5.0–1.0.2).
+ *  Frozen: prompts are now stored only when edited, so later defaults never need adding. */
+const LEGACY_DEFAULT_PROMPT_HASHES = new Set([
+	"69a38799", "a1e186b6", "6ecdae13", "675eb9b7",
+	"d620af38", "0b66d390", "2ae73e17", "f806ee48",
+]);
+
+/** True when a stored prompt is a default the user never edited. */
+export function isStockSystemPrompt(mode: AiPromptMode, text: string): boolean {
+	if (text === DEFAULT_SYSTEM_PROMPTS[mode]) return true;
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < text.length; i++) {
+		hash ^= text.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193) >>> 0;
+	}
+	return LEGACY_DEFAULT_PROMPT_HASHES.has(hash.toString(16).padStart(8, "0"));
+}
 
 /** Build a mode-specific system prompt from the user-editable template,
  *  substituting the document title and appending the source quote as context so
@@ -144,7 +170,8 @@ export interface HighlightsPaneSettings extends GlossHostSettings {
 	showBareFlaggedConversations: boolean;
 	/** Mobile only: force every AI submission into the deferred queue. */
 	deferAiToDesktop: boolean;
-	systemPrompts: Record<AiPromptMode, string>;
+	/** Edited prompts only; a missing mode uses DEFAULT_SYSTEM_PROMPTS. */
+	systemPrompts: Partial<Record<AiPromptMode, string>>;
 	/** Per-document record; only `pane` is the pane's business. Keyed by vault
 	 *  path, shared with the reader's position store. */
 	bookPositions: Record<string, { pane?: PaneTab }>;
@@ -211,8 +238,8 @@ export interface HighlightsPaneHost {
 	/** The live saved-highlight array. Never cached by the pane — the host
 	 *  reassigns it on book change, and `deleteHighlightAt` splices it in place. */
 	savedHighlights(): SavedHighlight[];
-	/** Companion doc path for the current book, or null when there is no book. */
-	companionDocPath(): string | null;
+	/** The current book's companion doc, or null until its first annotation. */
+	companionDoc(): TFile | null;
 	/** Grouping + doc-order keys for one highlight. EPUB resolves these from the
 	 *  spine section; a PDF host would resolve them from the page. */
 	sectionOf(saved: SavedHighlight): { id: string; label: string; spineIdx: number; paraIdx: number };
@@ -408,6 +435,28 @@ export class HighlightsPane extends Component {
 		this.activeConvLog = null;
 	}
 
+	/** File the companion doc's callouts under chapter headings, after asking.
+	 *  Returns true when the doc was rewritten, so the host re-parses it. */
+	async organiseCompanionDoc(sectionFor: (key: CalloutKey) => NoteSection | null): Promise<boolean> {
+		const file = this.host.companionDoc();
+		if (!file) return false;
+		if (!await confirmAction(
+			this.app,
+			"Organise annotation note?",
+			"Annotations are moved under chapter headings, in book order. Your own text and headings stay where they are.",
+			"Organise",
+		)) return false;
+		this.closeOpenConversation();
+		await this.app.vault.process(file, (doc) => organiseNote(doc, sectionFor));
+		return true;
+	}
+
+	/** Call before a re-parse that may renumber entries, which would leave an
+	 *  open chat pointing at the wrong one. */
+	closeOpenConversation(): void {
+		if (this.activeConvIdx !== -1) this.closeConversation();
+	}
+
 	/** Drop all per-book render state. Called when the host loads a new book. */
 	reset(): void {
 		this.collapsedSections.clear();
@@ -578,12 +627,10 @@ export class HighlightsPane extends Component {
 	 *  No-op when the doc doesn't exist yet (no annotations made). Bound to the
 	 *  Highlights-pane header button so it's reachable from either tab. */
 	async openCompanionDoc(): Promise<void> {
-		const path = this.host.companionDocPath();
-		if (!path) return;
-		const file = this.app.vault.getAbstractFileByPath(path);
-		if (!(file instanceof TFile)) return;
+		const file = this.host.companionDoc();
+		if (!file) return;
 		const existing = this.app.workspace.getLeavesOfType("markdown").find(
-			(l) => (l.view as { file?: TFile }).file?.path === path,
+			(l) => (l.view as { file?: TFile }).file === file,
 		);
 		if (existing) {
 			this.app.workspace.setActiveLeaf(existing, { focus: true });
@@ -596,9 +643,7 @@ export class HighlightsPane extends Component {
 	 *  disk — there's nothing to open before the reader's first annotation. */
 	refreshCompanionDocButton(): void {
 		if (!this.noteBtnEl) return;
-		const path = this.host.companionDocPath();
-		const exists = !!path && this.app.vault.getAbstractFileByPath(path) instanceof TFile;
-		this.noteBtnEl.toggleClass("tmr-hidden", !exists);
+		this.noteBtnEl.toggleClass("tmr-hidden", !this.host.companionDoc());
 	}
 
 	/** Build the filter row that lives at the bottom of the conversations list.
@@ -886,8 +931,7 @@ export class HighlightsPane extends Component {
 			"Delete",
 		)) return;
 
-		const path = this.host.companionDocPath();
-		const file = path ? this.app.vault.getFileByPath(path) : null;
+		const file = this.host.companionDoc();
 		if (file) {
 			try {
 				await this.app.vault.process(file, (doc) => this.removeCalloutFromDoc(doc, saved));
@@ -949,8 +993,9 @@ export class HighlightsPane extends Component {
 
 		let ordered: typeof enriched;
 		if (this.convSort === "recent") {
-			// Reverse insertion order — later entries in savedHighlights were appended last.
-			ordered = enriched.slice().sort((a, b) => b.idx - a.idx);
+			// Callouts without an `at:` stamp sort after stamped ones, by reverse note order.
+			ordered = enriched.slice().sort((a, b) =>
+				((b.saved.createdAt ?? -1) - (a.saved.createdAt ?? -1)) || (b.idx - a.idx));
 		} else if (this.convSort === "chapter") {
 			// Doc order (spine → para → startChar), same as Annotations tab.
 			ordered = enriched.slice().sort((a, b) =>
@@ -1234,10 +1279,14 @@ export class HighlightsPane extends Component {
 			// Static, not the animated indicator: nothing is happening, and
 			// three bouncing dots would promise otherwise.
 			const wrap = log.createDiv({ cls: "tmr-conv-turn-ai-wrap" });
-			wrap.createDiv({
+			const bubble = wrap.createDiv({
 				cls: "tmr-conv-turn-ai-bubble tmr-turn-queued",
 				text: queuedLabel(),
 			});
+			if (this.getActiveProvider()) {
+				bubble.createEl("button", { cls: "tmr-turn-queued-run", text: "Generate response" })
+					.addEventListener("click", () => this.runQueuedExchange(saved, log));
+			}
 		} else if (saved.aiState === "pending") {
 			const phase = saved.livePhase ?? "thinking";
 			if (phase === "streaming") {
@@ -1354,6 +1403,12 @@ export class HighlightsPane extends Component {
 		);
 	}
 
+	private runQueuedExchange(saved: SavedHighlight, log: HTMLElement): void {
+		void this.doAiExchange(saved, log, true)
+			.then(() => this.syncAiPendingFlag())
+			.catch((err) => console.error("[ThirdMindReader] queued AI call failed", err));
+	}
+
 	/** Should this exchange be queued for a desktop session instead of called?
 	 *
 	 *  Mobile only, and either because there is nothing to call (no provider, or
@@ -1375,10 +1430,9 @@ export class HighlightsPane extends Component {
 	 *  fresh AI annotation is appended — without this the doc could carry a
 	 *  marker and no hint if the session ended before the exchange resolved. */
 	async syncAiPendingFlag(): Promise<void> {
-		const path = this.host.companionDocPath();
-		const file = path ? this.app.vault.getFileByPath(path) : null;
+		const file = this.host.companionDoc();
 		if (!file) return;
-		const count = this.saved.filter((h) => h.aiState === "pending").length;
+		const count =this.saved.filter((h) => h.aiState === "pending").length;
 		await setAiPendingCount(this.app, file, count);
 	}
 
@@ -1393,6 +1447,7 @@ export class HighlightsPane extends Component {
 	private async doAiExchange(
 		saved: SavedHighlight,
 		log: HTMLElement | null,
+		bypassQueue = false,
 	): Promise<void> {
 		// Seed the first user turn from legacy userText when this is the
 		// initial auto-fire (turns array is empty at persistGloss time).
@@ -1411,7 +1466,7 @@ export class HighlightsPane extends Component {
 		// of a call, not an extra write. Openers and follow-ups both funnel
 		// through here, and the transcript parser rebuilds turn history either
 		// way, so the desktop can't tell them apart.
-		if (this.shouldQueueAi(provider)) {
+		if (!bypassQueue && this.shouldQueueAi(provider)) {
 			saved.aiState = "pending";
 			delete saved.livePhase; delete saved.streamingText;
 			if (log) { await this.renderConversationLog(log, saved); log.scrollTop = log.scrollHeight; }
@@ -1504,7 +1559,7 @@ export class HighlightsPane extends Component {
 					log.scrollTop = log.scrollHeight;
 				},
 			});
-			saved.turns.push({ role: "assistant", content: res.content });
+			saved.turns.push({ role: "assistant", content: res.content, label: provider.id });
 			saved.aiState = "complete";
 			delete saved.aiError;
 		} catch (err) {
@@ -1537,9 +1592,7 @@ export class HighlightsPane extends Component {
 	// ─── Companion-doc writers ──────────────────────────────────────────────
 
 	private async patchCalloutInDoc(saved: SavedHighlight): Promise<void> {
-		const path = this.host.companionDocPath();
-		if (!path) return;
-		const file = this.app.vault.getFileByPath(path);
+		const file = this.host.companionDoc();
 		if (!file) return;
 		try {
 			// AI-bearing callouts are rebuilt from `turns`; non-AI (Emphasise)
@@ -1593,13 +1646,7 @@ export class HighlightsPane extends Component {
 	private removeCalloutFromDoc(doc: string, saved: SavedHighlight): string {
 		const lines = doc.split("\n");
 		const bounds = findCalloutBounds(lines, saved);
-		if (!bounds) return doc;
-		let { startIdx } = bounds;
-		let { endIdx } = bounds;
-		if (lines[endIdx] === "") endIdx++;
-		else if (startIdx > 0 && lines[startIdx - 1] === "") startIdx--;
-		lines.splice(startIdx, endIdx - startIdx);
-		return lines.join("\n");
+		return bounds ? removeCallout(lines, bounds.startIdx, bounds.endIdx) : doc;
 	}
 
 	/** A bare-flagged conversation is an AI-mode callout with no user prompt

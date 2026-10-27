@@ -25,6 +25,8 @@ import {
 	Scope,
 	AbstractInputSuggest,
 	TFolder,
+	FileSystemAdapter,
+	MarkdownPreviewRenderer,
 	apiVersion,
 	getLinkpath,
 	normalizePath,
@@ -49,7 +51,7 @@ import { OffsetMap, type CursorRange, isRegisterableBlock, REGISTERABLE_BLOCK_SE
 import { isLocalEndpoint, probeProvider, starterModel, type AiProvider, type ProviderKind, type LocalRuntime } from "./ai-client";
 import { findFlaggedDocs, processPendingInFile } from "./ai-queue";
 import { LibraryView, LIBRARY_VIEW_TYPE } from "./library-view";
-import { type LibraryOverride, invalidateMetaCache, configureLibraryPaths, libraryRootPath, annotationsFolderPath, DEFAULT_LIBRARY_ROOT, companionDocPath, sanitizeFileName } from "./library-scan";
+import { type LibraryBook, type LibraryOverride, scanLibrary, invalidateMetaCache, configureLibraryPaths, libraryRootPath, annotationsFolderPath, defaultAnnotationsPath, DEFAULT_LIBRARY_ROOT, companionDocPath, findCompanionDoc, isCompanionDoc, watchCompanionDocs, sanitizeFileName, isExplodedEpub } from "./library-scan";
 // Shared Gloss grammar — the annotation surface, saved-highlight model, and
 // companion-doc writers that the EPUB reader and the PDF controller both drive.
 import {
@@ -59,8 +61,8 @@ import {
 	GLOSS_AI_MODES,
 	GLOSS_MODES,
 	GlossSurface,
-	appendCallout,
 	applyGlossTheme,
+	fileCallout,
 	type GlossHostSettings,
 	buildCallout,
 	calloutHeader,
@@ -80,13 +82,17 @@ import {
 	DEFAULT_SYSTEM_PROMPTS,
 	HighlightsPane,
 	buildGlossSystemPrompt,
+	confirmAction,
 	makePaneResizable,
+	isStockSystemPrompt,
 	pickModel,
 	type AiPromptMode,
 	type HighlightsPaneHost,
 	type PaneTab,
 } from "./highlights-pane";
-import { PdfGlossManager } from "./pdf-gloss";
+import { type NoteSection, needsOrganising, organiseNote, spineNoteSection } from "./note-layout";
+import { registerNoteFoldActions } from "./note-actions";
+import { PdfGlossManager, pdfNoteSections } from "./pdf-gloss";
 // Bundled 3C typefaces (OFL/Apache). Imported as base64 data URLs (see
 // esbuild.config.mjs `dataurl` loader) so they ship inside main.js and render
 // for BRAT testers, whose vaults never receive the loose fonts/ folder.
@@ -103,6 +109,27 @@ export const READER_VIEW_TYPE = "third-mind-reader";
 const SEARCH_MIN_CHARS = 2;
 const SEARCH_MAX_HITS = 500;
 const SEARCH_RENDER_CAP = 100;
+
+/** One registry entry per document, so every open reader adds and removes its own ranges. */
+let adjacentHighlight: Highlight | null = null;
+
+/** Fixed in-between colours for the page-turn fade (`::highlight(tmr-fade-N)` in styles.css).
+ *  Moving a range between them repaints only its own text, where an animated colour
+ *  variable would restyle the whole chapter every frame. */
+const FADE_RUNGS = 8;
+let fadeLadder: Highlight[] = [];
+
+function adjacentFadeLadder(): Highlight[] {
+	if (!fadeLadder.length) {
+		fadeLadder = Array.from({ length: FADE_RUNGS }, (_, k) => {
+			const rung = new Highlight();
+			rung.priority = 1;
+			CSS.highlights.set(`tmr-fade-${k}`, rung);
+			return rung;
+		});
+	}
+	return fadeLadder;
+}
 
 interface ImportEntry {
 	/** Book root as it appears in `webkitRelativePath`, e.g. `Books/Zen.epub`. */
@@ -148,10 +175,10 @@ interface ThirdMindReaderSettings {
 	 *  phone. Off by default — queueing is otherwise automatic and only happens
 	 *  when there is no provider to call. See the Mobile spec, Tier 1. */
 	deferAiToDesktop: boolean;
-	/** Editable system-prompt templates per AI Gloss mode. `{book}` is
-	 *  substituted with the book title; the selected passage is appended
-	 *  automatically by `buildAiSystemPrompt`. */
-	systemPrompts: Record<AiPromptMode, string>;
+	/** Edited system-prompt templates per AI Gloss mode; a missing mode uses the
+	 *  default. `{book}` is substituted with the book title; the selected passage
+	 *  is appended automatically by `buildAiSystemPrompt`. */
+	systemPrompts: Partial<Record<AiPromptMode, string>>;
 	/** Per-book display overrides for title/author, keyed by vault path. The
 	 *  epub file is never modified — these only change how the Library renders
 	 *  (e.g. trimming a junk suffix baked into the OPF metadata). */
@@ -163,9 +190,8 @@ interface ThirdMindReaderSettings {
 	/** Vault folder holding the user's books. Everything else the Library shows
 	 *  — collection tabs, imports — hangs off this. */
 	libraryRoot: string;
-	/** Where companion docs are written. Empty means "derive from `libraryRoot`",
-	 *  which is the normal case; it holds a real path only when the user moved
-	 *  the library and chose to leave existing annotations where they were. */
+	/** Where new companion docs are written. Empty means "derive from
+	 *  `libraryRoot`"; existing docs are found by their `source:` link wherever they sit. */
 	annotationsFolder: string;
 	/** Which one-shot prompts this vault has already seen, keyed by
 	 *  {@link OneTimeKey}. Written through `markSeen`, which persists before the
@@ -191,7 +217,10 @@ interface ThirdMindReaderSettings {
 	readerMargins: number | null;
 	/** How the neighbouring pages that bleed into the side margins are drawn.
 	 *  Desktop only: touch layouts always clip them. */
-	readerAdjacentPages: "default" | "muted" | "hidden";
+	readerAdjacentPages: "visible" | "muted" | "hidden";
+	/** 3C dark lets Obsidian's Translucent window show through. Off keeps it solid. */
+	translucent3c: boolean;
+	annotationsExpanded: boolean;
 }
 
 /** `family: null` is the reader's own default: Labrada in 3C mode, Obsidian's
@@ -237,7 +266,7 @@ function applyCssVars(el: HTMLElement, vars: Record<string, string | null>): voi
 }
 
 /** Prompts that must fire at most once per vault. */
-type OneTimeKey = "help-modal" | "library-setup";
+type OneTimeKey = "help-modal" | "library-setup" | "organise-notes";
 
 const DEFAULT_SETTINGS: ThirdMindReaderSettings = {
 	tmrMode: "obsidian",
@@ -249,7 +278,7 @@ const DEFAULT_SETTINGS: ThirdMindReaderSettings = {
 	streaming: true,
 	showBareFlaggedConversations: false,
 	deferAiToDesktop: false,
-	systemPrompts: { ...DEFAULT_SYSTEM_PROMPTS },
+	systemPrompts: {},
 	libraryOverrides: {},
 	libraryCollectionOrder: [],
 	libraryRoot: DEFAULT_LIBRARY_ROOT,
@@ -262,7 +291,9 @@ const DEFAULT_SETTINGS: ThirdMindReaderSettings = {
 	readerParagraphSpacing: null,
 	readerLineWidth: null,
 	readerMargins: null,
-	readerAdjacentPages: "default",
+	readerAdjacentPages: "muted",
+	translucent3c: true,
+	annotationsExpanded: false,
 };
 
 /** Bounds of the reader text-size override. Wider than Obsidian's own slider at
@@ -304,6 +335,51 @@ interface ReaderSection {
 	tocHref: string;
 	startSpine: number;
 	endSpine: number;
+}
+
+/** The book's sections from its TOC, one per spine item a TOC entry starts.
+ *  Shared by the reader and the headless note organiser so their headings agree. */
+function bookSections(book: Pick<EpubBook, "toc" | "spine">): ReaderSection[] {
+	// Walk ALL TOC items (parents and leaves) so that part dividers and
+	// other parent-only entries with their own spine item become sections
+	// instead of being silently absorbed into the preceding section.
+	const tocItems: { label: string; href: string }[] = [];
+	const walkAll = (items: EpubTocItem[]): void => {
+		for (const item of items) {
+			tocItems.push({ label: item.label.trim() || "Untitled", href: item.href });
+			if (item.children.length > 0) walkAll(item.children);
+		}
+	};
+	walkAll(book.toc);
+
+	const rawSections: { label: string; href: string; startSpine: number }[] = [];
+	const seenSpines = new Set<number>();
+	for (const entry of tocItems) {
+		const path = entry.href.split("#", 1)[0];
+		const idx = book.spine.findIndex((s) => s.href === path);
+		if (idx >= 0 && !seenSpines.has(idx)) {
+			seenSpines.add(idx);
+			rawSections.push({ label: entry.label, href: entry.href, startSpine: idx });
+		}
+	}
+
+	if (rawSections.length === 0) {
+		for (let i = 0; i < book.spine.length; i++) {
+			rawSections.push({ label: `Section ${i + 1}`, href: book.spine[i].href, startSpine: i });
+		}
+	}
+
+	rawSections.sort((a, b) => a.startSpine - b.startSpine);
+	return rawSections.map((s, i) => {
+		const nextStart = rawSections[i + 1]?.startSpine ?? book.spine.length;
+		return {
+			id: `sec-${i}`,
+			label: s.label,
+			tocHref: s.href,
+			startSpine: s.startSpine,
+			endSpine: Math.max(s.startSpine, nextStart - 1),
+		};
+	});
 }
 
 /** One registerable block of the book-search index. `paraId` is predicted to
@@ -353,7 +429,20 @@ interface ReaderPosition {
 	 *  everything read before this shipped — both sort to the alphabetical tail,
 	 *  which is the pre-existing order, so no backfill is needed. */
 	lastRead?: number;
+	/** Where the page is in the text. Outranks `unitIndex`/`spread`, which only
+	 *  mean something at the layout they were saved under. */
+	anchor?: PositionAnchor;
 }
+
+/** `char` is the first character on the page, in the same offset space as
+ *  highlight anchors, so a page that is all one paragraph's tail lands right. */
+interface PositionAnchor {
+	para: string;
+	prefix: string;
+	char: number;
+}
+
+type StartPosition = Pick<ReaderPosition, "unitIndex" | "spread" | "anchor">;
 
 type LayoutMode = "spread" | "single";
 
@@ -517,9 +606,8 @@ class LibrarySetupModal extends Modal {
 	}
 }
 
-/** Declining is a real answer, not a no-op: the old path gets pinned into
- *  settings so existing books keep their annotations. Closing without choosing
- *  declines, because the root has already changed by the time this opens. */
+/** Closing without choosing declines, because the folder has already changed by
+ *  the time this opens. */
 class MoveAnnotationsModal extends Modal {
 	private decided = false;
 
@@ -536,7 +624,7 @@ class MoveAnnotationsModal extends Modal {
 		const { contentEl } = this;
 		this.setTitle("Move your annotations too?");
 		contentEl.createEl("p", {
-			text: `Your notes for each book live in ${this.from}. Move them to ${this.to} to sit alongside the new library folder, or leave them where they are — either way nothing is lost.`,
+			text: `Your notes for each book live in ${this.from}. Move them to ${this.to}, or leave them where they are — either way nothing is lost.`,
 		});
 		new Setting(contentEl)
 			.addButton((b) => b.setButtonText("Leave them").onClick(() => this.decide(false)))
@@ -640,13 +728,6 @@ export class ReaderView extends ItemView {
 	private currentSpread = 0;
 	private currentUnitIndex = 0;
 	private totalSpreads = 1;
-	/** True once a unit has actually mounted for the current book. Guards the
-	 *  onClose position flush: a view closed mid-load (plugin reload/update
-	 *  tears views down while the async load is in flight) still sits at the
-	 *  0/0 reset values, and flushing those would overwrite the real stored
-	 *  position with {unitIndex: 0, spread: 0, pct: 1} — the "sent back to
-	 *  the start" poison. */
-	private hasMountedUnit = false;
 	/** Durable "where the user is" anchor — section index + in-section spread
 	 *  offset + that section's spread count — captured on every goToSpread,
 	 *  when the unit model is guaranteed valid. handleResize re-seeks from
@@ -656,6 +737,10 @@ export class ReaderView extends ItemView {
 	 *  "section 0" — the post-reload yank back to the cover. */
 	private posAnchor: { sectionIdx: number; offset: number; count: number } | null = null;
 	private tocAnchorPageMap: Array<{ spreadOffset: number; href: string }> = [];
+	private adjacentRanges: Range[] = [];
+	private pageRange: Range | null = null;
+	private fadingRanges: Range[] = [];
+	private fadeFrame: number | null = null;
 
 	/** Last `appearanceSignature()` applied; empty before the first call. Guards
 	 *  the repaginate so unrelated settings saves are free. */
@@ -683,6 +768,7 @@ export class ReaderView extends ItemView {
 	 *  whenever no reference floater is up. Touch only. */
 	private referenceTapEl: Element | null = null;
 	private isDraggingProgress = false;
+	private selectingFromSpread = false;
 	private progressTooltipRaf: number | null = null;
 	private pendingProgressMouseEvent: MouseEvent | null = null;
 
@@ -809,7 +895,9 @@ export class ReaderView extends ItemView {
 	 *  when the input belongs to a live selection. */
 	private editingNoteIdx: number | null = null;
 
-	private positionSaveTimer: number | null = null;
+	/** Path is captured at schedule time: by the time a book switch flushes,
+	 *  `currentFile` already names the incoming book. */
+	private pendingPositionSave: { path: string; timer: number; anchor: PositionAnchor | null } | null = null;
 
 	private static readonly GAP = 48;
 	private static readonly SINGLE_PAGE_HYSTERESIS = 32;
@@ -871,7 +959,7 @@ export class ReaderView extends ItemView {
 		this.glossSurface = new GlossSurface({
 			app: this.app,
 			settings: () => this.plugin.settings,
-			sourcePath: () => this.getCompanionDocPath() ?? "",
+			sourcePath: () => this.getCompanionDoc()?.path ?? companionDocPath(this.companionDocTitle()),
 			onExtend: () => this.beginExtend(),
 			onSubmit: (mode, text) => this.onGlossSubmit(mode, text),
 			onDismiss: () => this.dismissGloss(),
@@ -896,7 +984,7 @@ export class ReaderView extends ItemView {
 			settings: () => this.plugin.settings,
 			saveSettings: () => this.plugin.saveSettings(),
 			savedHighlights: () => this.savedHighlights,
-			companionDocPath: () => this.getCompanionDocPath(),
+			companionDoc: () => this.getCompanionDoc(),
 			sectionOf: (saved) => {
 				const match = /^s(\d+)-p(\d+)$/.exec(saved.paraIdHint);
 				const spineIdx = match ? parseInt(match[1], 10) : 0;
@@ -971,8 +1059,17 @@ export class ReaderView extends ItemView {
 		this.registerEvent(this.app.workspace.on("layout-change", () => this.syncPopoutGuard()));
 		this.syncPopoutGuard();
 
-		this.registerDomEvent(document, "mouseup", () => {
+		this.registerDomEvent(document, "mouseup", (e: MouseEvent) => {
 			this.isDraggingProgress = false;
+			const fromSpread = this.selectingFromSpread;
+			this.selectingFromSpread = false;
+			if (fromSpread && !this.spreadEl?.contains(e.target as Node)) this.raiseGlossForSelection(true);
+		});
+
+		// iOS can kill a backgrounded app without closing its views, so `onClose`
+		// never runs; this is the last moment a pending save can still land.
+		this.registerDomEvent(document, "visibilitychange", () => {
+			if (document.visibilityState === "hidden") this.flushPositionSave();
 		});
 
 		// Touch selection has no usable mouseup — see `registerTouchSelectionRaise`,
@@ -1126,6 +1223,7 @@ export class ReaderView extends ItemView {
 		this.escScopePushed = false;
 		this.escScope = null;
 		this.pane.abortActiveStream();
+		this.clearAdjacentMute();
 		this.resizeObserver?.disconnect();
 		this.resizeObserver = null;
 		this.statusBarObserver?.disconnect();
@@ -1162,18 +1260,7 @@ export class ReaderView extends ItemView {
 		this.clearHighlightOverlay();
 		if (this.progressTooltipRaf !== null) window.cancelAnimationFrame(this.progressTooltipRaf);
 		this.progressTooltipRaf = null;
-		// Flush any pending debounced save so the last position isn't lost on close.
-		if (this.positionSaveTimer !== null) {
-			window.clearTimeout(this.positionSaveTimer);
-			this.positionSaveTimer = null;
-		}
-		const closePath = this.currentFile?.path;
-		// hasMountedUnit: never flush the 0/0 reset values of a view that got
-		// closed before its load finished — see the field doc.
-		if (closePath && this.book && this.hasMountedUnit) {
-			this.writeBookPosition(closePath);
-			void this.plugin.persistSettings();
-		}
+		this.flushPositionSave();
 		this.contentEl.empty();
 	}
 
@@ -1205,7 +1292,7 @@ export class ReaderView extends ItemView {
 				// back to the cover after the user has navigated into the book.
 				const hasPosition = incomingUnit !== undefined || incomingSpread !== undefined;
 				if (hasPosition) {
-					await this.mountCurrentUnit(savedUnitIndex, savedSpread);
+					await this.mountCurrentUnit(savedUnitIndex, savedSpread, false);
 				}
 				await super.setState(state, result);
 				return;
@@ -1237,7 +1324,7 @@ export class ReaderView extends ItemView {
 			const node = this.app.vault.getAbstractFileByPath(filePath);
 			if (node instanceof TFile) {
 				this.currentFile = node;
-				await this.loadFile(node, { unitIndex: savedUnitIndex, spread: savedSpread });
+				await this.loadFile(node, { unitIndex: savedUnitIndex, spread: savedSpread, anchor: storedPos?.anchor });
 			}
 		}
 		await super.setState(state, result);
@@ -1261,6 +1348,7 @@ export class ReaderView extends ItemView {
 		const adjacent = this.plugin.settings.readerAdjacentPages;
 		this.contentEl.toggleClass("tmr-adjacent-muted", adjacent === "muted");
 		this.contentEl.toggleClass("tmr-adjacent-hidden", adjacent === "hidden");
+		this.updateAdjacentMute();
 		const signature = this.appearanceSignature();
 		if (signature === this.appliedAppearance) return;
 		const first = this.appliedAppearance === "";
@@ -1553,6 +1641,10 @@ export class ReaderView extends ItemView {
 				e.preventDefault();
 				return;
 			}
+			if (this.handleImageClick(e)) {
+				e.preventDefault();
+				return;
+			}
 			const anchor = (e.target as Element).closest("a[href]");
 			if (!anchor) return;
 			const href = anchor.getAttribute("href") ?? "";
@@ -1609,6 +1701,9 @@ export class ReaderView extends ItemView {
 			swipeAccum = 0;
 			if (dir > 0) void this.advance();
 			else void this.retreat();
+		});
+		this.registerDomEvent(this.spreadEl, "mousedown", (e: MouseEvent) => {
+			this.selectingFromSpread = e.button === 0;
 		});
 		this.registerDomEvent(this.spreadEl, "mouseup", () => this.raiseGlossForSelection());
 
@@ -2159,7 +2254,7 @@ export class ReaderView extends ItemView {
 		if (closeHighlightsPanel && this.pane.isOpen) this.pane.toggle();
 	}
 
-	private async loadFile(file: TFile, initialPos?: { unitIndex: number; spread: number }): Promise<void> {
+	private async loadFile(file: TFile, initialPos?: StartPosition): Promise<void> {
 		this.resetViewState();
 		this.renderShell();
 		if (file.extension === "epub") {
@@ -2173,6 +2268,7 @@ export class ReaderView extends ItemView {
 	}
 
 	private resetViewState(): void {
+		this.flushPositionSave();
 		this.sections = [];
 		this.units = [];
 		this.sectionIndexById.clear();
@@ -2188,7 +2284,6 @@ export class ReaderView extends ItemView {
 		this.currentSpread = 0;
 		this.currentUnitIndex = 0;
 		this.totalSpreads = 1;
-		this.hasMountedUnit = false;
 		this.posAnchor = null;
 		this.previousPosition = null;
 		this.measurementBucketKey = "";
@@ -2210,7 +2305,7 @@ export class ReaderView extends ItemView {
 		this.searchHits = [];
 	}
 
-	private async loadEpub(parse: () => Promise<EpubBook>, initialPos?: { unitIndex: number; spread: number }): Promise<void> {
+	private async loadEpub(parse: () => Promise<EpubBook>, initialPos?: StartPosition): Promise<void> {
 		try {
 			if (this.book) revokeImageUrls(this.book);
 			this.book = await parse();
@@ -2247,9 +2342,10 @@ export class ReaderView extends ItemView {
 				await this.loadSavedHighlights();
 				this.pane.restoreTab();
 				if (!this.spreadEl?.isConnected) return; // torn down mid-build
+				if (initialPos?.anchor && await this.mountAtAnchor(initialPos.anchor)) return;
 				const startUnit = Math.min(initialPos?.unitIndex ?? 0, Math.max(0, this.units.length - 1));
 				const startSpread = initialPos?.spread ?? 0;
-				await this.mountCurrentUnit(startUnit, startSpread);
+				await this.mountCurrentUnit(startUnit, startSpread, false);
 			});
 			this.renderToc();
 			this.buildProgressSegments();
@@ -2279,46 +2375,7 @@ export class ReaderView extends ItemView {
 	// ─── REGION: Section & Unit Modeling ─────────────────────────────────────
 	private buildSectionIndex(): void {
 		if (!this.book) return;
-		// Walk ALL TOC items (parents and leaves) so that part dividers and
-		// other parent-only entries with their own spine item become sections
-		// instead of being silently absorbed into the preceding section.
-		const tocItems: { label: string; href: string }[] = [];
-		const walkAll = (items: EpubTocItem[]): void => {
-			for (const item of items) {
-				tocItems.push({ label: item.label.trim() || "Untitled", href: item.href });
-				if (item.children.length > 0) walkAll(item.children);
-			}
-		};
-		walkAll(this.book.toc);
-
-		const rawSections: { label: string; href: string; startSpine: number }[] = [];
-		const seenSpines = new Set<number>();
-		for (const entry of tocItems) {
-			const path = entry.href.split("#", 1)[0];
-			const idx = this.book.spine.findIndex((s) => s.href === path);
-			if (idx >= 0 && !seenSpines.has(idx)) {
-				seenSpines.add(idx);
-				rawSections.push({ label: entry.label, href: entry.href, startSpine: idx });
-			}
-		}
-
-		if (rawSections.length === 0) {
-			for (let i = 0; i < this.book.spine.length; i++) {
-				rawSections.push({ label: `Section ${i + 1}`, href: this.book.spine[i].href, startSpine: i });
-			}
-		}
-
-		rawSections.sort((a, b) => a.startSpine - b.startSpine);
-		this.sections = rawSections.map((s, i) => {
-			const nextStart = rawSections[i + 1]?.startSpine ?? this.book!.spine.length;
-			return {
-				id: `sec-${i}`,
-				label: s.label,
-				tocHref: s.href,
-				startSpine: s.startSpine,
-				endSpine: Math.max(s.startSpine, nextStart - 1),
-			};
-		});
+		this.sections = bookSections(this.book);
 
 		this.sectionIndexById.clear();
 		this.sectionIndexBySpine = new Array<number>(this.book.spine.length).fill(0);
@@ -2397,15 +2454,15 @@ export class ReaderView extends ItemView {
 		mode: LayoutMode = this.layoutMode,
 	): { innerWidth: number; colWidth: number; gap: number } {
 		const cs = getComputedStyle(spread);
-		const fallbackWidth = this.spreadEl?.clientWidth ?? this.contentEl.clientWidth;
-		const spreadWidth = spread.clientWidth > 0 ? spread.clientWidth : fallbackWidth;
+		const fallbackWidth = this.spreadEl ? this.layoutWidth(this.spreadEl) : this.contentEl.clientWidth;
+		const spreadWidth = spread.clientWidth > 0 ? this.layoutWidth(spread) : fallbackWidth;
 		const innerWidth = Math.max(100, spreadWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight));
 		const gap = this.getColumnGap(mode, spread);
 		// `innerWidth` comes from float padding math and can run a sub-pixel wider
 		// than the pixel-snapped `.tmr-content` box the columns actually live in
 		// (this divergence only shows up at fractional UI zoom). Compute the column
 		// width against the real box so two columns are guaranteed to fit.
-		const usableInner = content.clientWidth > 0 ? Math.min(innerWidth, content.clientWidth) : innerWidth;
+		const usableInner = content.clientWidth > 0 ? Math.min(innerWidth, this.layoutWidth(content)) : innerWidth;
 		const colWidth = Math.max(100, mode === "single" ? usableInner : (usableInner - gap) / 2);
 		// CSS `column-width` is a *minimum*: if the applied value rounds up even a
 		// hair past what fits, multicol drops from two columns to one full-width
@@ -2458,7 +2515,7 @@ export class ReaderView extends ItemView {
 		this.ensureMeasurementNodes();
 		if (!this.measurementSpreadEl || !this.measurementContentEl) return { spreads: 1, columns: 1, fromCache: false };
 
-		const width = this.spreadEl?.clientWidth || this.contentEl.clientWidth;
+		const width = (this.spreadEl && this.layoutWidth(this.spreadEl)) || this.contentEl.clientWidth;
 		const height = this.spreadEl?.clientHeight || this.contentEl.clientHeight;
 		this.measurementSpreadEl.style.width = `${Math.max(200, width)}px`;
 		this.measurementSpreadEl.style.height = `${Math.max(200, height)}px`;
@@ -2590,7 +2647,7 @@ export class ReaderView extends ItemView {
 		return node;
 	}
 
-	private async mountCurrentUnit(unitIdx: number, spread: number): Promise<void> {
+	private async mountCurrentUnit(unitIdx: number, spread: number, record = true): Promise<void> {
 		if (this.isGlossActive()) this.dismissGloss();
 		const token = ++this.renderToken;
 		this.currentUnitIndex = Math.max(0, Math.min(unitIdx, this.units.length - 1));
@@ -2606,14 +2663,12 @@ export class ReaderView extends ItemView {
 		this.preloadLinkPreviewsForUnit(currentDom);
 		this.buildTocAnchorPageMap();
 		this.currentSpread = Math.max(0, Math.min(spread, unit.spreadCount - 1));
-		this.goToSpread(this.currentSpread);
+		this.goToSpread(this.currentSpread, record);
 		this.renderSavedHighlights();
 		this.hideAnnotationPreview();
 		await this.mountAdjacentUnits();
 		this.updateProgress();
 		this.updateTocActive();
-		this.hasMountedUnit = true;
-		this.schedulePositionSave();
 	}
 
 	private async mountAdjacentUnits(): Promise<void> {
@@ -2748,11 +2803,15 @@ export class ReaderView extends ItemView {
 		this.updateBackMarker();
 	}
 
-	private goToSpread(n: number): void {
+	/** Every page move ends here, so this is where the position is saved. Restores
+	 *  and layout passes pass `record = false`: they re-place the reader without
+	 *  the reader moving, and must not overwrite the stored position. */
+	private goToSpread(n: number, record = true): void {
 		const unit = this.getCurrentUnit();
 		if (!this.contentNode || !unit) return;
 		const clamped = Math.max(0, Math.min(n, unit.spreadCount - 1));
 		const stride = this.getNavigationStride();
+		const previousSpread = this.currentSpread;
 		this.currentSpread = clamped;
 		// Far jumps snap instead of sliding. Animating thousands of px in
 		// 250ms reads as a blur at best — and on translucent themes the
@@ -2762,7 +2821,9 @@ export class ReaderView extends ItemView {
 		const targetX = clamped * stride;
 		const liveTransform = getComputedStyle(this.contentNode).transform;
 		const liveX = liveTransform === "none" ? 0 : -new DOMMatrixReadOnly(liveTransform).m41;
-		if (Math.abs(liveX - targetX) > stride * 1.5) {
+		const snaps = Math.abs(liveX - targetX) > stride * 1.5;
+		const turned = !snaps && clamped !== previousSpread;
+		if (snaps) {
 			this.contentNode.addClass("tmr-no-transition");
 			this.contentNode.style.transform = `translateX(-${targetX}px)`;
 			void this.contentNode.offsetWidth; // commit without transition
@@ -2779,12 +2840,131 @@ export class ReaderView extends ItemView {
 		};
 		this.updateProgress();
 		this.updateTocActive();
+		this.updateAdjacentMute(turned);
+		if (record) this.schedulePositionSave();
+	}
+
+	/** Muted neighbouring pages: the unit's text before the current spread's first
+	 *  character and from the next spread's first character on. */
+	private updateAdjacentMute(animate = false): void {
+		const leaving = animate ? this.pageRange : null;
+		this.clearAdjacentMute();
+		const content = this.contentNode;
+		const stride = this.getNavigationStride();
+		if (!content || stride <= 0 || Platform.isMobile || this.plugin.settings.readerAdjacentPages !== "muted") return;
+		const contentLeft = content.getBoundingClientRect().left;
+		const spreadOf = (rect: DOMRect | undefined) => (rect ? Math.floor((rect.left - contentLeft) / stride) : -1);
+
+		const nodes: Text[] = [];
+		const walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT);
+		for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+			if (/\S/.test(n.nodeValue ?? "")) nodes.push(n as Text);
+		}
+		const probe = document.createRange();
+		const lastSpread = (node: Text) => {
+			probe.selectNodeContents(node);
+			const rects = probe.getClientRects();
+			return spreadOf(rects[rects.length - 1]);
+		};
+		const firstSpreadFrom = (node: Text, offset: number) => {
+			probe.setStart(node, offset);
+			probe.setEnd(node, node.length);
+			return spreadOf(probe.getClientRects()[0]);
+		};
+		const firstCharOn = (spread: number): [Text, number] | null => {
+			let lo = 0;
+			let hi = nodes.length;
+			while (lo < hi) {
+				const mid = (lo + hi) >> 1;
+				if (lastSpread(nodes[mid]) >= spread) hi = mid;
+				else lo = mid + 1;
+			}
+			const node = nodes[lo];
+			if (!node) return null;
+			let a = 0;
+			let b = node.length - 1;
+			while (a < b) {
+				const mid = (a + b) >> 1;
+				if (firstSpreadFrom(node, mid) >= spread) b = mid;
+				else a = mid + 1;
+			}
+			return [node, a];
+		};
+
+		const start = firstCharOn(this.currentSpread);
+		const end = firstCharOn(this.currentSpread + 1);
+		const before = document.createRange();
+		before.selectNodeContents(content);
+		if (start) before.setEnd(start[0], start[1]);
+		this.adjacentRanges.push(before);
+		if (end) {
+			const after = document.createRange();
+			after.selectNodeContents(content);
+			after.setStart(end[0], end[1]);
+			this.adjacentRanges.push(after);
+		}
+		if (!adjacentHighlight) {
+			adjacentHighlight = new Highlight();
+			CSS.highlights.set("tmr-adjacent", adjacentHighlight);
+		}
+		for (const range of this.adjacentRanges) adjacentHighlight.add(range);
+		content.querySelectorAll("img, svg").forEach((el) => {
+			el.toggleClass("tmr-adjacent-dim", spreadOf(el.getBoundingClientRect()) !== this.currentSpread);
+		});
+		if (!start) return;
+		const page = document.createRange();
+		page.selectNodeContents(content);
+		page.setStart(start[0], start[1]);
+		if (end) page.setEnd(end[0], end[1]);
+		this.pageRange = page;
+		if (animate) this.runAdjacentFade(leaving && content.contains(leaving.commonAncestorContainer) ? leaving : null, page);
+	}
+
+	/** The arriving page lights up in 60% of the slide, with a fast attack; the leaving
+	 *  page dims over all of it. */
+	private runAdjacentFade(leaving: Range | null, arriving: Range): void {
+		if (!this.contentNode) return;
+		const ladder = adjacentFadeLadder();
+		const slide = parseFloat(getComputedStyle(this.contentNode).transitionDuration) * 1000;
+		if (!(slide > 0)) return;
+		this.fadingRanges = leaving ? [arriving, leaving] : [arriving];
+		const place = (range: Range, muted: number, show: boolean) => {
+			for (const rung of ladder) rung.delete(range);
+			if (show) ladder[Math.round(muted * (ladder.length - 1))].add(range);
+		};
+		const started = performance.now();
+		const tick = (now: number) => {
+			// A frame's timestamp can predate `started`, which would push the rung index out of range.
+			const easeOut = (span: number) => 1 - (1 - Math.max(0, Math.min(1, (now - started) / span))) ** 2;
+			const lit = easeOut(slide * 0.6);
+			const dimmed = easeOut(slide);
+			place(arriving, 1 - lit, lit < 1);
+			if (leaving) place(leaving, dimmed, dimmed < 1);
+			this.fadeFrame = dimmed < 1 ? window.requestAnimationFrame(tick) : null;
+		};
+		tick(started);
+	}
+
+	private clearAdjacentMute(): void {
+		for (const range of this.adjacentRanges) adjacentHighlight?.delete(range);
+		this.adjacentRanges = [];
+		if (this.fadeFrame !== null) window.cancelAnimationFrame(this.fadeFrame);
+		this.fadeFrame = null;
+		for (const range of this.fadingRanges) for (const rung of fadeLadder) rung.delete(range);
+		this.fadingRanges = [];
+		this.pageRange = null;
 	}
 
 	private getPageWidth(): number {
 		if (!this.spreadEl) return 0;
 		const cs = getComputedStyle(this.spreadEl);
-		return this.spreadEl.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+		return this.layoutWidth(this.spreadEl) - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+	}
+
+	/** Columns lay out at the fractional width (common on Android) while `clientWidth`
+	 *  rounds, so a stride built from it drifts by the rounding error on every page. */
+	private layoutWidth(el: HTMLElement): number {
+		return parseFloat(getComputedStyle(el).width) || el.clientWidth;
 	}
 
 	private paginateVisibleContent(): void {
@@ -2899,7 +3079,7 @@ export class ReaderView extends ItemView {
 	private async handleResize(isStale?: () => boolean): Promise<void> {
 		if (!this.book || !this.spreadEl) {
 			this.paginateVisibleContent();
-			this.goToSpread(this.currentSpread);
+			this.goToSpread(this.currentSpread, false);
 			return;
 		}
 
@@ -2938,7 +3118,7 @@ export class ReaderView extends ItemView {
 			const unit = this.getCurrentUnit();
 			if (unit) this.applyContentLayout(unit);
 			else this.paginateVisibleContent();
-			this.goToSpread(this.currentSpread);
+			this.goToSpread(this.currentSpread, false);
 			// The one resize path that doesn't reach `mountCurrentUnit`, and so
 			// the one that used to leave the highlight overlay behind: the rects
 			// are absolute boxes measured off `getClientRects()` at paint time,
@@ -2978,7 +3158,7 @@ export class ReaderView extends ItemView {
 		if (!section) {
 			// Can't resolve the section — clamp to the nearest valid unit
 			// instead of teleporting to the cover.
-			await this.mountCurrentUnit(Math.min(this.currentUnitIndex, this.units.length - 1), 0);
+			await this.mountCurrentUnit(Math.min(this.currentUnitIndex, this.units.length - 1), 0, false);
 			return;
 		}
 
@@ -3003,11 +3183,11 @@ export class ReaderView extends ItemView {
 			const targetGlobal = (this.unitStartSpreads[targetUnitIdx] ?? 0) + targetSpread;
 			const drift = memoGlobal - targetGlobal;
 			if (drift >= 0 && drift <= 1) {
-				await this.mountCurrentUnit(memo.unitIndex, memo.spread);
+				await this.mountCurrentUnit(memo.unitIndex, memo.spread, false);
 				return;
 			}
 		}
-		await this.mountCurrentUnit(targetUnitIdx, targetSpread);
+		await this.mountCurrentUnit(targetUnitIdx, targetSpread, false);
 	}
 
 	private getSpreadOffsetInUnitBySectionId(unit: RenderUnit | undefined, sectionId: string): number {
@@ -3376,17 +3556,21 @@ export class ReaderView extends ItemView {
 	}
 
 	private async jumpToSpine(targetSpine: number, fragment: string | null): Promise<void> {
-		const sectionIdx = this.sectionIndexBySpine[targetSpine] ?? 0;
-		const section = this.sections[sectionIdx];
-		if (!section) return;
-		const targetUnitIdx = this.unitIndexBySection.get(section.id) ?? 0;
-		const spreadOffset = this.getSpreadOffsetInUnitBySectionId(this.units[targetUnitIdx], section.id);
-		await this.mountCurrentUnit(targetUnitIdx, spreadOffset);
+		if (!(await this.mountSpine(targetSpine))) return;
 		if (fragment) {
 			const namespacedId = `s${targetSpine}-${fragment}`;
 			const target = this.findTarget(namespacedId);
 			if (target) this.scrollToTarget(target);
 		}
+	}
+
+	/** Mount the unit holding a spine item, at the first page of its section. */
+	private async mountSpine(spine: number, record = true): Promise<boolean> {
+		const section = this.sections[this.sectionIndexBySpine[spine] ?? 0];
+		if (!section) return false;
+		const unitIdx = this.unitIndexBySection.get(section.id) ?? 0;
+		await this.mountCurrentUnit(unitIdx, this.getSpreadOffsetInUnitBySectionId(this.units[unitIdx], section.id), record);
+		return true;
 	}
 
 	private updateTocActive(): void {
@@ -3544,17 +3728,28 @@ export class ReaderView extends ItemView {
 	/** Resolve whatever is selected right now into a raised GlossBar. Reached from
 	 *  mouseup on desktop and from settled `selectionchange` on touch, hence the
 	 *  input-agnostic name. */
-	private raiseGlossForSelection(): void {
+	private raiseGlossForSelection(releasedOutside = false): void {
 		const sel = window.getSelection();
 		// A click while extending sets the far endpoint of the anchored range.
 		if (this.isExtending) {
-			if (sel) this.finishExtend(sel);
+			if (sel && !releasedOutside) this.finishExtend(sel);
 			return;
 		}
 		if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
 		const range = sel.getRangeAt(0);
 		if (!this.spreadEl || !this.spreadEl.contains(range.startContainer)) return;
+		// Released off the page, the browser may snap the far end to a page that isn't showing.
+		if (releasedOutside && !this.rangeOnVisiblePage(range)) return;
 		this.finalizeSelection(sel, range.getBoundingClientRect());
+	}
+
+	private rangeOnVisiblePage(range: Range): boolean {
+		if (!this.spreadEl) return false;
+		const view = this.spreadEl.getBoundingClientRect();
+		const cs = getComputedStyle(this.spreadEl);
+		const left = view.left + (parseFloat(cs.paddingLeft) || 0);
+		const right = view.right - (parseFloat(cs.paddingRight) || 0);
+		return Array.from(range.getClientRects()).every((r) => r.left < right && r.right > left);
 	}
 
 	/** Resolve a native selection to a stored `CursorRange`, paint the active
@@ -3776,17 +3971,11 @@ export class ReaderView extends ItemView {
 		quote: string,
 		highlight: CursorRange,
 	): Promise<void> {
-		const path = this.getCompanionDocPath();
-		if (!path) return;
-		const callout = this.buildCallout(modeId, userText, quote, highlight);
-		const file = await ensureCompanionDoc(
-			this.app,
-			path,
-			this.book?.title ?? this.currentFile?.basename ?? "Book",
-			this.currentFile ? `[[${this.currentFile.path}]]` : "",
-		);
+		const createdAt = Date.now();
+		const callout = this.buildCallout(modeId, userText, quote, highlight, createdAt);
+		const file = await this.ensureCompanionDoc();
 		if (!file) return;
-		await appendCallout(this.app, file, callout);
+		await fileCallout(this.app, file, callout, this.noteSectionForPara(highlight.paraId));
 
 		const chars = this.offsetMap.cursorRangeToChars(highlight);
 		const entry = this.offsetMap.get(highlight.paraId);
@@ -3802,6 +3991,7 @@ export class ReaderView extends ItemView {
 			startChar: chars?.startChar ?? -1,
 			endChar: chars?.endChar ?? -1,
 			prefix,
+			createdAt,
 			userText,
 			quote,
 			turns: [],
@@ -3819,10 +4009,8 @@ export class ReaderView extends ItemView {
 	 *  re-rendered in the reader. Missing file = empty list (silent). */
 	private async loadSavedHighlights(): Promise<void> {
 		this.savedHighlights = [];
-		const path = this.getCompanionDocPath();
-		if (!path) return;
 		try {
-			const file = this.app.vault.getFileByPath(path);
+			const file = this.getCompanionDoc();
 			if (!file) return;
 			const content = await this.app.vault.cachedRead(file);
 			this.savedHighlights = parseSavedHighlights(content);
@@ -3863,6 +4051,50 @@ export class ReaderView extends ItemView {
 			fallback = el.dataset.paraId ?? fallback;
 		}
 		return fallback;
+	}
+
+	/** The current page as a place in the text, or null when the page carries no
+	 *  paragraph text of its own (an image or heading-only page). */
+	private positionAnchorOnSpread(): PositionAnchor | null {
+		const para = this.firstParaIdOnSpread();
+		const entry = para ? this.offsetMap.get(para) : null;
+		if (!para || !entry) return null;
+		const len = this.offsetMap.charLength(para);
+		const onPage = (c: number) => (this.spreadOfChar(para, c, len) ?? -1) >= this.currentSpread;
+		if (len === 0 || !onPage(len - 1)) return null;
+		let lo = 0;
+		let hi = len - 1;
+		while (lo < hi) {
+			const mid = (lo + hi) >> 1;
+			if (onPage(mid)) hi = mid;
+			else lo = mid + 1;
+		}
+		const prefix = entry.text.replace(/\s+/g, " ").trim().slice(0, ANCHOR_PREFIX_LEN);
+		return { para, prefix, char: lo };
+	}
+
+	/** Measures `char..end` rather than the one character, which can be a
+	 *  zero-width space at a line end. */
+	private spreadOfChar(paraId: string, char: number, end: number): number | null {
+		const rect = this.rectsForCharRange(paraId, char, end)[0];
+		const stride = this.getNavigationStride();
+		if (!rect || !this.contentNode || stride <= 0) return null;
+		return Math.floor((rect.left - this.contentNode.getBoundingClientRect().left) / stride);
+	}
+
+	/** False when the paragraph can't be found, leaving the caller to fall back
+	 *  to the stored page number. */
+	private async mountAtAnchor(anchor: PositionAnchor): Promise<boolean> {
+		const spine = /^s(\d+)-/.exec(anchor.para);
+		if (!spine || !(await this.mountSpine(parseInt(spine[1], 10), false))) return false;
+		const para = this.offsetMap.findParaIdByPrefix(anchor.prefix, anchor.para);
+		const entry = para ? this.offsetMap.get(para) : null;
+		if (!para || !entry || !this.contentNode?.contains(entry.element)) return false;
+		const len = this.offsetMap.charLength(para);
+		const spread = this.spreadOfChar(para, Math.min(anchor.char, Math.max(0, len - 1)), len);
+		if (spread === null) return false;
+		this.goToSpread(spread, false);
+		return true;
 	}
 
 	/** Every spread an element's rendered fragments land on — two, for a
@@ -3949,19 +4181,13 @@ export class ReaderView extends ItemView {
 			new Notice("Third Mind Reader: nothing on this page to bookmark");
 			return;
 		}
-		const built = this.buildBookmarkCallout(paraId);
+		const createdAt = Date.now();
+		const built = this.buildBookmarkCallout(paraId, createdAt);
 		if (!built) return;
 
-		const path = this.getCompanionDocPath();
-		if (!path) return;
-		const file = await ensureCompanionDoc(
-			this.app,
-			path,
-			this.book.title || this.currentFile?.basename || "Book",
-			this.currentFile ? `[[${this.currentFile.path}]]` : "",
-		);
+		const file = await this.ensureCompanionDoc();
 		if (!file) return;
-		await appendCallout(this.app, file, built.callout);
+		await fileCallout(this.app, file, built.callout, this.noteSectionForPara(paraId));
 
 		// Synthesise the in-memory record so the pane and the button update
 		// without a re-parse. -1 offsets are the rangeless marker.
@@ -3971,6 +4197,7 @@ export class ReaderView extends ItemView {
 			startChar: -1,
 			endChar: -1,
 			prefix: built.prefix,
+			createdAt,
 			userText: "",
 			quote: built.quote,
 			turns: [],
@@ -3993,6 +4220,7 @@ export class ReaderView extends ItemView {
 	 *  doc readable on its own. */
 	private buildBookmarkCallout(
 		paraId: string,
+		createdAt: number,
 	): { callout: string; prefix: string; quote: string } | null {
 		const match = /^s(\d+)-p(\d+)$/.exec(paraId);
 		if (!match) return null;
@@ -4006,7 +4234,7 @@ export class ReaderView extends ItemView {
 		const quote = text.length > max ? text.slice(0, max).trimEnd() + "…" : text;
 		const anchor =
 			`<!-- tmr-anchor spine:${spineIdx} para:${paraId} ` +
-			`prefix:"${encodeURIComponent(prefix)}" -->`;
+			`prefix:"${encodeURIComponent(prefix)}" at:${createdAt} -->`;
 		return {
 			callout: buildCallout({
 				modeId: BOOKMARK_MODE.id,
@@ -4014,6 +4242,7 @@ export class ReaderView extends ItemView {
 				anchor,
 				quote,
 				userText: "",
+				expanded: this.plugin.settings.annotationsExpanded,
 			}),
 			prefix,
 			quote,
@@ -4040,8 +4269,7 @@ export class ReaderView extends ItemView {
 	private async processQueuedExchanges(): Promise<void> {
 		if (Platform.isMobile) return;
 		if (!this.savedHighlights.some((h) => h.aiState === "pending")) return;
-		const path = this.getCompanionDocPath();
-		const file = path ? this.app.vault.getFileByPath(path) : null;
+		const file = this.getCompanionDoc();
 		const provider = this.plugin.activeAiProvider();
 		if (!file || !provider) return;
 		try {
@@ -4262,9 +4490,39 @@ export class ReaderView extends ItemView {
 		this.glossSurface.openInput("emphasise", rect, true);
 	}
 
-	private getCompanionDocPath(): string | null {
-		if (!this.book && !this.currentFile) return null;
-		return companionDocPath(this.book?.title || this.currentFile?.basename || "Book");
+	private companionDocTitle(): string {
+		return this.book?.title || this.currentFile?.basename || "Book";
+	}
+
+	private getCompanionDoc(): TFile | null {
+		return this.currentFile ? findCompanionDoc(this.currentFile, this.companionDocTitle()) : null;
+	}
+
+	private async ensureCompanionDoc(): Promise<TFile | null> {
+		return this.currentFile ? ensureCompanionDoc(this.app, this.currentFile, this.companionDocTitle()) : null;
+	}
+
+	private noteSectionForPara(paraId: string): NoteSection | null {
+		const spine = /^s(\d+)-/.exec(paraId);
+		return spine ? this.noteSectionForSpine(parseInt(spine[1], 10)) : null;
+	}
+
+	private noteSectionForSpine(spine: number): NoteSection | null {
+		return spineNoteSection(this.sections, spine);
+	}
+
+	async organiseCompanionDoc(): Promise<void> {
+		const rewritten = await this.pane.organiseCompanionDoc((key) => this.noteSectionForSpine(key[0]));
+		if (rewritten) await this.reloadAnnotations();
+	}
+
+	async reloadReorganisedNote(): Promise<void> {
+		this.pane.closeOpenConversation();
+		await this.reloadAnnotations();
+	}
+
+	hasCompanionDoc(): boolean {
+		return this.getCompanionDoc() !== null;
 	}
 
 	private buildCallout(
@@ -4272,6 +4530,7 @@ export class ReaderView extends ItemView {
 		userText: string,
 		quote: string,
 		highlight: CursorRange,
+		createdAt: number,
 	): string {
 		const match = /^s(\d+)-p(\d+)$/.exec(highlight.paraId);
 		const spineIdx = match ? parseInt(match[1], 10) : 0;
@@ -4290,21 +4549,21 @@ export class ReaderView extends ItemView {
 		const prefix = encodeURIComponent(prefixRaw);
 		let anchor: string;
 		if (!chars) {
-			anchor = `<!-- tmr-anchor spine:${spineIdx} para:${highlight.paraId} prefix:"${prefix}" -->`;
+			anchor = `<!-- tmr-anchor spine:${spineIdx} para:${highlight.paraId} prefix:"${prefix}" at:${createdAt} -->`;
 		} else if (highlight.endParaId) {
 			// Cross-paragraph: endChars holds the end offset within endParaId.
 			// chars:S,-1 is a sentinel so old plugin versions skip this anchor cleanly.
 			anchor =
 				`<!-- tmr-anchor spine:${spineIdx} para:${highlight.paraId} ` +
 				`chars:${chars.startChar},-1 endPara:"${highlight.endParaId}" ` +
-				`endChars:${chars.endChar} prefix:"${prefix}" -->`;
+				`endChars:${chars.endChar} prefix:"${prefix}" at:${createdAt} -->`;
 		} else {
 			anchor =
 				`<!-- tmr-anchor spine:${spineIdx} para:${highlight.paraId} ` +
-				`chars:${chars.startChar},${chars.endChar} prefix:"${prefix}" -->`;
+				`chars:${chars.startChar},${chars.endChar} prefix:"${prefix}" at:${createdAt} -->`;
 		}
 
-		return buildCallout({ modeId, header, anchor, quote, userText });
+		return buildCallout({ modeId, header, anchor, quote, userText, expanded: this.plugin.settings.annotationsExpanded });
 	}
 
 	private renderHighlightOverlay(cursorRange: CursorRange): void {
@@ -4627,7 +4886,7 @@ export class ReaderView extends ItemView {
 	/** Persist the live reading position for `path`, merging onto any existing
 	 *  entry so sibling fields (the right-rail `pane` choice) survive — the old
 	 *  bare-object assignment silently dropped them. Caches `pct` for the Library. */
-	private writeBookPosition(path: string): void {
+	private writeBookPosition(path: string, anchor: PositionAnchor | null): void {
 		// A pass racing a rebuild (or a view torn down mid-load) can hold
 		// transient garbage — never persist it.
 		if (!Number.isFinite(this.currentUnitIndex) || !Number.isFinite(this.currentSpread)) return;
@@ -4642,6 +4901,7 @@ export class ReaderView extends ItemView {
 			...existing,
 			unitIndex: this.currentUnitIndex,
 			spread: this.currentSpread,
+			anchor: anchor ?? undefined,
 			pct,
 			// Activity, not opening: this runs on page turns (and the close flush),
 			// so a book left open in a background tab doesn't outrank one actually
@@ -4656,12 +4916,19 @@ export class ReaderView extends ItemView {
 	private schedulePositionSave(): void {
 		const path = this.currentFile?.path;
 		if (!path) return;
-		if (this.positionSaveTimer !== null) window.clearTimeout(this.positionSaveTimer);
-		this.positionSaveTimer = window.setTimeout(() => {
-			this.positionSaveTimer = null;
-			this.writeBookPosition(path);
-			void this.plugin.persistSettings();
-		}, 800);
+		if (this.pendingPositionSave) window.clearTimeout(this.pendingPositionSave.timer);
+		const timer = window.setTimeout(() => this.flushPositionSave(), 800);
+		// Measured at the turn: `onClose` flushes from a view that may no longer be laid out.
+		this.pendingPositionSave = { path, timer, anchor: this.positionAnchorOnSpread() };
+	}
+
+	private flushPositionSave(): void {
+		const pending = this.pendingPositionSave;
+		if (!pending) return;
+		window.clearTimeout(pending.timer);
+		this.pendingPositionSave = null;
+		this.writeBookPosition(pending.path, pending.anchor);
+		void this.plugin.persistSettings();
 	}
 
 	private async goBack(): Promise<void> {
@@ -4914,6 +5181,28 @@ export class ReaderView extends ItemView {
 		else this.toggleChrome();
 	}
 
+	/** On touch only the middle third opens an image, so a full-page illustration
+	 *  still leaves the edge strips free to turn the page. */
+	private handleImageClick(e: MouseEvent): boolean {
+		const img = (e.target as Element).closest("img");
+		if (!img || img.closest("a[href]") || !this.contentNode) return false;
+		if (this.tapDismisses || this.glossSurface.inputOpen) return false;
+		const sel = window.getSelection();
+		if (sel && !sel.isCollapsed) return false;
+		if (Platform.isMobile) {
+			const zone = this.tapZoneEdges();
+			if (e.clientX <= zone.left || e.clientX >= zone.right) return false;
+		}
+		// Obsidian's image viewer has no public API: borrow reading view's click
+		// handler, and leave the click inert if a later Obsidian drops it.
+		const open = (MarkdownPreviewRenderer.prototype as unknown as {
+			handleMediaClick?: (this: { sections: { el: HTMLElement }[] }, e: MouseEvent, img: HTMLImageElement) => void;
+		}).handleMediaClick;
+		if (typeof open !== "function") return false;
+		open.call({ sections: [{ el: this.contentNode }] }, e, img);
+		return true;
+	}
+
 	/** Horizontal extent of the two page-turn strips: a third of the reader's
 	 *  width at each edge, leaving the middle third to toggle the chrome.
 	 *
@@ -5085,6 +5374,9 @@ export default class ThirdMindReader extends Plugin {
 	/** True when this load found no data.json — the only reliable "never been
 	 *  set up" signal, since every other field has a default. */
 	private freshInstall = false;
+	/** Paths whose position this session removed. `data.json` still holds them
+	 *  until the next write, and the merge in `persistSettings` must not take them back. */
+	private droppedPositions = new Set<string>();
 	/** Set before any view can open, so a book restored at launch can't stack the
 	 *  cheat sheet on top of the setup prompt. */
 	librarySetupPending = false;
@@ -5098,6 +5390,7 @@ export default class ThirdMindReader extends Plugin {
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
+		this.applyBodyClasses();
 		this.librarySetupPending = !this.hasSeen("library-setup");
 		// Obsidian's bundled Lucide set predates `book-search` — register the
 		// glyph ourselves (Lucide 24-grid paths scaled onto Obsidian's 100-grid).
@@ -5151,6 +5444,8 @@ export default class ThirdMindReader extends Plugin {
 			void this.openEpubInNewTab(file.path);
 		}, { capture: true });
 
+		watchCompanionDocs(this);
+		registerNoteFoldActions(this);
 		this.registerVaultEvents();
 
 		// PDF Gloss: augment Obsidian's native PDF viewer with the same GlossBar.
@@ -5259,6 +5554,111 @@ export default class ThirdMindReader extends Plugin {
 		}
 	}
 
+	/** Blank, or the default path typed out, stores "" so the folder keeps
+	 *  following the Library root. */
+	async applyAnnotationsFolder(next: string): Promise<void> {
+		const previous = annotationsFolderPath();
+		const target = next.trim() ? normalizePath(next.trim()) : "";
+		this.settings.annotationsFolder = target === defaultAnnotationsPath() ? "" : target;
+		await this.saveSettings();
+		this.refreshLibraryViews();
+
+		const to = annotationsFolderPath();
+		if (to === previous) return;
+		const notes = (this.app.vault.getFolderByPath(previous)?.children ?? [])
+			.filter((f): f is TFile => isCompanionDoc(f));
+		if (!notes.length) return;
+		new MoveAnnotationsModal(this.app, previous, to, async (move) => {
+			if (move) await this.moveCompanionDocs(notes, previous, to);
+		}).open();
+	}
+
+	/** Books whose companion note still has callouts outside any chapter heading. */
+	async findUnorganisedNotes(books: LibraryBook[]): Promise<{ book: TFile; note: TFile }[]> {
+		const found: { book: TFile; note: TFile }[] = [];
+		for (const entry of books) {
+			const book = this.app.vault.getFileByPath(entry.path);
+			const note = book && findCompanionDoc(book, entry.rawTitle);
+			if (book && note && needsOrganising(await this.app.vault.cachedRead(note))) found.push({ book, note });
+		}
+		return found;
+	}
+
+	async organiseNotes(targets: { book: TFile; note: TFile }[]): Promise<void> {
+		const n = targets.length;
+		const plural = n === 1 ? "" : "s";
+		if (!await confirmAction(
+			this.app,
+			`Organise ${n} annotation note${plural}?`,
+			"Annotations are moved under chapter headings, in book order. Your own text and headings stay where they are.",
+			"Organise",
+		)) return;
+		await this.markSeen("organise-notes");
+		const progress = new Notice(`Organising annotation notes… 0 of ${n}`, 0);
+		const failed: string[] = [];
+		for (const [i, { book, note }] of targets.entries()) {
+			progress.setMessage(`Organising annotation notes… ${i} of ${n}`);
+			try {
+				const sectionFor = await this.noteSectionsFor(book);
+				await this.app.vault.process(note, (doc) => organiseNote(doc, (key) => sectionFor(key[0])));
+			} catch (err) {
+				console.error("[ThirdMindReader] organise failed", note.path, err);
+				failed.push(book.basename);
+			}
+		}
+		progress.hide();
+		new Notice(failed.length
+			? `Organised ${n - failed.length} of ${n} notes. Couldn't read: ${failed.join(", ")}`
+			: `Organised ${n} annotation note${plural}.`);
+
+		const paths = new Set(targets.map((t) => t.book.path));
+		for (const leaf of this.app.workspace.getLeavesOfType(READER_VIEW_TYPE)) {
+			const view = leaf.view;
+			const file = view instanceof ReaderView ? view.getState().file : undefined;
+			if (view instanceof ReaderView && file && paths.has(file)) void view.reloadReorganisedNote();
+		}
+		this.refreshLibraryViews();
+	}
+
+	/** Heading lookup by a callout key's first element, for a book that isn't open. */
+	private async noteSectionsFor(book: TFile): Promise<(first: number) => NoteSection | null> {
+		if (book.extension === "pdf") return pdfNoteSections(this.app, book);
+		const parsed = await parseEpub(await this.app.vault.readBinary(book));
+		revokeImageUrls(parsed);
+		const sections = bookSections(parsed);
+		return (spine) => spineNoteSection(sections, spine);
+	}
+
+	private async moveCompanionDocs(notes: TFile[], from: string, to: string): Promise<void> {
+		if (!this.app.vault.getFolderByPath(to)) {
+			try {
+				await this.app.vault.createFolder(to);
+			} catch (e) {
+				new Notice(`Couldn't create ${to}: ${(e as Error).message}`);
+				return;
+			}
+		}
+		const skipped: string[] = [];
+		for (const note of notes) {
+			const dest = normalizePath(`${to}/${note.name}`);
+			if (this.app.vault.getAbstractFileByPath(dest)) {
+				skipped.push(note.name);
+				continue;
+			}
+			try {
+				await this.app.fileManager.renameFile(note, dest);
+			} catch {
+				skipped.push(note.name);
+			}
+		}
+		const old = this.app.vault.getFolderByPath(from);
+		if (old && old.children.length === 0) await this.app.fileManager.trashFile(old);
+		this.refreshLibraryViews();
+		new Notice(skipped.length
+			? `Moved ${notes.length - skipped.length} of ${notes.length} notes to ${to}. Left in ${from}, because the name is taken or the move failed: ${skipped.join(", ")}`
+			: `Moved ${notes.length} note${notes.length === 1 ? "" : "s"} to ${to}.`);
+	}
+
 	/** Create the `Library/` root on load if it's missing, so a fresh install
 	 *  has the folder the empty-state prompt tells users to drop epubs into.
 	 *  Idempotent and tolerant of a parallel creation race. */
@@ -5286,6 +5686,8 @@ export default class ThirdMindReader extends Plugin {
 				if (this.settings.bookPositions[oldPath]) {
 					this.settings.bookPositions[newPath] = this.settings.bookPositions[oldPath];
 					delete this.settings.bookPositions[oldPath];
+					this.droppedPositions.add(oldPath);
+					this.droppedPositions.delete(newPath);
 					changed = true;
 				}
 				// The display override is path-keyed too — carry it along.
@@ -5317,8 +5719,8 @@ export default class ThirdMindReader extends Plugin {
 		this.registerEvent(
 			this.app.vault.on("modify", (file) => {
 				// A companion-doc edit changes a book's mark count; an epub re-save
-				// changes its metadata. Both live under Library/ and want a refresh.
-				if (!inLibrary(file.path)) return;
+				// changes its metadata. Companion docs can live outside Library/.
+				if (!inLibrary(file.path) && !isCompanionDoc(file)) return;
 				invalidateMetaCache(file.path);
 				this.refreshLibraryViews();
 			})
@@ -5350,6 +5752,11 @@ export default class ThirdMindReader extends Plugin {
 
 	onunload(): void {
 		document.getElementById("tmr-bundled-fonts")?.remove();
+		document.body.removeClass("tmr-3c-opaque");
+	}
+
+	private applyBodyClasses(): void {
+		document.body.toggleClass("tmr-3c-opaque", !this.settings.translucent3c);
 	}
 
 	/** The reader view of the currently-active leaf, or null. Reader commands
@@ -5432,6 +5839,16 @@ export default class ThirdMindReader extends Plugin {
 				const v = this.activeReaderView();
 				if (!v) return false;
 				if (!checking) void v.toggleBookmark();
+				return true;
+			},
+		});
+		this.addCommand({
+			id: "organise-annotation-note",
+			name: "Organise annotation note by chapter",
+			checkCallback: (checking) => {
+				const host = this.activeReaderView() ?? this.pdfGloss?.activeController() ?? null;
+				if (!host?.hasCompanionDoc()) return false;
+				if (!checking) void host.organiseCompanionDoc();
 				return true;
 			},
 		});
@@ -5591,11 +6008,20 @@ export default class ThirdMindReader extends Plugin {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
 		this.freshInstall = data === null;
 		this.settings.seenOnce = { ...this.settings.seenOnce };
+		this.settings.bookPositions = { ...this.settings.bookPositions };
 		configureLibraryPaths(this.settings.libraryRoot, this.settings.annotationsFolder);
-		// Fresh object with every mode filled — guards against a shared
-		// reference to DEFAULT_SETTINGS and forward-compat for new modes.
-		this.settings.systemPrompts = { ...DEFAULT_SYSTEM_PROMPTS, ...this.settings.systemPrompts };
+		this.settings.systemPrompts = { ...this.settings.systemPrompts };
 		let needsPersist = this.migrateApiKeysToSecretStorage();
+		// Migration: prompts used to be saved in full whether edited or not, which
+		// froze untouched ones at the default of the day. Unedited copies go.
+		const prompts = this.settings.systemPrompts;
+		for (const mode of Object.keys(DEFAULT_SYSTEM_PROMPTS) as AiPromptMode[]) {
+			const text = prompts[mode];
+			if (text !== undefined && isStockSystemPrompt(mode, text)) {
+				delete prompts[mode];
+				needsPersist = true;
+			}
+		}
 		// Migration: the model used to fall back to a hardcoded id per kind when
 		// `defaultModel` was unset, so an Anthropic/OpenAI provider added before
 		// this could be saved without one and still work. That fallback is gone
@@ -5614,6 +6040,12 @@ export default class ThirdMindReader extends Plugin {
 		// Lite (matches the "auto-on with provider" rule for new providers).
 		if (data && data.aiFeaturesEnabled === undefined && this.settings.aiProviders.length > 0) {
 			this.settings.aiFeaturesEnabled = true;
+			needsPersist = true;
+		}
+		// Migration: "default" named the visible option until Muted became the
+		// default. Every install stores it, so it can't mean anyone chose it.
+		if ((this.settings.readerAdjacentPages as string) === "default") {
+			this.settings.readerAdjacentPages = "muted";
 			needsPersist = true;
 		}
 		// Object.assign copies unknown stored keys onto settings, so the migrated
@@ -5675,7 +6107,8 @@ export default class ThirdMindReader extends Plugin {
 
 	/** Write settings to disk with resolved API keys stripped — only the
 	 *  `apiKeyId` reference is persisted, never the key itself. */
-	persistSettings(): Promise<void> {
+	async persistSettings(): Promise<void> {
+		await this.adoptNewerPositions();
 		configureLibraryPaths(this.settings.libraryRoot, this.settings.annotationsFolder);
 		const data: ThirdMindReaderSettings = {
 			...this.settings,
@@ -5685,11 +6118,29 @@ export default class ThirdMindReader extends Plugin {
 				return copy;
 			}),
 		};
-		return this.saveData(data);
+		await this.saveData(data);
+	}
+
+	async onExternalSettingsChange(): Promise<void> {
+		await this.adoptNewerPositions();
+	}
+
+	/** Take every book whose position on disk is newer than ours, so writing a
+	 *  stale in-memory copy of data.json can never roll a book back. */
+	private async adoptNewerPositions(): Promise<void> {
+		const disk = (await this.loadData().catch(() => null)) as Partial<ThirdMindReaderSettings> | null;
+		for (const [path, pos] of Object.entries(disk?.bookPositions ?? {})) {
+			if (this.droppedPositions.has(path)) continue;
+			const ours = this.settings.bookPositions[path];
+			if (ours && (pos.lastRead ?? 0) <= (ours.lastRead ?? 0)) continue;
+			this.settings.bookPositions[path] = pos;
+			if (pos.pct !== undefined) this.updateLibraryProgress(path, pos.pct);
+		}
 	}
 
 	async saveSettings(): Promise<void> {
 		await this.persistSettings();
+		this.applyBodyClasses();
 		this.app.workspace.getLeavesOfType(READER_VIEW_TYPE).forEach((leaf) => {
 			const view = leaf.view;
 			if (view instanceof ReaderView) {
@@ -5786,29 +6237,44 @@ class TmrSettingTab extends PluginSettingTab {
 		super(app, plugin);
 	}
 
-	/** Which vault folder holds the user's books. Committed on blur/Enter rather
-	 *  than per keystroke, so a half-typed path never becomes the library. */
-	private renderLibraryFolderSetting(setting: Setting): void {
-		const pinned = this.plugin.settings.annotationsFolder;
-		setting.setDesc(pinned
-			? `Vault folder holding your books. Annotations stay in ${pinned}.`
-			: "Vault folder holding your books. Point this at a folder you already keep EPUBs and PDFs in — it will be created if it doesn't exist.");
-
+	/** Committed on blur/Enter rather than per keystroke, so a half-typed path
+	 *  never becomes a real folder setting. */
+	private addFolderInput(setting: Setting, value: string, placeholder: string, commit: (raw: string) => void): void {
 		setting.addText((t) => {
-			t.setPlaceholder(DEFAULT_LIBRARY_ROOT).setValue(this.plugin.settings.libraryRoot);
+			t.setPlaceholder(placeholder).setValue(value);
 			new FolderSuggest(this.app, t.inputEl);
-			const commit = (): void => {
-				const target = normalizePath(t.inputEl.value.trim() || DEFAULT_LIBRARY_ROOT);
-				if (target === this.plugin.settings.libraryRoot) return;
-				void this.plugin.applyLibraryRoot(target).then(() => this.update());
-			};
-			t.inputEl.addEventListener("blur", commit);
+			t.inputEl.addEventListener("blur", () => commit(t.inputEl.value));
 			t.inputEl.addEventListener("keydown", (e) => {
 				if (e.key === "Enter") {
 					e.preventDefault();
 					t.inputEl.blur();
 				}
 			});
+		});
+	}
+
+	private renderLibraryFolderSetting(setting: Setting): void {
+		setting.setDesc("Vault folder holding your books. Point this at a folder you already keep EPUBs and PDFs in — it will be created if it doesn't exist.");
+		this.addFolderInput(setting, this.plugin.settings.libraryRoot, DEFAULT_LIBRARY_ROOT, (raw) => {
+			const target = normalizePath(raw.trim() || DEFAULT_LIBRARY_ROOT);
+			if (target === this.plugin.settings.libraryRoot) return;
+			void this.plugin.applyLibraryRoot(target).then(() => this.update());
+		});
+	}
+
+	private async organiseAllNotes(): Promise<void> {
+		const { settings } = this.plugin;
+		const books = await scanLibrary(this.app.vault, settings.libraryOverrides, settings.bookPositions);
+		const targets = await this.plugin.findUnorganisedNotes(books);
+		if (targets.length) await this.plugin.organiseNotes(targets);
+		else new Notice("All annotation notes are already organised by chapter.");
+	}
+
+	private renderAnnotationsFolderSetting(setting: Setting): void {
+		setting.setDesc(`Where new annotation notes are created. Leave blank to use ${defaultAnnotationsPath()}. Existing notes are found wherever they are, so moving them by hand is safe.`);
+		this.addFolderInput(setting, this.plugin.settings.annotationsFolder, defaultAnnotationsPath(), (raw) => {
+			if (raw.trim() === this.plugin.settings.annotationsFolder) return;
+			void this.plugin.applyAnnotationsFolder(raw).then(() => this.update());
 		});
 	}
 
@@ -5906,8 +6372,14 @@ class TmrSettingTab extends PluginSettingTab {
 							control: {
 								type: "dropdown",
 								key: "readerAdjacentPages",
-								options: { default: "Default", muted: "Muted", hidden: "Hidden" },
+								options: { visible: "Visible", muted: "Muted", hidden: "Hidden" },
 							},
+						},
+						{
+							name: "Translucent background in 3C mode",
+							desc: "With Obsidian's Translucent window on, let the desktop show through the reader and Library in 3C dark mode. Off keeps the 3C background solid.",
+							visible: Platform.isDesktopApp,
+							control: { type: "toggle", key: "translucent3c" },
 						},
 					],
 				},
@@ -6030,6 +6502,7 @@ class TmrSettingTab extends PluginSettingTab {
 		settings.readerLineWidth = DEFAULT_SETTINGS.readerLineWidth;
 		settings.readerMargins = DEFAULT_SETTINGS.readerMargins;
 		settings.readerAdjacentPages = DEFAULT_SETTINGS.readerAdjacentPages;
+		settings.translucent3c = DEFAULT_SETTINGS.translucent3c;
 		await this.plugin.saveSettings();
 		this.update();
 	}
@@ -6051,6 +6524,33 @@ class TmrSettingTab extends PluginSettingTab {
 						desc: "Import exploded epub folders from Apple Books as proper .epub files.",
 						visible: Platform.isDesktopApp,
 						page: () => customSettingPage((el) => this.renderImportSection(el)),
+					},
+				],
+			},
+			{
+				type: "group",
+				heading: "Annotation notes",
+				items: [
+					{
+						name: "Annotations folder",
+						desc: "Where new annotation notes are created.",
+						render: (setting) => this.renderAnnotationsFolderSetting(setting),
+					},
+					{
+						name: "Annotations start",
+						desc: "Whether new annotations are written folded or open in the note. To change the ones already there, use Expand or Collapse all annotations from the note's header or the command palette.",
+						control: {
+							type: "dropdown",
+							key: "annotationsExpanded",
+							options: { collapsed: "Collapsed", expanded: "Expanded" },
+						},
+					},
+					{
+						name: "Organise by chapter",
+						desc: "Move the annotations in older notes under chapter headings, in book order. Notes that are already organised are left as they are, and so is any text you've added.",
+						render: (setting) => setting.addButton((b) => b
+							.setButtonText("Organise notes")
+							.onClick(() => void this.organiseAllNotes())),
 					},
 				],
 			},
@@ -6095,11 +6595,13 @@ class TmrSettingTab extends PluginSettingTab {
 			case "followAppTextSize": return settings.readerFontSize === null;
 			case "readerFont": return settings.readerFont;
 			case "readerAdjacentPages": return settings.readerAdjacentPages;
+			case "annotationsExpanded": return settings.annotationsExpanded ? "expanded" : "collapsed";
 			case "quickHighlight": return settings.quickHighlight[Platform.isMobile ? "mobile" : "desktop"];
 			case "primaryProviderId": return settings.aiDefaults.primaryProviderId ?? "";
 			case "aiFeaturesEnabled":
 			case "streaming":
 			case "deferAiToDesktop":
+			case "translucent3c":
 				return settings[key];
 			default: return undefined;
 		}
@@ -6119,7 +6621,10 @@ class TmrSettingTab extends PluginSettingTab {
 					: "default";
 				break;
 			case "readerAdjacentPages":
-				settings.readerAdjacentPages = value === "muted" || value === "hidden" ? value : "default";
+				settings.readerAdjacentPages = value === "visible" || value === "hidden" ? value : "muted";
+				break;
+			case "annotationsExpanded":
+				settings.annotationsExpanded = value === "expanded";
 				break;
 			case "quickHighlight":
 				settings.quickHighlight[Platform.isMobile ? "mobile" : "desktop"] = value === true;
@@ -6130,6 +6635,7 @@ class TmrSettingTab extends PluginSettingTab {
 			case "aiFeaturesEnabled":
 			case "streaming":
 			case "deferAiToDesktop":
+			case "translucent3c":
 				settings[key] = value === true;
 				break;
 			default: return;
@@ -6423,7 +6929,7 @@ class TmrSettingTab extends PluginSettingTab {
 			// A free variant so the provider works the moment a key is pasted.
 			// Deliberately not a reasoning model: those spend the mode's token
 			// budget on hidden reasoning and can return no text at all at the
-			// 512 explain-mode ceiling. Free ids do churn, and the "Browse
+			// explain-mode ceiling. Free ids do churn, and the "Browse
 			// models" button repopulates this from the live list — which is the
 			// real answer to a stale default.
 			provider.defaultModel = "google/gemma-4-26b-a4b-it:free";
@@ -6469,11 +6975,12 @@ class TmrSettingTab extends PluginSettingTab {
 		setting
 			.addTextArea(t => {
 				textArea = t;
-				t.setValue(this.plugin.settings.systemPrompts[id]);
+				t.setValue(this.plugin.settings.systemPrompts[id] ?? DEFAULT_SYSTEM_PROMPTS[id]);
 				t.inputEl.rows = 5;
 				t.inputEl.addClass("tmr-settings-prompt-input");
 				t.onChange(async v => {
-					this.plugin.settings.systemPrompts[id] = v;
+					if (v === DEFAULT_SYSTEM_PROMPTS[id]) delete this.plugin.settings.systemPrompts[id];
+					else this.plugin.settings.systemPrompts[id] = v;
 					await this.plugin.saveSettings();
 				});
 			})
@@ -6481,7 +6988,7 @@ class TmrSettingTab extends PluginSettingTab {
 				.setIcon("rotate-ccw")
 				.setTooltip("Reset to default")
 				.onClick(async () => {
-					this.plugin.settings.systemPrompts[id] = DEFAULT_SYSTEM_PROMPTS[id];
+					delete this.plugin.settings.systemPrompts[id];
 					textArea.setValue(DEFAULT_SYSTEM_PROMPTS[id]);
 					await this.plugin.saveSettings();
 				}));
@@ -6502,7 +7009,7 @@ class TmrSettingTab extends PluginSettingTab {
 					.setButtonText("Select folder…")
 					.setCta()
 					.onClick(async () => {
-						const picked = await this.pickEpubFolders();
+						const picked = await this.pickEpubFolders(b.buttonEl.doc);
 						if (!picked.length) return;
 						this.importEntries = await this.validateEpubFolders(picked);
 						if (this.importEntries.length) this.renderImportResults(resultsEl);
@@ -6549,7 +7056,8 @@ class TmrSettingTab extends PluginSettingTab {
 			btn.textContent = "Importing…";
 			const imported = await this.importBooks(toImport, statusEl);
 			btn.textContent = "Import selected";
-			btn.disabled = imported > 0;
+			btn.disabled = imported.length > 0;
+			this.offerTrashOriginals(imported, statusEl);
 		};
 		btn.addEventListener("click", () => void onImportClick());
 	}
@@ -6601,7 +7109,7 @@ class TmrSettingTab extends PluginSettingTab {
 		return results.sort((a, b) => a.name.localeCompare(b.name));
 	}
 
-	private async importBooks(entries: ImportEntry[], statusEl: HTMLElement): Promise<number> {
+	private async importBooks(entries: ImportEntry[], statusEl: HTMLElement): Promise<ImportEntry[]> {
 		const vault = this.plugin.app.vault;
 		const outputDir = normalizePath(`${libraryRootPath()}/Imported`);
 		if (!vault.getFolderByPath(outputDir)) {
@@ -6609,12 +7117,12 @@ class TmrSettingTab extends PluginSettingTab {
 				await vault.createFolder(outputDir);
 			} catch (e) {
 				new Notice(`Could not create output folder: ${(e as Error).message}`);
-				return 0;
+				return [];
 			}
 		}
 
 		statusEl.empty();
-		let imported = 0;
+		const imported: ImportEntry[] = [];
 		for (const entry of entries) {
 			const safe = sanitizeFileName(entry.finalName || entry.name);
 			let outputPath = normalizePath(`${outputDir}/${safe}.epub`);
@@ -6625,7 +7133,7 @@ class TmrSettingTab extends PluginSettingTab {
 			try {
 				const fsx = await readPickedFolder(entry.files);
 				await vault.createBinary(outputPath, await packEpubFolder(entry.root, fsx));
-				imported++;
+				imported.push(entry);
 			} catch (e) {
 				statusEl.createDiv({
 					cls: "tmr-settings-import-status-line tmr-settings-import-err",
@@ -6634,20 +7142,77 @@ class TmrSettingTab extends PluginSettingTab {
 			}
 		}
 
-		if (imported > 0) {
+		const count = imported.length;
+		if (count > 0) {
 			const ok = statusEl.createDiv({ cls: "tmr-settings-import-status-line tmr-settings-import-ok" });
 			setIcon(ok.createSpan({ cls: "tmr-settings-import-status-icon" }), "book-check");
-			ok.createSpan({ text: `${imported} book${imported === 1 ? "" : "s"} imported` });
+			ok.createSpan({ text: `${count} book${count === 1 ? "" : "s"} imported` });
 			new Notice(`Import complete \u2014 check ${outputDir}/ in your vault.`);
 		}
 		return imported;
 	}
 
+	private offerTrashOriginals(imported: ImportEntry[], statusEl: HTMLElement): void {
+		const folders = imported
+			.map(entry => this.vaultFolderOf(entry))
+			.filter((f): f is TFolder => f !== null);
+		const n = folders.length;
+		if (!n) return;
+
+		const row = statusEl.createDiv({ cls: "tmr-settings-import-status-line" });
+		row.createSpan({ text: n === 1 ? "The original folder is still in your vault." : `The ${n} original folders are still in your vault.` });
+		const btn = row.createEl("button", { text: "Delete originals" });
+		btn.addEventListener("click", () => void (async () => {
+			btn.disabled = true;
+			let trashed = 0;
+			for (const folder of folders) {
+				try {
+					await this.app.fileManager.trashFile(folder);
+					trashed++;
+				} catch (e) {
+					new Notice(`Couldn't delete ${folder.path}: ${(e as Error).message}`);
+				}
+			}
+			row.empty();
+			row.createSpan({ text: `Deleted ${trashed} original folder${trashed === 1 ? "" : "s"}.` });
+		})());
+	}
+
+	/** Null unless the picked book is a folder inside this vault that still looks
+	 *  like an unzipped epub \u2014 originals picked from outside must never be offered. */
+	private vaultFolderOf(entry: ImportEntry): TFolder | null {
+		const adapter = this.app.vault.adapter;
+		const first = Array.from(entry.files)[0];
+		if (!(adapter instanceof FileSystemAdapter) || !first) return null;
+		const [rel, file] = first;
+
+		let abs: string;
+		try {
+			// eslint-disable-next-line @typescript-eslint/no-require-imports, no-undef -- Electron's webUtils is only reachable via require() in Obsidian's renderer.
+			const { webUtils } = require("electron") as { webUtils: { getPathForFile: (f: File) => string } };
+			abs = webUtils.getPathForFile(file).replace(/\\/g, "/");
+		} catch {
+			return null;
+		}
+
+		const suffix = entry.root ? rel.slice(entry.root.length) : `/${rel}`;
+		const base = `${adapter.getBasePath().replace(/\\/g, "/")}/`;
+		if (!abs.endsWith(suffix)) return null;
+		const rootAbs = abs.slice(0, abs.length - suffix.length);
+		if (!rootAbs.startsWith(base) || rootAbs.length === base.length) return null;
+
+		const folder = this.app.vault.getFolderByPath(normalizePath(rootAbs.slice(base.length)));
+		return folder && isExplodedEpub(folder) ? folder : null;
+	}
+
 	/** A directory `<input>` rather than Electron's dialog: the browser hands back
-	 *  the files themselves, so importing needs no filesystem access at all. */
-	private pickEpubFolders(): Promise<File[]> {
+	 *  the files themselves, so importing needs no filesystem access at all.
+	 *  The input must belong to the clicked window's document: settings can open
+	 *  in its own window, and a file picker only opens on a click in its own window. */
+	private pickEpubFolders(doc: Document): Promise<File[]> {
 		return new Promise(resolve => {
-			const input = createEl("input", { type: "file" });
+			// Obsidian installs createEl on every window's globals but types it only on the main one.
+			const input = (doc.win as typeof window).createEl("input", { type: "file" });
 			input.webkitdirectory = true;
 			input.multiple = true;
 			const settle = (files: File[]): void => {

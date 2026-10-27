@@ -493,7 +493,7 @@ export function isLocalEndpoint(endpoint: string | undefined): boolean {
  *  reasoning allowance is uniform: how hard a question is to think about has
  *  little to do with how long its answer should be. */
 export function tokenBudget(mode: string): { maxTokens: number; reasoningTokens: number } {
-	return { maxTokens: mode === "explain" ? 512 : 1024, reasoningTokens: 1024 };
+	return { maxTokens: mode === "explain" ? 1024 : 2048, reasoningTokens: 1024 };
 }
 
 /** The model a newly-added provider starts on, so it works without a trip to

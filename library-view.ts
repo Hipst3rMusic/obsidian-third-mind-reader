@@ -1,7 +1,7 @@
-import { ItemView, WorkspaceLeaf, setIcon, setTooltip, Menu, Modal, Setting, App, TextComponent, Notice, sanitizeHTMLToDom } from "obsidian";
+import { ItemView, WorkspaceLeaf, setIcon, setTooltip, Menu, Modal, Setting, App, TextComponent, Notice, Platform, sanitizeHTMLToDom } from "obsidian";
 import type ThirdMindReader from "./main";
 import { LOGO_3C_SVG } from "./main";
-import { scanLibrary, computeCollections, detectExplodedEpubs, type LibraryBook } from "./library-scan";
+import { scanLibrary, computeCollections, detectExplodedEpubs, libraryRootPath, type LibraryBook } from "./library-scan";
 
 export const LIBRARY_VIEW_TYPE = "tmr-library";
 
@@ -53,6 +53,8 @@ export class LibraryView extends ItemView {
 	private searchInputEl: HTMLInputElement | null = null;
 	/** Exploded `.epub` folders found in `Library/` — drives the import nudge. */
 	private explodedFolders: string[] = [];
+	/** Notes from before chapter headings — drives the one-time organise prompt. */
+	private unorganisedNotes: Awaited<ReturnType<ThirdMindReader["findUnorganisedNotes"]>> = [];
 	/** Repaint targets carved out by `render()` so state changes don't re-scan. */
 	private stripEl: HTMLElement | null = null;
 	private nudgeEl: HTMLElement | null = null;
@@ -182,6 +184,9 @@ export class LibraryView extends ItemView {
 			this.plugin.settings.bookPositions,
 		);
 		this.explodedFolders = await detectExplodedEpubs(this.app.vault);
+		this.unorganisedNotes = this.plugin.hasSeen("organise-notes")
+			? []
+			: await this.plugin.findUnorganisedNotes(this.books);
 
 		// Guard against a view that closed/re-rendered while the scan was awaiting.
 		if (!root.isConnected) return;
@@ -237,6 +242,12 @@ export class LibraryView extends ItemView {
 		this.tabResizeObserver?.disconnect();
 		this.tabResizeObserver = new ResizeObserver(() => this.positionTabIndicator(false));
 		this.tabResizeObserver.observe(tabs);
+
+		this.registerDomEvent(tabs, "wheel", (e: WheelEvent) => {
+			if (tabs.scrollWidth <= tabs.clientWidth || Math.abs(e.deltaX) >= Math.abs(e.deltaY)) return;
+			e.preventDefault();
+			tabs.scrollLeft += e.deltaY;
+		}, { passive: false });
 
 		// Add-Folder sits with the tabs; the action cluster pins to the right.
 		// Its own class because on a phone it retires with the tabs when search
@@ -540,19 +551,45 @@ export class LibraryView extends ItemView {
 		if (!slot) return;
 		slot.empty();
 		const n = this.explodedFolders.length;
-		if (n === 0) return;
+		if (n > 0) {
+			this.addNudge(
+				slot,
+				`Found ${n} book${n === 1 ? "" : "s"} that ${n === 1 ? "needs" : "need"} to be imported.`,
+				"Import",
+				() => this.openSettings(),
+				(banner) => banner.remove(),
+			);
+		}
+		const notes = this.unorganisedNotes.length;
+		if (notes > 0) {
+			this.addNudge(
+				slot,
+				`Annotation notes now group by chapter! ${notes} of yours ${notes === 1 ? "predates" : "predate"} that.`,
+				"Organise",
+				() => void this.plugin.organiseNotes(this.unorganisedNotes),
+				(banner) => {
+					banner.remove();
+					void this.plugin.markSeen("organise-notes");
+				},
+			);
+		}
+	}
 
+	private addNudge(
+		slot: HTMLElement,
+		text: string,
+		action: string,
+		onAction: () => void,
+		onDismiss: (banner: HTMLElement) => void,
+	): void {
 		const banner = slot.createDiv({ cls: "tmr-lib-nudge" });
-		banner.createSpan({
-			cls: "tmr-lib-nudge-text",
-			text: `Found ${n} book${n === 1 ? "" : "s"} that ${n === 1 ? "needs" : "need"} to be imported.`,
-		});
-		const cta = banner.createEl("button", { cls: "tmr-lib-nudge-cta", text: "Import" });
-		this.registerDomEvent(cta, "click", () => this.openSettings());
+		banner.createSpan({ cls: "tmr-lib-nudge-text", text });
+		const cta = banner.createEl("button", { cls: "tmr-lib-nudge-cta", text: action });
+		this.registerDomEvent(cta, "click", onAction);
 		const dismiss = banner.createEl("button", { cls: "tmr-lib-nudge-dismiss" });
 		setIcon(dismiss, "x");
 		setTooltip(dismiss, "Dismiss");
-		this.registerDomEvent(dismiss, "click", () => slot.empty());
+		this.registerDomEvent(dismiss, "click", () => onDismiss(banner));
 	}
 
 	// ── Book grid ───────────────────────────────────────────────────────────
@@ -747,13 +784,14 @@ export class LibraryView extends ItemView {
 	private renderEmptyState(parent: HTMLElement): void {
 		const empty = parent.createDiv({ cls: "tmr-lib-empty" });
 		empty.createDiv({ cls: "tmr-lib-empty-title", text: "Your library is empty" });
-		empty.createDiv({
-			cls: "tmr-lib-empty-hint",
-			text: "Import a book, or drop .epub and .pdf files into your Library folder.",
+		const hint = empty.createDiv({ cls: "tmr-lib-empty-hint" });
+		hint.createSpan({
+			text: `Drag .epub and .pdf files into your ${libraryRootPath()} folder${Platform.isDesktopApp ? ", or" : "."}`,
 		});
-		const importBtn = empty.createEl("button", {
+		if (!Platform.isDesktopApp) return;
+		const importBtn = hint.createEl("button", {
 			cls: "tmr-lib-empty-import",
-			text: "Import a book",
+			text: "Import from Apple Books",
 		});
 		this.registerDomEvent(importBtn, "click", () => this.openSettings());
 	}

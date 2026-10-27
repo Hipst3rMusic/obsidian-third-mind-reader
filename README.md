@@ -25,7 +25,7 @@ Everything follows my design system; I'm a designer by trade, and spent a lot of
 
 ![A book open as a two-page spread in the reader](assets/01a-hero-spread-dark.png)
 
-A two-page spread or a single page, depending on the window size you prefer. It's got all the standard bells & whistles: chapter navigation, table-of-contents panel, in-book search across the whole book, a live progress bar, and per-book position memory so you come back where you left. Body text follows Obsidian's own text size, but you can override this in the settings.
+A two-page spread or a single page, depending on the window size you prefer. It's got all the standard bells & whistles: chapter navigation, table-of-contents panel, in-book search across the whole book, a live progress bar, and per-book position memory so you come back where you left. Body text follows Obsidian's own text size, but you can override this in the settings. Any images you click on open in Obsidian's native image viewer, where you can zoom in on the small print.
 
 The source EPUB is never modified.
 
@@ -51,7 +51,9 @@ You can type `[[` while annotating and get the same file suggestions you'd get a
 
 ## Companion notes
 
-One note per book, created on your first annotation and filed in an Annotations folder inside whichever folder you use as the Library. Frontmatter, tags, and a wikilink back to the source file. Each annotation is a colour-coded callout carrying the quote, your note, and — if you used an AI mode — the full exchange written out verbatim.
+One note per book, created on your first annotation and filed in an Annotations folder inside your Library, or wherever you point it in settings. It has frontmatter, tags, and a wikilink back to the source file. The plugin finds each note by that link rather than by its name, so you can rename or move a note without it losing track of its book.
+
+Annotations sit under a heading for their chapter, in book order. Each one is a colour-coded callout carrying the quote, your note, and if you used an AI mode, the full exchange written out verbatim with each reply headed by the provider that wrote it. Callouts start collapsed or expanded, your choice, and a button in the note's header opens or closes them all at once.
 
 ![A book and its companion note side by side](assets/02-split-view.png)
 

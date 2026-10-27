@@ -1,4 +1,4 @@
-import { type Vault, TFile, TFolder, normalizePath } from "obsidian";
+import { type App, type CachedMetadata, type Plugin, type TAbstractFile, type Vault, TFile, TFolder, getLinkpath, normalizePath } from "obsidian";
 import { readEpubMeta } from "./epub";
 
 /** Minimal shape the scan needs from `settings.bookPositions[path]`: the cached
@@ -40,7 +40,7 @@ export interface LibraryBook {
 	/** Epoch ms of last reading activity; 0 for never-opened books. Sort key for
 	 *  the shelf — see `sortForShelf` in library-view.ts. */
 	lastRead: number;
-	/** Annotation count — `> [!mode]-` callout headers in the companion doc. */
+	/** Annotation count — `> [!mode]` callout headers in the companion doc, bookmarks excluded. */
 	marks: number;
 	/** Whether a companion doc exists for this book (independent of mark count). */
 	hasCompanion: boolean;
@@ -55,7 +55,12 @@ let configuredAnnotations = `${DEFAULT_LIBRARY_ROOT}/Annotations`;
  *  would sweep every epub in the vault into the Library. */
 export function configureLibraryPaths(root: string, annotations: string): void {
 	configuredRoot = normalizePath(root.trim() || DEFAULT_LIBRARY_ROOT);
-	configuredAnnotations = normalizePath(annotations.trim() || `${configuredRoot}/Annotations`);
+	configuredAnnotations = annotations.trim() ? normalizePath(annotations.trim()) : defaultAnnotationsPath();
+}
+
+/** Where companion docs go when the Annotations folder setting is blank. */
+export function defaultAnnotationsPath(): string {
+	return normalizePath(`${configuredRoot}/Annotations`);
 }
 
 export function libraryRootPath(): string {
@@ -90,17 +95,86 @@ export function sanitizeFileName(raw: string): string {
 	return raw.replace(/[\\/:*?"<>|]+/g, "_").replace(/\s+/g, " ").trim() || "Book";
 }
 
-/** Resolve a book's companion-doc path from its **raw OPF title**. The reader
- *  keys the doc by `book.title` (the parsed OPF title, not the Library display
- *  override), so marks must resolve against `rawTitle`. Shared by the reader's
- *  `getCompanionDocPath` and the Library scan, so the write and read paths can
- *  never drift apart. */
+/** Where a new companion doc is created, from the book's **raw OPF title** (not
+ *  the Library display override). Existing docs are found by `findCompanionDoc`. */
 export function companionDocPath(rawTitle: string): string {
 	return normalizePath(`${annotationsFolderPath()}/${sanitizeFileName(rawTitle)}-Annotations.md`);
 }
 
-/** Each Gloss entry begins with a `> [!mode]-` header line (see `buildCallout`),
- *  so counting those headers gives the mark count without parsing anchors. */
+interface CompanionIndex {
+	byBook: Map<string, TFile[]>;
+	notes: Set<TFile>;
+}
+
+let companionApp: App | null = null;
+let companionIndex: CompanionIndex | null = null;
+const warnedDuplicates = new Set<string>();
+
+const isBookFile = (file: TAbstractFile): boolean =>
+	file instanceof TFile && (file.extension === "epub" || file.extension === "pdf");
+
+function sourceLink(cache: CachedMetadata | null | undefined) {
+	return cache?.frontmatterLinks?.find((l) => l.key === "source");
+}
+
+/** Notes are matched to books by their `source:` frontmatter link, so either can
+ *  be renamed or moved. The index is dropped when a change could alter a match. */
+export function watchCompanionDocs(plugin: Plugin): void {
+	const { app } = plugin;
+	companionApp = app;
+	companionIndex = null;
+	const invalidate = () => { companionIndex = null; };
+	const isNote = (file: TAbstractFile) => file instanceof TFile && !!companionIndex?.notes.has(file);
+	plugin.registerEvent(app.metadataCache.on("changed", (file, _data, cache) => {
+		if (isNote(file) || sourceLink(cache)) invalidate();
+	}));
+	plugin.registerEvent(app.metadataCache.on("deleted", (file) => { if (isNote(file)) invalidate(); }));
+	plugin.registerEvent(app.vault.on("create", (file) => { if (isBookFile(file)) invalidate(); }));
+	plugin.registerEvent(app.vault.on("delete", (file) => { if (isBookFile(file)) invalidate(); }));
+	plugin.registerEvent(app.vault.on("rename", (file) => { if (isBookFile(file) || isNote(file)) invalidate(); }));
+}
+
+function companionIndexFor(app: App): CompanionIndex {
+	if (companionIndex) return companionIndex;
+	const byBook = new Map<string, TFile[]>();
+	const notes = new Set<TFile>();
+	for (const note of app.vault.getMarkdownFiles()) {
+		const link = sourceLink(app.metadataCache.getFileCache(note));
+		if (!link) continue;
+		const book = app.metadataCache.getFirstLinkpathDest(getLinkpath(link.link), note.path);
+		if (!book || !isBookFile(book)) continue;
+		const claims = byBook.get(book.path);
+		if (claims) claims.push(note);
+		else byBook.set(book.path, [note]);
+		notes.add(note);
+	}
+	companionIndex = { byBook, notes };
+	return companionIndex;
+}
+
+/** The note whose `source:` links to `book`, else the note at the derived path
+ *  (covers a metadata cache that hasn't indexed the note yet). */
+export function findCompanionDoc(book: TFile, rawTitle: string): TFile | null {
+	const app = companionApp;
+	if (!app) return null;
+	const derived = companionDocPath(rawTitle);
+	const claims = companionIndexFor(app).byBook.get(book.path);
+	if (!claims) return app.vault.getFileByPath(derived);
+	if (claims.length === 1) return claims[0];
+	if (!warnedDuplicates.has(book.path)) {
+		warnedDuplicates.add(book.path);
+		console.warn(`[ThirdMindReader] ${claims.length} notes claim ${book.path} as their source:`, claims.map((c) => c.path));
+	}
+	return claims.find((c) => c.path === derived)
+		?? claims.reduce((a, b) => (b.stat.mtime > a.stat.mtime ? b : a));
+}
+
+export function isCompanionDoc(file: TAbstractFile): boolean {
+	return !!companionApp && file instanceof TFile && companionIndexFor(companionApp).notes.has(file);
+}
+
+/** Each Gloss entry begins with a `> [!mode]` header line, folded or not (see
+ *  `buildCallout`), so counting those headers gives the mark count without parsing anchors. */
 const CALLOUT_HEADER_RE = /^>\s*\[!(?:exclaim|explain|examine|emphasise|enquiry)\]/gim;
 
 /** Marks cache keyed by companion-doc path, validated against the doc's mtime so
@@ -109,18 +183,17 @@ const marksCache = new Map<string, { mtime: number; marks: number }>();
 
 /** Count annotation callouts in a book's companion doc. Returns 0 marks and
  *  `hasCompanion: false` when no doc exists. */
-async function readMarks(vault: Vault, rawTitle: string): Promise<{ marks: number; hasCompanion: boolean }> {
-	const path = companionDocPath(rawTitle);
-	const file = vault.getAbstractFileByPath(path);
-	if (!(file instanceof TFile)) return { marks: 0, hasCompanion: false };
+async function readMarks(vault: Vault, book: TFile, rawTitle: string): Promise<{ marks: number; hasCompanion: boolean }> {
+	const file = findCompanionDoc(book, rawTitle);
+	if (!file) return { marks: 0, hasCompanion: false };
 
-	const cached = marksCache.get(path);
+	const cached = marksCache.get(file.path);
 	if (cached && cached.mtime === file.stat.mtime) return { marks: cached.marks, hasCompanion: true };
 
 	try {
 		const text = await vault.cachedRead(file);
 		const marks = text.match(CALLOUT_HEADER_RE)?.length ?? 0;
-		marksCache.set(path, { mtime: file.stat.mtime, marks });
+		marksCache.set(file.path, { mtime: file.stat.mtime, marks });
 		return { marks, hasCompanion: true };
 	} catch {
 		// Doc exists but couldn't be read — treat as a companion with 0 marks.
@@ -136,7 +209,7 @@ async function readMarks(vault: Vault, rawTitle: string): Promise<{ marks: numbe
  * `overrides` (keyed by path) replace the displayed title/author without
  * touching the epub; the raw OPF values are retained for the editor.
  * `positions` (= `settings.bookPositions`) supplies the cached reading fraction;
- * `marks`/`hasCompanion` resolve from the companion doc, keyed by raw OPF title.
+ * `marks`/`hasCompanion` resolve from the book's companion doc (`findCompanionDoc`).
  */
 export async function scanLibrary(
 	vault: Vault,
@@ -145,11 +218,13 @@ export async function scanLibrary(
 ): Promise<LibraryBook[]> {
 	const prefix = libraryRootPath() + "/";
 	const annotationsPrefix = annotationsFolderPath() + "/";
+	// An annotations folder at or above the Library root would otherwise exclude every book.
+	const excludeAnnotations = annotationsPrefix.startsWith(prefix) && annotationsPrefix !== prefix;
 	const files = vault.getFiles().filter(
 		(f) =>
 			(f.extension === "epub" || f.extension === "pdf") &&
 			f.path.startsWith(prefix) &&
-			!f.path.startsWith(annotationsPrefix)
+			!(excludeAnnotations && f.path.startsWith(annotationsPrefix))
 	);
 
 	const books: LibraryBook[] = [];
@@ -160,10 +235,8 @@ export async function scanLibrary(
 
 		const cached = metaCache.get(file.path);
 		if (kind === "pdf") {
-			// No OPF to read: the filename is the title, and the author stays empty
-			// until someone sets one in Edit details. The filename is also what PDF
-			// Gloss keys its companion doc by (`companionDocPath(file.basename)`),
-			// so marks resolve here without inventing a second convention.
+			// No OPF to read: the filename is the title (and PDF Gloss names new
+			// companion docs from it); the author stays empty until Edit details.
 			title = file.basename;
 			author = "";
 		} else if (cached && cached.mtime === file.stat.mtime) {
@@ -185,7 +258,7 @@ export async function scanLibrary(
 		}
 
 		const ov = overrides[file.path];
-		const { marks, hasCompanion } = await readMarks(vault, title);
+		const { marks, hasCompanion } = await readMarks(vault, file, title);
 		const pct = positions[file.path]?.pct;
 		const lastRead = positions[file.path]?.lastRead;
 		books.push({
@@ -229,7 +302,8 @@ export function computeCollections(vault: Vault, order: string[]): string[] {
 	const root = vault.getAbstractFileByPath(libraryRootPath());
 	const folders = root instanceof TFolder
 		? root.children
-			.filter((c): c is TFolder => c instanceof TFolder && c.path !== annotationsFolderPath())
+			.filter((c): c is TFolder =>
+				c instanceof TFolder && c.path !== annotationsFolderPath() && !isExplodedEpub(c) && !isNotesFolder(c))
 			.map((c) => c.name)
 		: [];
 
@@ -240,6 +314,16 @@ export function computeCollections(vault: Vault, order: string[]): string[] {
 		.filter((c) => !ordered.includes(c))
 		.sort((a, b) => a.localeCompare(b));
 	return [...ordered, ...rest];
+}
+
+/** A former annotations folder left in place when the setting moved on. */
+function isNotesFolder(folder: TFolder): boolean {
+	return folder.children.some(isCompanionDoc) && !folder.children.some(isBookFile);
+}
+
+/** An unzipped book (the Apple Books shape) is a folder, but never a collection. */
+export function isExplodedEpub(folder: TFolder): boolean {
+	return folder.children.some((c) => c.name === "META-INF" || c.name === "mimetype");
 }
 
 /**
